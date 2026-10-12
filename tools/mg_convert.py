@@ -5,6 +5,12 @@ Mantis Gallery — MG Converter (Tkinter GUI)
 Converts JPG / PNG / BMP / WEBP → .mg (RGB565 320×240) for fast
 playback on M5Stack Core2 from the SD card.
 
+Preserves folder structure:
+    Input:  FolderA/cats/a.jpg
+            FolderA/dogs/b.png
+    Output: out/cats/a.mg
+            out/dogs/b.mg
+
 Requires:
     pip install pillow
 
@@ -38,7 +44,6 @@ def to_rgb565_bytes(im: Image.Image) -> bytes:
     im = im.convert("RGB")
     if im.size != (W, H):
         raise ValueError(f"expected {W}x{H}, got {im.size}")
-    # Pack via array: faster than per-pixel Python loops
     rgb = im.tobytes()
     out = bytearray(W * H * 2)
     j = 0
@@ -81,6 +86,7 @@ def convert_one(src: Path, dst: Path, mode: str = "cover") -> None:
 
 
 def collect_files(src_dir: Path) -> list[Path]:
+    """All images under src_dir, including nested subfolders."""
     return sorted(
         p for p in src_dir.rglob("*")
         if p.is_file() and p.suffix.lower() in EXTS
@@ -112,7 +118,7 @@ def run_gui() -> None:
     src_var = tk.StringVar()
     out_var = tk.StringVar()
     mode_var = tk.StringVar(value="cover")
-    status_var = tk.StringVar(value="Choose a source folder, then Convert.")
+    status_var = tk.StringVar(value="Choose source + output folders, then Convert.")
     busy = {"on": False}
 
     def log(msg: str) -> None:
@@ -122,14 +128,14 @@ def run_gui() -> None:
         log_box.configure(state="disabled")
 
     def browse_src() -> None:
-        d = filedialog.askdirectory(title="Source folder (JPG/PNG/…)")
+        d = filedialog.askdirectory(title="Source folder (JPG/PNG/…, subfolders kept)")
         if d:
             src_var.set(d)
             n = len(collect_files(Path(d)))
-            status_var.set(f"Source set — {n} image(s) found")
+            status_var.set(f"Source set — {n} image(s) found (including subfolders)")
 
     def browse_out() -> None:
-        d = filedialog.askdirectory(title="Output folder (optional — default: beside sources)")
+        d = filedialog.askdirectory(title="Output folder (same folder tree as .mg)")
         if d:
             out_var.set(d)
 
@@ -137,15 +143,26 @@ def run_gui() -> None:
         if busy["on"]:
             return
         src = src_var.get().strip()
+        out_s = out_var.get().strip()
         if not src:
             messagebox.showerror("Mantis Gallery", "Choose a source folder first.")
             return
+        if not out_s:
+            messagebox.showerror(
+                "Mantis Gallery",
+                "Choose an output folder.\n\n"
+                "Folder structure is preserved, e.g.:\n"
+                "  source/cats/a.jpg  →  output/cats/a.mg",
+            )
+            return
         src_path = Path(src)
+        out_path = Path(out_s)
         if not src_path.is_dir():
             messagebox.showerror("Mantis Gallery", "Source path is not a folder.")
             return
-        out_s = out_var.get().strip()
-        out_path = Path(out_s) if out_s else None
+        if src_path.resolve() == out_path.resolve():
+            messagebox.showerror("Mantis Gallery", "Source and output must be different folders.")
+            return
         mode = mode_var.get()
         files = collect_files(src_path)
         if not files:
@@ -160,19 +177,22 @@ def run_gui() -> None:
         log_box.configure(state="normal")
         log_box.delete("1.0", "end")
         log_box.configure(state="disabled")
-        log(f"Mode: {mode}  →  320×240 RGB565 .mg")
-        log(f"Files: {len(files)}")
+        log(f"Source: {src_path}")
+        log(f"Output: {out_path}")
+        log(f"Mode:   {mode}  →  320×240 RGB565 .mg")
+        log(f"Files:  {len(files)}  (folder structure preserved)")
+        log("——")
 
         def worker() -> None:
             ok = fail = 0
             for i, p in enumerate(files):
                 rel = p.relative_to(src_path)
-                target_root = out_path if out_path else src_path
-                dst = target_root / rel.with_suffix(".mg")
+                # Preserve tree: source/cats/a.jpg → output/cats/a.mg
+                dst = out_path / rel.with_suffix(".mg")
                 try:
                     convert_one(p, dst, mode=mode)
                     ok += 1
-                    root.after(0, lambda m=f"OK  {rel} → {dst.name}": log(m))
+                    root.after(0, lambda m=f"OK  {rel} → {rel.with_suffix('.mg')}": log(m))
                 except Exception as e:
                     fail += 1
                     root.after(0, lambda m=f"FAIL {rel}: {e}": log(m))
@@ -188,7 +208,8 @@ def run_gui() -> None:
                 messagebox.showinfo(
                     "Mantis Gallery",
                     f"Converted {ok} image(s)\nFailed: {fail}\n\n"
-                    f"Copy the .mg files onto the Core2 SD card under /images",
+                    f"Folder structure was kept under:\n{out_path}\n\n"
+                    f"Copy that tree onto the Core2 SD card under /images",
                 )
             root.after(0, done)
 
@@ -207,7 +228,7 @@ def run_gui() -> None:
     ).pack(anchor="w", padx=14, pady=(14, 0))
     tk.Label(
         root,
-        text="Convert photos to .mg  ·  320×240 RGB565  ·  Core2 SD fast path",
+        text="Convert photos to .mg  ·  320×240 RGB565  ·  keeps subfolder structure",
         fg=muted, bg="#1a1a1a", font=("Segoe UI", 10),
     ).pack(anchor="w", padx=14, pady=(0, 8))
 
@@ -264,21 +285,25 @@ def run_cli(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Mantis Gallery .mg converter (CLI)")
     ap.add_argument("--cli", action="store_true")
     ap.add_argument("src", help="Source folder")
-    ap.add_argument("-o", "--out", help="Output folder")
+    ap.add_argument("-o", "--out", required=True, help="Output folder (structure preserved)")
     ap.add_argument("--mode", choices=("cover", "fit"), default="cover")
     args = ap.parse_args(argv)
-    files = collect_files(Path(args.src))
+    src_path = Path(args.src)
+    out_path = Path(args.out)
+    if src_path.resolve() == out_path.resolve():
+        print("Source and output must differ")
+        return 2
+    files = collect_files(src_path)
     ok = fail = 0
-    out = Path(args.out) if args.out else None
     for p in files:
-        rel = p.relative_to(Path(args.src))
-        dst = (out if out else Path(args.src)) / rel.with_suffix(".mg")
+        rel = p.relative_to(src_path)
+        dst = out_path / rel.with_suffix(".mg")
         try:
             convert_one(p, dst, mode=args.mode)
-            print(f"OK  {p} → {dst}")
+            print(f"OK  {rel} → {dst}")
             ok += 1
         except Exception as e:
-            print(f"FAIL {p}: {e}")
+            print(f"FAIL {rel}: {e}")
             fail += 1
     print(f"\n{ok} ok, {fail} failed")
     return 0 if fail == 0 else 1
