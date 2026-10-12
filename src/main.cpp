@@ -269,15 +269,32 @@ static bool load_mg(const char* path) {
     return true;
 }
 
+// M5GFX DataWrapperT<fs::SDFS> is abstract on current cores — avoid draw*File(SD, …).
+// Load the whole file into PSRAM/heap and decode from the buffer instead.
 static bool load_jpg_png(const char* path, bool png) {
-    // M5GFX draws from FS; scales if needed
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+    size_t sz = f.size();
+    if (sz == 0 || sz > 2 * 1024 * 1024) { // hard cap 2 MB
+        f.close();
+        return false;
+    }
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = (uint8_t*)malloc(sz);
+    if (!buf) { f.close(); return false; }
+
+    size_t got = f.read(buf, sz);
+    f.close();
+    if (got != sz) { free(buf); return false; }
+
     M5.Display.fillScreen(COL_BG);
     bool ok = false;
     if (png) {
-        ok = M5.Display.drawPngFile(SD, path, 0, 0);
+        ok = M5.Display.drawPng(buf, sz, 0, 0);
     } else {
-        ok = M5.Display.drawJpgFile(SD, path, 0, 0);
+        ok = M5.Display.drawJpg(buf, sz, 0, 0);
     }
+    free(buf);
     return ok;
 }
 
