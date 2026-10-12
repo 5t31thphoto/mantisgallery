@@ -28,13 +28,12 @@ RECOMMENDED FORMAT (FASTEST) — .mg binary
                    is tens of ms vs hundreds of ms for large JPEGs.
 
   How to make    :
+      pip install pillow
       python tools/mg_convert.py
-      — or —
-      python tools/mg_convert.py /path/to/folder
+        → opens the Tkinter GUI (Browse source/output, Cover/Fit, Convert)
 
-  The converter accepts JPG/JPEG/PNG/BMP/WEBP (via Pillow), center-crops or
-  letterboxes to 320×240, and writes .mg next to the source (or into an
-  output folder you choose).
+  The GUI accepts JPG/JPEG/PNG/BMP/WEBP, scales to 320×240 (cover crop or
+  letterbox fit), and writes .mg files ready for the Core2 SD card.
 
 --------------------------------------------------------------------------------
 FALLBACK FORMATS (still supported, slower)

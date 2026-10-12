@@ -63,8 +63,9 @@
       Gallery
     </h1>
     <p class="sub">
-      SD-card slideshow. Drop images in <code>/images</code>, optional subfolders as albums.
+      SD-card gallery. Images in <code>/images</code>, subfolders as albums.
       Random shuffle with no repeats until the album rolls over.
+      Slideshow is <strong>off</strong> until you long-press the screen.
     </p>
 
     <section class="step">
@@ -100,18 +101,33 @@
       <p>
         FAT32 card. Create <code>/images</code>. Put JPG/PNG there, or convert with
         <code>tools/mg_convert.py</code> for the fast <code>.mg</code> format.
-        Subfolders under <code>/images</code> become albums (Btn A / C).
+        Files in <code>/images</code> = default album. Subfolders = extra albums.
       </p>
     </section>
 
     <section class="step">
       <h2><span class="pip">3</span>Controls</h2>
+      <p style="margin-bottom:8px"><strong>Default album</strong> (files in <code>/images</code>):</p>
       <p>
-        <strong>A / C</strong> — previous / next album ·
-        <strong>B</strong> or <strong>touch</strong> — next image ·
-        <strong>hold C</strong> — power off ·
-        auto-advance ~4 s.
+        <strong>Hold B</strong> — yellow→red bar; hold until full → random subfolder ·
+        <strong>Swipe right / left</strong> — next / previous image ·
+        <strong>Long-press screen</strong> — slideshow on/off
       </p>
+      <p style="margin-bottom:8px"><strong>Subfolders:</strong></p>
+      <p>
+        <strong>A / C</strong> — prev / next subfolder ·
+        <strong>Short B</strong> — back to default ·
+        swipes and long-press same as above
+      </p>
+      <p style="margin-bottom:8px"><strong>Slideshow</strong> (starts <em>off</em>):</p>
+      <p>
+        Random <strong>5–8 s</strong> per image ·
+        <strong>Tap</strong> — stay on current photo 2× as long ·
+        swipes still change image ·
+        long-press again to exit ·
+        <strong>Hold C</strong> — power off
+      </p>
+      <p>No on-screen labels during playback.</p>
     </section>
   </div>
 </body>

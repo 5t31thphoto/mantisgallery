@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <vector>
 #include <algorithm>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // Mantis theme
 static constexpr uint16_t COL_BG     = 0x18C3;
@@ -103,17 +106,20 @@ static bool ends_with_png(const char* name) {
 //  Album model
 // ---------------------------------------------------------------------------
 struct Album {
-    char name[NAME_MAX_LEN];   // "" = default (files in /images root)
+    char name[NAME_MAX_LEN];   // "default" = files in /images root
     char path[PATH_MAX_LEN];   // full directory path
     std::vector<String> files; // filenames only (not full path)
     std::vector<int> order;    // shuffled indices into files
     int cursor = 0;
+    bool scanned = false;      // file list loaded? (lazy)
 };
 
 static std::vector<Album> albums;
 static int album_i = 0;
 static uint16_t* pixel_buf = nullptr; // PSRAM RGB565 frame for .mg
 static constexpr size_t PIXEL_BYTES = SCREEN_W * SCREEN_H * 2;
+static volatile bool bg_scan_run = false;
+static SemaphoreHandle_t albums_mtx = nullptr;
 
 static void show_msg(const char* line1, const char* line2 = nullptr) {
     M5.Display.fillScreen(COL_BG);
@@ -142,8 +148,10 @@ static void reshuffle(Album& a) {
     a.cursor = 0;
 }
 
+// List image filenames in one directory only (no recursion, no sort).
 static bool scan_dir_images(const char* dir, std::vector<String>& out) {
     out.clear();
+    out.reserve(128);
     File d = SD.open(dir);
     if (!d || !d.isDirectory()) {
         if (d) d.close();
@@ -154,45 +162,76 @@ static bool scan_dir_images(const char* dir, std::vector<String>& out) {
         if (!f) break;
         if (!f.isDirectory()) {
             const char* nm = f.name();
-            // SD lib may return full path or basename depending on version
             const char* base = strrchr(nm, '/');
             base = base ? base + 1 : nm;
             if (is_image_name(base)) {
                 out.push_back(String(base));
+                if ((int)out.size() >= MAX_FILES_PER_ALBUM) {
+                    f.close();
+                    break;
+                }
             }
         }
         f.close();
     }
     d.close();
-    // Prefer listing stability: sort names, shuffle is separate
-    std::sort(out.begin(), out.end(), [](const String& a, const String& b) {
-        return a.compareTo(b) < 0;
-    });
-    return true;
+    return !out.empty();
 }
 
+// Load file list for one album when first needed (or from background task).
+static bool ensure_album_scanned(int idx) {
+    if (idx < 0 || idx >= (int)albums.size()) return false;
+    if (albums_mtx) xSemaphoreTake(albums_mtx, portMAX_DELAY);
+    if (albums[idx].scanned) {
+        bool has = !albums[idx].files.empty();
+        if (albums_mtx) xSemaphoreGive(albums_mtx);
+        return has;
+    }
+    // Copy path out then release while scanning SD (slow)
+    char path_copy[PATH_MAX_LEN];
+    strncpy(path_copy, albums[idx].path, sizeof(path_copy) - 1);
+    path_copy[sizeof(path_copy) - 1] = 0;
+    if (albums_mtx) xSemaphoreGive(albums_mtx);
+
+    std::vector<String> files;
+    bool ok = scan_dir_images(path_copy, files);
+
+    if (albums_mtx) xSemaphoreTake(albums_mtx, portMAX_DELAY);
+    Album& a = albums[idx];
+    if (!a.scanned) {  // another task may have finished first
+        a.files = std::move(files);
+        a.scanned = true;
+        if (ok && !a.files.empty()) reshuffle(a);
+        else { a.order.clear(); a.cursor = 0; }
+    }
+    bool has = !a.files.empty();
+    if (albums_mtx) xSemaphoreGive(albums_mtx);
+    return has;
+}
+
+// Boot: scan ONLY default (/images root). Subfolders = names only until used.
 static bool build_albums() {
     albums.clear();
     album_i = 0;
 
-    // Ensure /images exists
-    if (!SD.exists(IMAGES_ROOT)) {
-        return false;
-    }
+    if (!SD.exists(IMAGES_ROOT)) return false;
 
-    // Default album: files directly in /images
+    // 1) Default album — full file list (first screen the user sees)
     {
         Album def;
+        memset(def.name, 0, sizeof def.name);
+        memset(def.path, 0, sizeof def.path);
         strncpy(def.name, "default", sizeof(def.name) - 1);
         strncpy(def.path, IMAGES_ROOT, sizeof(def.path) - 1);
-        scan_dir_images(IMAGES_ROOT, def.files);
-        if (!def.files.empty()) {
+        def.scanned = false;
+        if (scan_dir_images(IMAGES_ROOT, def.files) && !def.files.empty()) {
             reshuffle(def);
+            def.scanned = true;
             albums.push_back(std::move(def));
         }
     }
 
-    // Subfolders of /images
+    // 2) Subfolders — register names only (no file listing yet)
     File root = SD.open(IMAGES_ROOT);
     if (root && root.isDirectory()) {
         for (;;) {
@@ -202,15 +241,13 @@ static bool build_albums() {
                 const char* nm = f.name();
                 const char* base = strrchr(nm, '/');
                 base = base ? base + 1 : nm;
-                // skip hidden
-                if (base[0] == '.') { f.close(); continue; }
-
-                Album al;
-                strncpy(al.name, base, sizeof(al.name) - 1);
-                snprintf(al.path, sizeof(al.path), "%s/%s", IMAGES_ROOT, base);
-                scan_dir_images(al.path, al.files);
-                if (!al.files.empty() && (int)albums.size() < MAX_ALBUMS) {
-                    reshuffle(al);
+                if (base[0] != '.' && (int)albums.size() < MAX_ALBUMS) {
+                    Album al;
+                    memset(al.name, 0, sizeof al.name);
+                    memset(al.path, 0, sizeof al.path);
+                    strncpy(al.name, base, sizeof(al.name) - 1);
+                    snprintf(al.path, sizeof(al.path), "%s/%s", IMAGES_ROOT, base);
+                    al.scanned = false;
                     albums.push_back(std::move(al));
                 }
             }
@@ -220,6 +257,24 @@ static bool build_albums() {
     }
 
     return !albums.empty();
+}
+
+// Automatic background scan of remaining albums (no user setting).
+static void bg_scan_task(void*) {
+    bg_scan_run = true;
+    vTaskDelay(pdMS_TO_TICKS(500));
+    for (int i = 0; i < (int)albums.size() && bg_scan_run; ++i) {
+        if (!albums[i].scanned) {
+            ensure_album_scanned(i);
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+    }
+    bg_scan_run = false;
+    vTaskDelete(nullptr);
+}
+
+static void start_bg_scan() {
+    xTaskCreatePinnedToCore(bg_scan_task, "mg_scan", 8192, nullptr, 1, nullptr, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +361,7 @@ static bool in_default_album() {
 
 static bool show_current() {
     if (albums.empty()) return false;
+    if (!ensure_album_scanned(album_i)) return false;
     Album& a = albums[album_i];
     if (a.files.empty()) return false;
 
@@ -369,10 +425,17 @@ static void change_subfolder(int delta) {
 
     int rel = album_i - start;
     if (rel < 0) rel = 0;
-    rel = (rel + delta) % n;
-    if (rel < 0) rel += n;
-    album_i = start + rel;
-    show_current();
+    // Step until we land on a folder that has images (or tried all)
+    for (int tried = 0; tried < n; ++tried) {
+        rel = (rel + delta) % n;
+        if (rel < 0) rel += n;
+        int idx = start + rel;
+        if (ensure_album_scanned(idx) && !albums[idx].files.empty()) {
+            album_i = idx;
+            show_current();
+            return;
+        }
+    }
 }
 
 static void go_default_album() {
@@ -386,8 +449,15 @@ static void enter_random_subfolder() {
     int start = (strcmp(albums[0].name, "default") == 0) ? 1 : 0;
     int n = (int)albums.size() - start;
     if (n <= 0) return;
-    album_i = start + (int)(esp_random() % (uint32_t)n);
-    show_current();
+    // Try a few random picks in case a folder is empty
+    for (int attempt = 0; attempt < n; ++attempt) {
+        int pick = start + (int)(esp_random() % (uint32_t)n);
+        if (ensure_album_scanned(pick) && !albums[pick].files.empty()) {
+            album_i = pick;
+            show_current();
+            return;
+        }
+    }
 }
 
 // Progress bar at bottom: yellow → red as t goes 0..1
@@ -451,18 +521,21 @@ void setup() {
         while (true) { M5.update(); delay(200); }
     }
 
+    albums_mtx = xSemaphoreCreateMutex();
     show_msg("Scanning /images…");
     if (!build_albums()) {
         show_msg("No images found", "See IMAGE_SPEC.txt");
         while (true) { M5.update(); delay(200); }
     }
 
-    Serial.printf("Albums: %d\n", (int)albums.size());
+    Serial.printf("Albums registered: %d (default scanned, others lazy)\n", (int)albums.size());
     for (auto& a : albums) {
-        Serial.printf("  %s (%s) %d files\n", a.name, a.path, (int)a.files.size());
+        Serial.printf("  %s (%s) scanned=%d files=%d\n",
+                      a.name, a.path, (int)a.scanned, (int)a.files.size());
     }
 
     show_current();
+    start_bg_scan();  // automatic — no user option
 }
 
 void loop() {
