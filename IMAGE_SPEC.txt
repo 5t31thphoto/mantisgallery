@@ -1,0 +1,105 @@
+================================================================================
+  MANTIS GALLERY — IMAGE SPECIFICATION (M5Stack Core2)
+================================================================================
+
+DISPLAY
+  Panel     : ILI9342C
+  Resolution: 320 × 240 pixels (landscape)
+  Color     : 16-bit RGB565
+
+--------------------------------------------------------------------------------
+RECOMMENDED FORMAT (FASTEST) — .mg binary
+--------------------------------------------------------------------------------
+  Use tools/mg_convert.py on your laptop, then copy the output onto the SD card.
+
+  File extension : .mg
+  Layout         :
+      bytes 0..3   : magic "MG01"
+      bytes 4..5   : width  (uint16 little-endian)  = 320
+      bytes 6..7   : height (uint16 little-endian)  = 240
+      bytes 8..end : width * height * 2 bytes of RGB565 pixels
+                     row-major, left→right, top→bottom
+                     each pixel: uint16 LE, RRRRR GGGGGG BBBBB
+
+  Size on disk   : 8 + 320*240*2 = 153,608 bytes per image (fixed)
+
+  Why faster?    : No JPEG/PNG decode. Firmware streams the pixel buffer
+                   straight to the display (PSRAM-assisted). Typical load
+                   is tens of ms vs hundreds of ms for large JPEGs.
+
+  How to make    :
+      python tools/mg_convert.py
+      — or —
+      python tools/mg_convert.py /path/to/folder
+
+  The converter accepts JPG/JPEG/PNG/BMP/WEBP (via Pillow), center-crops or
+  letterboxes to 320×240, and writes .mg next to the source (or into an
+  output folder you choose).
+
+--------------------------------------------------------------------------------
+FALLBACK FORMATS (still supported, slower)
+--------------------------------------------------------------------------------
+  .jpg / .jpeg   : Baseline JPEG, RGB (not CMYK). Prefer ~320×240 already.
+  .png           : 8-bit RGB or RGBA (alpha ignored). Prefer ~320×240 already.
+
+  Images larger than 320×240 are scaled by M5GFX (extra CPU time).
+  Images smaller are drawn top-left (or centered by firmware).
+
+  For a snappy gallery with dozens/hundreds of photos, convert to .mg.
+
+--------------------------------------------------------------------------------
+SD CARD LAYOUT
+--------------------------------------------------------------------------------
+  Format the card as FAT32.
+
+  /images/                  ← required root album folder
+      photo1.mg             ← files sitting HERE are the DEFAULT album
+      photo2.jpg
+      vacation/             ← subfolder = another album (cycle with Btn A / C)
+          a.mg
+          b.mg
+      family/
+          x.png
+
+  Rules
+  • Only the first level of subfolders under /images is treated as albums.
+  • Nested folders deeper than one level are ignored.
+  • Default album = files directly inside /images (not in a subfolder).
+  • Supported extensions (case-insensitive): .mg .jpg .jpeg .png
+  • When both photo.mg and photo.jpg exist, .mg is preferred if you list
+    both; usually you only put one form on the card.
+
+--------------------------------------------------------------------------------
+CONTROLS (Core2) — no on-screen text or labels during playback
+--------------------------------------------------------------------------------
+  DEFAULT album (/images root files):
+    Hold Btn B     : progress bar at bottom (yellow → red). Hold until full
+                     to open a RANDOM subfolder. Release early to cancel.
+    Swipe right    : next image (shuffle order)
+    Swipe left     : previous image
+    Long-press screen : start / stop slideshow mode
+
+  SUBFOLDERS:
+    Btn A / Btn C  : previous / next subfolder
+    Short Btn B    : jump back to default album
+    Swipe L/R      : previous / next image (same as default)
+    Long-press screen : slideshow on/off
+
+  SLIDESHOW MODE:
+    Dwell          : random 5–8 seconds per image
+    Short tap      : stay on current photo twice as long
+    Swipe L/R      : still change image; timer resets
+    Long-press     : exit slideshow
+
+  Hold Btn C       : power off
+
+  Within an album, order is a random shuffle with no repeats until every
+  image has been shown; then it reshuffles and continues.
+
+--------------------------------------------------------------------------------
+COLOR / THEME
+--------------------------------------------------------------------------------
+  UI chrome uses the Mantis palette:
+    teal #007373 · purple #5d005d · lime · dark grey backgrounds
+
+================================================================================
