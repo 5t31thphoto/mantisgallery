@@ -102,3 +102,15 @@ COLOR / THEME
     teal #007373 · purple #5d005d · lime · dark grey backgrounds
 
 ================================================================================
+
+
+--------------------------------------------------------------------------------
+INDEX CACHE (automatic)
+--------------------------------------------------------------------------------
+  Each album folder may contain a hidden list file:
+      .mg_index
+  Written by the firmware after a full scan. On the next boot, if the number
+  of images in that folder still matches the index count, the list is reused
+  (fast). If you add or remove images, the count changes and that folder is
+  scanned again, then the index is rewritten.
+  You can delete .mg_index files anytime to force a rescan.

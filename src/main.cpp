@@ -1,12 +1,11 @@
 /**
  * Mantis Gallery — M5Stack Core2
  *
- * SD card slideshow:
- *   /images/*.jpg|png|mg          → default album
- *   /images/<folder>/…            → extra albums (Btn A / C cycle)
+ * Stable single-core build + SD index cache.
+ * Per-folder ".mg_index": if file count matches, reuse list (fast boot).
+ * Mismatch or missing index → full scan and rewrite index.
  *
- * Playback: random shuffle, no repeats until the album is exhausted,
- * then reshuffle. Prefers .mg (RGB565) for speed; JPG/PNG fallback.
+ * UX unchanged: hold B / A·C / swipe / long-press slideshow.
  */
 
 #include <M5Unified.h>
@@ -16,11 +15,7 @@
 #include <stdlib.h>
 #include <vector>
 #include <algorithm>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/semphr.h>
 
-// Mantis theme
 static constexpr uint16_t COL_BG     = 0x18C3;
 static constexpr uint16_t COL_TEAL   = 0x038E;
 static constexpr uint16_t COL_PURPLE = 0x580B;
@@ -31,57 +26,44 @@ static constexpr uint16_t COL_DIM    = 0x8410;
 
 static constexpr int SCREEN_W = 320;
 static constexpr int SCREEN_H = 240;
-
 static constexpr const char* IMAGES_ROOT = "/images";
+static constexpr const char* INDEX_NAME = ".mg_index";
 
-// Controls
-static constexpr uint32_t HOLD_B_MS        = 1200;  // long-press B to enter random subfolder
-static constexpr uint32_t TOUCH_LONG_MS    = 650;   // long-press screen → slideshow
-static constexpr int      SWIPE_MIN_PX     = 40;
-static constexpr uint32_t SLIDE_MIN_MS     = 5000;
-static constexpr uint32_t SLIDE_MAX_MS     = 8000;
+static constexpr uint32_t HOLD_B_MS     = 1200;
+static constexpr uint32_t TOUCH_LONG_MS = 650;
+static constexpr int      SWIPE_MIN_PX  = 40;
+static constexpr uint32_t SLIDE_MIN_MS  = 5000;
+static constexpr uint32_t SLIDE_MAX_MS  = 8000;
 
-static constexpr uint16_t COL_BAR_YEL = 0xFFE0;  // yellow
-static constexpr uint16_t COL_BAR_RED = 0xF800;  // red
-static constexpr uint16_t COL_BAR_BG  = 0x2104;  // dark under bar
+static constexpr uint16_t COL_BAR_YEL = 0xFFE0;
+static constexpr uint16_t COL_BAR_RED = 0xF800;
+static constexpr uint16_t COL_BAR_BG  = 0x2104;
 
-// Max path length for SD paths
 static constexpr size_t PATH_MAX_LEN = 96;
 static constexpr size_t NAME_MAX_LEN = 48;
 static constexpr int MAX_ALBUMS = 32;
 static constexpr int MAX_FILES_PER_ALBUM = 512;
 
-// ---------------------------------------------------------------------------
-//  SD helpers (Core2: SCK=18 MISO=38 MOSI=23 CS=4)
-// ---------------------------------------------------------------------------
 static bool sd_ok = false;
 
 static bool sd_begin() {
     SPI.begin(18, 38, 23, 4);
-    if (SD.begin(4, SPI, 25000000)) {
-        sd_ok = true;
-        return true;
-    }
-    // retry slower
-    if (SD.begin(4, SPI, 4000000)) {
-        sd_ok = true;
-        return true;
-    }
+    if (SD.begin(4, SPI, 25000000)) { sd_ok = true; return true; }
+    if (SD.begin(4, SPI, 4000000))  { sd_ok = true; return true; }
     sd_ok = false;
     return false;
 }
 
 static bool is_image_name(const char* name) {
-    if (!name) return false;
+    if (!name || name[0] == '.') return false;
     size_t n = strlen(name);
     auto low = [](char c) -> char {
         return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
     };
     auto match = [&](const char* suf, size_t sl) -> bool {
         if (n < sl) return false;
-        for (size_t i = 0; i < sl; ++i) {
+        for (size_t i = 0; i < sl; ++i)
             if (low(name[n - sl + i]) != suf[i]) return false;
-        }
         return true;
     };
     return match(".mg", 3) || match(".jpg", 4) || match(".png", 4) || match(".jpeg", 5);
@@ -102,24 +84,18 @@ static bool ends_with_png(const char* name) {
     return e[0] == '.' && low(e[1]) == 'p' && low(e[2]) == 'n' && low(e[3]) == 'g';
 }
 
-// ---------------------------------------------------------------------------
-//  Album model
-// ---------------------------------------------------------------------------
 struct Album {
-    char name[NAME_MAX_LEN];   // "default" = files in /images root
-    char path[PATH_MAX_LEN];   // full directory path
-    std::vector<String> files; // filenames only (not full path)
-    std::vector<int> order;    // shuffled indices into files
+    char name[NAME_MAX_LEN];
+    char path[PATH_MAX_LEN];
+    std::vector<String> files;
+    std::vector<int> order;
     int cursor = 0;
-    bool scanned = false;      // file list loaded? (lazy)
 };
 
 static std::vector<Album> albums;
 static int album_i = 0;
-static uint16_t* pixel_buf = nullptr; // PSRAM RGB565 frame for .mg
+static uint16_t* pixel_buf = nullptr;
 static constexpr size_t PIXEL_BYTES = SCREEN_W * SCREEN_H * 2;
-static volatile bool bg_scan_run = false;
-static SemaphoreHandle_t albums_mtx = nullptr;
 
 static void show_msg(const char* line1, const char* line2 = nullptr) {
     M5.Display.fillScreen(COL_BG);
@@ -140,7 +116,6 @@ static void reshuffle(Album& a) {
     a.order.clear();
     a.order.reserve(a.files.size());
     for (size_t i = 0; i < a.files.size(); ++i) a.order.push_back((int)i);
-    // Fisher–Yates
     for (int i = (int)a.order.size() - 1; i > 0; --i) {
         int j = (int)(esp_random() % (uint32_t)(i + 1));
         std::swap(a.order[i], a.order[j]);
@@ -148,15 +123,38 @@ static void reshuffle(Album& a) {
     a.cursor = 0;
 }
 
-// List image filenames in one directory only (no recursion, no sort).
+static void index_path_for(const char* dir, char* out, size_t out_sz) {
+    snprintf(out, out_sz, "%s/%s", dir, INDEX_NAME);
+}
+
+// Fast count only — no String allocations
+static int count_dir_images(const char* dir) {
+    int n = 0;
+    File d = SD.open(dir);
+    if (!d || !d.isDirectory()) { if (d) d.close(); return 0; }
+    for (;;) {
+        File f = d.openNextFile();
+        if (!f) break;
+        if (!f.isDirectory()) {
+            const char* nm = f.name();
+            const char* base = strrchr(nm, '/');
+            base = base ? base + 1 : nm;
+            if (is_image_name(base)) {
+                n++;
+                if (n >= MAX_FILES_PER_ALBUM) { f.close(); break; }
+            }
+        }
+        f.close();
+    }
+    d.close();
+    return n;
+}
+
 static bool scan_dir_images(const char* dir, std::vector<String>& out) {
     out.clear();
     out.reserve(128);
     File d = SD.open(dir);
-    if (!d || !d.isDirectory()) {
-        if (d) d.close();
-        return false;
-    }
+    if (!d || !d.isDirectory()) { if (d) d.close(); return false; }
     for (;;) {
         File f = d.openNextFile();
         if (!f) break;
@@ -166,10 +164,7 @@ static bool scan_dir_images(const char* dir, std::vector<String>& out) {
             base = base ? base + 1 : nm;
             if (is_image_name(base)) {
                 out.push_back(String(base));
-                if ((int)out.size() >= MAX_FILES_PER_ALBUM) {
-                    f.close();
-                    break;
-                }
+                if ((int)out.size() >= MAX_FILES_PER_ALBUM) { f.close(); break; }
             }
         }
         f.close();
@@ -178,60 +173,92 @@ static bool scan_dir_images(const char* dir, std::vector<String>& out) {
     return !out.empty();
 }
 
-// Load file list for one album when first needed (or from background task).
-static bool ensure_album_scanned(int idx) {
-    if (idx < 0 || idx >= (int)albums.size()) return false;
-    if (albums_mtx) xSemaphoreTake(albums_mtx, portMAX_DELAY);
-    if (albums[idx].scanned) {
-        bool has = !albums[idx].files.empty();
-        if (albums_mtx) xSemaphoreGive(albums_mtx);
-        return has;
-    }
-    // Copy path out then release while scanning SD (slow)
-    char path_copy[PATH_MAX_LEN];
-    strncpy(path_copy, albums[idx].path, sizeof(path_copy) - 1);
-    path_copy[sizeof(path_copy) - 1] = 0;
-    if (albums_mtx) xSemaphoreGive(albums_mtx);
+static bool load_index(const char* dir, std::vector<String>& out, int* out_count) {
+    out.clear();
+    char ipath[PATH_MAX_LEN];
+    index_path_for(dir, ipath, sizeof(ipath));
+    if (!SD.exists(ipath)) return false;
+    File f = SD.open(ipath, FILE_READ);
+    if (!f) return false;
 
-    std::vector<String> files;
-    bool ok = scan_dir_images(path_copy, files);
+    String magic = f.readStringUntil('\n');
+    magic.trim();
+    if (magic != "MGIDX1") { f.close(); return false; }
 
-    if (albums_mtx) xSemaphoreTake(albums_mtx, portMAX_DELAY);
-    Album& a = albums[idx];
-    if (!a.scanned) {  // another task may have finished first
-        a.files = std::move(files);
-        a.scanned = true;
-        if (ok && !a.files.empty()) reshuffle(a);
-        else { a.order.clear(); a.cursor = 0; }
+    String cnts = f.readStringUntil('\n');
+    cnts.trim();
+    int cnt = cnts.toInt();
+    if (cnt <= 0 || cnt > MAX_FILES_PER_ALBUM) { f.close(); return false; }
+
+    out.reserve(cnt);
+    while (f.available() && (int)out.size() < cnt) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0 || line[0] == '.') continue;
+        if (!is_image_name(line.c_str())) continue;
+        out.push_back(line);
     }
-    bool has = !a.files.empty();
-    if (albums_mtx) xSemaphoreGive(albums_mtx);
-    return has;
+    f.close();
+    if ((int)out.size() != cnt) { out.clear(); return false; }
+    if (out_count) *out_count = cnt;
+    return true;
 }
 
-// Boot: scan ONLY default (/images root). Subfolders = names only until used.
+static void save_index(const char* dir, const std::vector<String>& files) {
+    char ipath[PATH_MAX_LEN];
+    index_path_for(dir, ipath, sizeof(ipath));
+    File f = SD.open(ipath, FILE_WRITE);
+    if (!f) return;
+    f.println("MGIDX1");
+    f.println((int)files.size());
+    for (const auto& name : files) f.println(name);
+    f.close();
+}
+
+// Prefer index when live count matches; else scan and rewrite index.
+static bool load_album_files(Album& a) {
+    std::vector<String> files;
+    int idx_count = 0;
+    if (load_index(a.path, files, &idx_count)) {
+        int live = count_dir_images(a.path);
+        if (live == idx_count && live > 0) {
+            a.files = std::move(files);
+            reshuffle(a);
+            Serial.printf("index hit %s (%d)\n", a.path, live);
+            return true;
+        }
+        Serial.printf("index stale %s (idx %d live %d)\n", a.path, idx_count, live);
+        files.clear();
+    }
+    if (!scan_dir_images(a.path, files) || files.empty()) {
+        a.files.clear();
+        a.order.clear();
+        a.cursor = 0;
+        return false;
+    }
+    save_index(a.path, files);
+    a.files = std::move(files);
+    reshuffle(a);
+    Serial.printf("index write %s (%d)\n", a.path, (int)a.files.size());
+    return true;
+}
+
+// Single-core: register all albums under /images, load every file list at boot
+// (index hit = fast; first time or after add/remove = scan that folder).
 static bool build_albums() {
     albums.clear();
     album_i = 0;
-
     if (!SD.exists(IMAGES_ROOT)) return false;
 
-    // 1) Default album — full file list (first screen the user sees)
     {
         Album def;
         memset(def.name, 0, sizeof def.name);
         memset(def.path, 0, sizeof def.path);
         strncpy(def.name, "default", sizeof(def.name) - 1);
         strncpy(def.path, IMAGES_ROOT, sizeof(def.path) - 1);
-        def.scanned = false;
-        if (scan_dir_images(IMAGES_ROOT, def.files) && !def.files.empty()) {
-            reshuffle(def);
-            def.scanned = true;
-            albums.push_back(std::move(def));
-        }
+        albums.push_back(std::move(def));
     }
 
-    // 2) Subfolders — register names only (no file listing yet)
     File root = SD.open(IMAGES_ROOT);
     if (root && root.isDirectory()) {
         for (;;) {
@@ -247,7 +274,6 @@ static bool build_albums() {
                     memset(al.path, 0, sizeof al.path);
                     strncpy(al.name, base, sizeof(al.name) - 1);
                     snprintf(al.path, sizeof(al.path), "%s/%s", IMAGES_ROOT, base);
-                    al.scanned = false;
                     albums.push_back(std::move(al));
                 }
             }
@@ -256,30 +282,23 @@ static bool build_albums() {
         root.close();
     }
 
-    return !albums.empty();
-}
-
-// Automatic background scan of remaining albums (no user setting).
-static void bg_scan_task(void*) {
-    bg_scan_run = true;
-    vTaskDelay(pdMS_TO_TICKS(500));
-    for (int i = 0; i < (int)albums.size() && bg_scan_run; ++i) {
-        if (!albums[i].scanned) {
-            ensure_album_scanned(i);
-            vTaskDelay(pdMS_TO_TICKS(30));
+    bool any = false;
+    for (size_t i = 0; i < albums.size(); ++i) {
+        if (load_album_files(albums[i])) any = true;
+    }
+    // Drop empty albums (except keep default slot if it has files or is only one)
+    // Keep structure: empty default is ok if subs have images
+    if (!any) return false;
+    // Prefer starting on default if it has files
+    album_i = 0;
+    if (albums[0].files.empty()) {
+        for (int i = 1; i < (int)albums.size(); ++i) {
+            if (!albums[i].files.empty()) { album_i = i; break; }
         }
     }
-    bg_scan_run = false;
-    vTaskDelete(nullptr);
+    return true;
 }
 
-static void start_bg_scan() {
-    xTaskCreatePinnedToCore(bg_scan_task, "mg_scan", 8192, nullptr, 1, nullptr, 0);
-}
-
-// ---------------------------------------------------------------------------
-//  Image loaders
-// ---------------------------------------------------------------------------
 static bool load_mg(const char* path) {
     File f = SD.open(path, FILE_READ);
     if (!f) return false;
@@ -295,7 +314,6 @@ static bool load_mg(const char* path) {
     if (w == 0 || h == 0 || w > 640 || h > 480) { f.close(); return false; }
 
     size_t need = (size_t)w * (size_t)h * 2;
-    // Fast path: exact screen size → pushImage full screen
     if (w == SCREEN_W && h == SCREEN_H && pixel_buf) {
         size_t got = f.read((uint8_t*)pixel_buf, need);
         f.close();
@@ -306,7 +324,6 @@ static bool load_mg(const char* path) {
         return true;
     }
 
-    // Non-native size: read into temp and push centered (still faster than JPG)
     uint16_t* tmp = (uint16_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!tmp) tmp = (uint16_t*)malloc(need);
     if (!tmp) { f.close(); return false; }
@@ -324,36 +341,25 @@ static bool load_mg(const char* path) {
     return true;
 }
 
-// M5GFX DataWrapperT<fs::SDFS> is abstract on current cores — avoid draw*File(SD, …).
-// Load the whole file into PSRAM/heap and decode from the buffer instead.
 static bool load_jpg_png(const char* path, bool png) {
     File f = SD.open(path, FILE_READ);
     if (!f) return false;
     size_t sz = f.size();
-    if (sz == 0 || sz > 2 * 1024 * 1024) { // hard cap 2 MB
-        f.close();
-        return false;
-    }
+    if (sz == 0 || sz > 2 * 1024 * 1024) { f.close(); return false; }
     uint8_t* buf = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) buf = (uint8_t*)malloc(sz);
     if (!buf) { f.close(); return false; }
-
     size_t got = f.read(buf, sz);
     f.close();
     if (got != sz) { free(buf); return false; }
 
     M5.Display.fillScreen(COL_BG);
-    bool ok = false;
-    if (png) {
-        ok = M5.Display.drawPng(buf, sz, 0, 0);
-    } else {
-        ok = M5.Display.drawJpg(buf, sz, 0, 0);
-    }
+    bool ok = png ? M5.Display.drawPng(buf, sz, 0, 0)
+                  : M5.Display.drawJpg(buf, sz, 0, 0);
     free(buf);
     return ok;
 }
 
-// default album is always index 0 when present (built first in build_albums)
 static bool in_default_album() {
     return !albums.empty() && album_i == 0 &&
            strcmp(albums[0].name, "default") == 0;
@@ -361,33 +367,23 @@ static bool in_default_album() {
 
 static bool show_current() {
     if (albums.empty()) return false;
-    if (!ensure_album_scanned(album_i)) return false;
     Album& a = albums[album_i];
     if (a.files.empty()) return false;
 
     if (a.cursor < 0) a.cursor = 0;
-    if (a.cursor >= (int)a.order.size()) {
-        reshuffle(a);
-    }
+    if (a.cursor >= (int)a.order.size()) reshuffle(a);
+
     int fi = a.order[a.cursor];
     const String& fname = a.files[fi];
-
     char path[PATH_MAX_LEN];
     snprintf(path, sizeof(path), "%s/%s", a.path, fname.c_str());
 
     bool ok = false;
-    if (ends_with_mg(fname.c_str())) {
-        ok = load_mg(path);
-    } else if (ends_with_png(fname.c_str())) {
-        ok = load_jpg_png(path, true);
-    } else {
-        ok = load_jpg_png(path, false);
-    }
+    if (ends_with_mg(fname.c_str())) ok = load_mg(path);
+    else if (ends_with_png(fname.c_str())) ok = load_jpg_png(path, true);
+    else ok = load_jpg_png(path, false);
 
-    // No on-screen text or labels — blank frame if load fails
-    if (!ok) {
-        M5.Display.fillScreen(COL_BG);
-    }
+    if (!ok) M5.Display.fillScreen(COL_BG);
     return ok;
 }
 
@@ -396,9 +392,7 @@ static void next_image() {
     Album& a = albums[album_i];
     if (a.files.empty()) return;
     a.cursor++;
-    if (a.cursor >= (int)a.order.size()) {
-        reshuffle(a);
-    }
+    if (a.cursor >= (int)a.order.size()) reshuffle(a);
     show_current();
 }
 
@@ -406,31 +400,23 @@ static void prev_image() {
     if (albums.empty()) return;
     Album& a = albums[album_i];
     if (a.files.empty()) return;
-    if (a.cursor <= 0) {
-        // wrap to end of current shuffle without reshuffling mid-cycle
-        a.cursor = (int)a.order.size() - 1;
-    } else {
-        a.cursor--;
-    }
+    if (a.cursor <= 0) a.cursor = (int)a.order.size() - 1;
+    else a.cursor--;
     show_current();
 }
 
-// Cycle subfolders only (skip default at index 0 when it is "default")
 static void change_subfolder(int delta) {
     if (albums.size() < 2) return;
-    int start = 0;
-    if (strcmp(albums[0].name, "default") == 0) start = 1;
+    int start = (strcmp(albums[0].name, "default") == 0) ? 1 : 0;
     int n = (int)albums.size() - start;
     if (n <= 0) return;
-
     int rel = album_i - start;
     if (rel < 0) rel = 0;
-    // Step until we land on a folder that has images (or tried all)
     for (int tried = 0; tried < n; ++tried) {
         rel = (rel + delta) % n;
         if (rel < 0) rel += n;
         int idx = start + rel;
-        if (ensure_album_scanned(idx) && !albums[idx].files.empty()) {
+        if (!albums[idx].files.empty()) {
             album_i = idx;
             show_current();
             return;
@@ -441,6 +427,11 @@ static void change_subfolder(int delta) {
 static void go_default_album() {
     if (albums.empty()) return;
     album_i = 0;
+    if (albums[0].files.empty()) {
+        for (int i = 1; i < (int)albums.size(); ++i) {
+            if (!albums[i].files.empty()) { album_i = i; break; }
+        }
+    }
     show_current();
 }
 
@@ -449,10 +440,9 @@ static void enter_random_subfolder() {
     int start = (strcmp(albums[0].name, "default") == 0) ? 1 : 0;
     int n = (int)albums.size() - start;
     if (n <= 0) return;
-    // Try a few random picks in case a folder is empty
     for (int attempt = 0; attempt < n; ++attempt) {
         int pick = start + (int)(esp_random() % (uint32_t)n);
-        if (ensure_album_scanned(pick) && !albums[pick].files.empty()) {
+        if (!albums[pick].files.empty()) {
             album_i = pick;
             show_current();
             return;
@@ -460,17 +450,13 @@ static void enter_random_subfolder() {
     }
 }
 
-// Progress bar at bottom: yellow → red as t goes 0..1
 static void draw_hold_bar(float t) {
     if (t < 0) t = 0;
     if (t > 1) t = 1;
     const int bar_h = 8;
     const int y = SCREEN_H - bar_h;
     M5.Display.fillRect(0, y, SCREEN_W, bar_h, COL_BAR_BG);
-    // lerp yellow → red
-    uint8_t r = 255;
-    uint8_t g = (uint8_t)(255 * (1.0f - t));
-    uint8_t b = 0;
+    uint8_t r = 255, g = (uint8_t)(255 * (1.0f - t)), b = 0;
     uint16_t col = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
     int w = (int)(t * SCREEN_W);
     if (w > 0) M5.Display.fillRect(0, y, w, bar_h, col);
@@ -480,40 +466,35 @@ static uint32_t random_slide_ms() {
     return SLIDE_MIN_MS + (esp_random() % (SLIDE_MAX_MS - SLIDE_MIN_MS + 1));
 }
 
-// ---------------------------------------------------------------------------
-//  Interaction state
-// ---------------------------------------------------------------------------
-static bool     slideshow      = false;
-static uint32_t slide_due_ms   = 0;   // when to auto-advance in slideshow
-static uint32_t slide_span_ms  = 0;   // current photo dwell
+static bool     slideshow     = false;
+static uint32_t slide_due_ms  = 0;
+static uint32_t slide_span_ms = 0;
 
-static bool     btn_b_holding  = false;
-static uint32_t btn_b_t0       = 0;
-static float    btn_b_last_t   = -1;
+static bool     btn_b_holding = false;
+static uint32_t btn_b_t0      = 0;
+static float    btn_b_last_t  = -1;
 
-static bool     touch_down     = false;
-static int16_t  touch_x0       = 0, touch_y0 = 0;
-static int16_t  touch_x1       = 0, touch_y1 = 0;  // last point while pressed
-static uint32_t touch_t0       = 0;
-static bool     touch_moved    = false;
+static bool     touch_down  = false;
+static int16_t  touch_x0 = 0, touch_y0 = 0;
+static int16_t  touch_x1 = 0, touch_y1 = 0;
+static uint32_t touch_t0    = 0;
+static bool     touch_moved = false;
 
-// ---------------------------------------------------------------------------
 void setup() {
     auto cfg = M5.config();
     cfg.clear_display = true;
     M5.begin(cfg);
 
     M5.Display.setBrightness(200);
-    M5.Display.setRotation(1); // landscape 320x240
+    M5.Display.setRotation(1);
     M5.Display.fillScreen(COL_BG);
 
     Serial.begin(115200);
-    Serial.println("Mantis Gallery");
+    Serial.println("Mantis Gallery (index cache)");
 
     pixel_buf = (uint16_t*)heap_caps_malloc(PIXEL_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!pixel_buf) {
+    if (!pixel_buf)
         pixel_buf = (uint16_t*)heap_caps_malloc(PIXEL_BYTES, MALLOC_CAP_8BIT);
-    }
 
     show_msg("Mounting SD…");
     if (!sd_begin()) {
@@ -521,42 +502,30 @@ void setup() {
         while (true) { M5.update(); delay(200); }
     }
 
-    albums_mtx = xSemaphoreCreateMutex();
-    show_msg("Scanning /images…");
+    show_msg("Loading /images…");
     if (!build_albums()) {
         show_msg("No images found", "See IMAGE_SPEC.txt");
         while (true) { M5.update(); delay(200); }
     }
 
-    Serial.printf("Albums registered: %d (default scanned, others lazy)\n", (int)albums.size());
     for (auto& a : albums) {
-        Serial.printf("  %s (%s) scanned=%d files=%d\n",
-                      a.name, a.path, (int)a.scanned, (int)a.files.size());
+        Serial.printf("  %s (%s) %d files\n", a.name, a.path, (int)a.files.size());
     }
 
     show_current();
-    start_bg_scan();  // automatic — no user option
 }
 
 void loop() {
     M5.update();
     uint32_t now = millis();
 
-    // ---- Btn C hold = power off (always) ----
-    if (M5.BtnC.wasHold()) {
-        M5.Power.powerOff();
-    }
+    if (M5.BtnC.wasHold()) M5.Power.powerOff();
 
-    // ---- Album navigation ----
-    // Default: A/C ignored for folders. Subfolders: short A/C cycle peers.
     if (!in_default_album()) {
         if (M5.BtnA.wasClicked()) change_subfolder(-1);
         if (M5.BtnC.wasClicked()) change_subfolder(+1);
     }
 
-    // ---- Btn B ----
-    // Default: long-press with yellow→red bar → random subfolder
-    // Subfolder: short press → jump back to default
     if (in_default_album()) {
         if (M5.BtnB.isPressed()) {
             if (!btn_b_holding) {
@@ -573,7 +542,6 @@ void loop() {
             if (t >= 1.0f) {
                 btn_b_holding = false;
                 btn_b_last_t = -1;
-                // wait for release so we don't retrigger
                 while (M5.BtnB.isPressed()) { M5.update(); delay(10); }
                 enter_random_subfolder();
                 if (slideshow) {
@@ -582,7 +550,6 @@ void loop() {
                 }
             }
         } else if (btn_b_holding) {
-            // released early — cancel bar, restore image
             btn_b_holding = false;
             btn_b_last_t = -1;
             show_current();
@@ -598,7 +565,6 @@ void loop() {
         }
     }
 
-    // ---- Touch: swipe L/R, long-press = slideshow, tap in slideshow = 2× dwell ----
     auto td = M5.Touch.getDetail();
     if (td.isPressed() && td.x >= 0) {
         if (!touch_down) {
@@ -619,14 +585,12 @@ void loop() {
         uint32_t held = now - touch_t0;
 
         if (!touch_moved && held >= TOUCH_LONG_MS) {
-            // Long press on screen → toggle slideshow on/off
             slideshow = !slideshow;
             if (slideshow) {
                 slide_span_ms = random_slide_ms();
                 slide_due_ms = now + slide_span_ms;
             }
         } else if (abs(dx) >= SWIPE_MIN_PX) {
-            // Swipe right → next, swipe left → previous
             if (dx > 0) next_image();
             else        prev_image();
             if (slideshow) {
@@ -634,7 +598,6 @@ void loop() {
                 slide_due_ms = millis() + slide_span_ms;
             }
         } else if (!touch_moved && held < TOUCH_LONG_MS) {
-            // Short tap during slideshow → double remaining/current dwell
             if (slideshow) {
                 slide_span_ms = slide_span_ms * 2;
                 if (slide_span_ms > 60000) slide_span_ms = 60000;
@@ -643,7 +606,6 @@ void loop() {
         }
     }
 
-    // ---- Slideshow auto-advance ----
     if (slideshow && !btn_b_holding && (int32_t)(now - slide_due_ms) >= 0) {
         next_image();
         slide_span_ms = random_slide_ms();
