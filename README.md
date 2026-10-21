@@ -41,7 +41,7 @@ See **`IMAGE_SPEC.txt`** for exact resolution and the `.mg` binary format.
 
 ## Fast path (recommended)
 
-JPEG/PNG decode on ESP32 is fine for a few images; for large folders use the converter:
+JPEG/PNG decode on ESP32 is fine for a few images; for large folders use the converter. You need python and pillow installed. there is a tkinter interface to make it easy:
 
 ```bash
 pip install pillow
