@@ -94,13 +94,21 @@
         <a href="./IMAGE_SPEC.txt" download>IMAGE_SPEC.txt</a>
         — 320×240, <code>.mg</code> format, SD layout, controls.
       </div>
+      <div class="feat">
+        <strong>MG converter (Tkinter)</strong>
+        <a href="./mg_convert.py" download>mg_convert.py</a>
+        — laptop tool: JPG/PNG → <code>.mg</code>, keeps folder structure, writes <code>.mg_index</code>.
+        Needs <code>pip install pillow</code>, then <code>python mg_convert.py</code>.
+      </div>
     </section>
 
     <section class="step">
       <h2><span class="pip">2</span>Prepare the SD card</h2>
       <p>
-        FAT32 card. Create <code>/images</code>. Put JPG/PNG there, or convert with
-        <code>tools/mg_convert.py</code> for the fast <code>.mg</code> format.
+        FAT32 card. Create <code>/images</code>. Convert with
+        <a href="./mg_convert.py" download>mg_convert.py</a>
+        for the fast <code>.mg</code> format (and optional <strong>Write indexes only</strong>
+        against the card’s <code>/images</code> folder so first boot is quick).
         Files in <code>/images</code> = default album. Subfolders = extra albums.
       </p>
     </section>

@@ -109,8 +109,7 @@ INDEX CACHE (automatic)
 --------------------------------------------------------------------------------
   Each album folder may contain a hidden list file:
       .mg_index
-  Written by the firmware after a full scan. On the next boot, if the number
-  of images in that folder still matches the index count, the list is reused
-  (fast). If you add or remove images, the count changes and that folder is
-  scanned again, then the index is rewritten.
+  Written by the firmware after a full scan. On the next boot, when present and valid, the list is reused with no directory walk (fast).
+  If you add or remove images by hand, delete that folder's .mg_index (or run
+  the converter "Write indexes only") so the next boot rescans and rewrites it.
   You can delete .mg_index files anytime to force a rescan.

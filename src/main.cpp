@@ -90,6 +90,7 @@ struct Album {
     std::vector<String> files;
     std::vector<int> order;
     int cursor = 0;
+    bool loaded = false;  // file list filled (from index or scan)
 };
 
 static std::vector<Album> albums;
@@ -125,29 +126,6 @@ static void reshuffle(Album& a) {
 
 static void index_path_for(const char* dir, char* out, size_t out_sz) {
     snprintf(out, out_sz, "%s/%s", dir, INDEX_NAME);
-}
-
-// Fast count only — no String allocations
-static int count_dir_images(const char* dir) {
-    int n = 0;
-    File d = SD.open(dir);
-    if (!d || !d.isDirectory()) { if (d) d.close(); return 0; }
-    for (;;) {
-        File f = d.openNextFile();
-        if (!f) break;
-        if (!f.isDirectory()) {
-            const char* nm = f.name();
-            const char* base = strrchr(nm, '/');
-            base = base ? base + 1 : nm;
-            if (is_image_name(base)) {
-                n++;
-                if (n >= MAX_FILES_PER_ALBUM) { f.close(); break; }
-            }
-        }
-        f.close();
-    }
-    d.close();
-    return n;
 }
 
 static bool scan_dir_images(const char* dir, std::vector<String>& out) {
@@ -215,36 +193,135 @@ static void save_index(const char* dir, const std::vector<String>& files) {
     f.close();
 }
 
-// Prefer index when live count matches; else scan and rewrite index.
-static bool load_album_files(Album& a) {
+// Append any on-disk images not already in the album list; rewrite index if needed.
+// Used when a shuffle cycle finishes — not on every boot (keeps startup fast).
+static int merge_new_files(Album& a) {
+    File d = SD.open(a.path);
+    if (!d || !d.isDirectory()) { if (d) d.close(); return 0; }
+
+    // Build a simple membership check (linear; albums capped at MAX_FILES_PER_ALBUM)
+    int added = 0;
+    for (;;) {
+        File f = d.openNextFile();
+        if (!f) break;
+        if (!f.isDirectory()) {
+            const char* nm = f.name();
+            const char* base = strrchr(nm, '/');
+            base = base ? base + 1 : nm;
+            if (is_image_name(base)) {
+                bool found = false;
+                for (const auto& existing : a.files) {
+                    if (existing == base) { found = true; break; }
+                }
+                if (!found && (int)a.files.size() < MAX_FILES_PER_ALBUM) {
+                    a.files.push_back(String(base));
+                    added++;
+                }
+            }
+        }
+        f.close();
+    }
+    d.close();
+    if (added > 0) {
+        save_index(a.path, a.files);
+        a.loaded = true;
+        Serial.printf("index append %s (+%d → %d)\n", a.path, added, (int)a.files.size());
+    }
+    return added;
+}
+
+// Drop one missing/corrupt filename from the in-memory list + index (no crash).
+static void remove_file_at(Album& a, int file_index) {
+    if (file_index < 0 || file_index >= (int)a.files.size()) return;
+    a.files.erase(a.files.begin() + file_index);
+    // Rebuild shuffle order from scratch
+    if (!a.files.empty()) {
+        reshuffle(a);
+        save_index(a.path, a.files);
+    } else {
+        a.order.clear();
+        a.cursor = 0;
+        save_index(a.path, a.files);
+    }
+}
+
+// Index hit = fast. Full directory scan only when needed (first open, no index).
+static bool load_album_files(Album& a, bool allow_scan) {
     std::vector<String> files;
     int idx_count = 0;
-    if (load_index(a.path, files, &idx_count)) {
-        int live = count_dir_images(a.path);
-        if (live == idx_count && live > 0) {
-            a.files = std::move(files);
-            reshuffle(a);
-            Serial.printf("index hit %s (%d)\n", a.path, live);
-            return true;
-        }
-        Serial.printf("index stale %s (idx %d live %d)\n", a.path, idx_count, live);
-        files.clear();
+    if (load_index(a.path, files, &idx_count) && idx_count > 0 && !files.empty()) {
+        a.files = std::move(files);
+        reshuffle(a);
+        a.loaded = true;
+        Serial.printf("index hit %s (%d)\n", a.path, idx_count);
+        return true;
+    }
+    files.clear();
+    if (!allow_scan) {
+        a.loaded = false;
+        return false;
     }
     if (!scan_dir_images(a.path, files) || files.empty()) {
         a.files.clear();
         a.order.clear();
         a.cursor = 0;
+        a.loaded = true;  // know it's empty
         return false;
     }
     save_index(a.path, files);
     a.files = std::move(files);
     reshuffle(a);
+    a.loaded = true;
     Serial.printf("index write %s (%d)\n", a.path, (int)a.files.size());
     return true;
 }
 
-// Single-core: register all albums under /images, load every file list at boot
-// (index hit = fast; first time or after add/remove = scan that folder).
+static bool ensure_album_ready(int idx) {
+    if (idx < 0 || idx >= (int)albums.size()) return false;
+    Album& a = albums[idx];
+    if (a.loaded && !a.files.empty()) return true;
+    if (a.loaded && a.files.empty()) return false;
+    // Not loaded yet: try index, else scan once (happens when user opens the folder)
+    return load_album_files(a, true) && !a.files.empty();
+}
+
+// Pick up subfolders other apps created under /images (names only — no file scan).
+static void refresh_subfolders() {
+    if (!SD.exists(IMAGES_ROOT)) return;
+    File root = SD.open(IMAGES_ROOT);
+    if (!root || !root.isDirectory()) { if (root) root.close(); return; }
+
+    for (;;) {
+        File f = root.openNextFile();
+        if (!f) break;
+        if (f.isDirectory()) {
+            const char* nm = f.name();
+            const char* base = strrchr(nm, '/');
+            base = base ? base + 1 : nm;
+            if (base[0] != '.' && (int)albums.size() < MAX_ALBUMS) {
+                bool exists = false;
+                for (const auto& al : albums) {
+                    if (strcmp(al.name, base) == 0) { exists = true; break; }
+                }
+                if (!exists) {
+                    Album al;
+                    memset(al.name, 0, sizeof al.name);
+                    memset(al.path, 0, sizeof al.path);
+                    strncpy(al.name, base, sizeof(al.name) - 1);
+                    snprintf(al.path, sizeof(al.path), "%s/%s", IMAGES_ROOT, base);
+                    al.loaded = false;
+                    albums.push_back(std::move(al));
+                    Serial.printf("new album: %s\n", base);
+                }
+            }
+        }
+        f.close();
+    }
+    root.close();
+}
+
+// Boot: register folder names + load indexes only. Never full-scan every folder.
+// Default album: index or one scan so we have something to show.
 static bool build_albums() {
     albums.clear();
     album_i = 0;
@@ -256,40 +333,36 @@ static bool build_albums() {
         memset(def.path, 0, sizeof def.path);
         strncpy(def.name, "default", sizeof(def.name) - 1);
         strncpy(def.path, IMAGES_ROOT, sizeof(def.path) - 1);
+        def.loaded = false;
         albums.push_back(std::move(def));
     }
 
-    File root = SD.open(IMAGES_ROOT);
-    if (root && root.isDirectory()) {
-        for (;;) {
-            File f = root.openNextFile();
-            if (!f) break;
-            if (f.isDirectory()) {
-                const char* nm = f.name();
-                const char* base = strrchr(nm, '/');
-                base = base ? base + 1 : nm;
-                if (base[0] != '.' && (int)albums.size() < MAX_ALBUMS) {
-                    Album al;
-                    memset(al.name, 0, sizeof al.name);
-                    memset(al.path, 0, sizeof al.path);
-                    strncpy(al.name, base, sizeof(al.name) - 1);
-                    snprintf(al.path, sizeof(al.path), "%s/%s", IMAGES_ROOT, base);
-                    albums.push_back(std::move(al));
-                }
-            }
-            f.close();
-        }
-        root.close();
+    refresh_subfolders();  // name registration only
+
+    // Default: allow scan if no index (need a first image)
+    load_album_files(albums[0], true);
+
+    // Other albums: index only at boot — scan deferred until user opens them
+    for (size_t i = 1; i < albums.size(); ++i) {
+        load_album_files(albums[i], false);
     }
 
     bool any = false;
-    for (size_t i = 0; i < albums.size(); ++i) {
-        if (load_album_files(albums[i])) any = true;
+    for (auto& a : albums) {
+        if (!a.files.empty()) any = true;
     }
-    // Drop empty albums (except keep default slot if it has files or is only one)
-    // Keep structure: empty default is ok if subs have images
+    // Might only have unloaded subs with no index yet — still OK; open will scan
+    if (!any) {
+        for (size_t i = 1; i < albums.size(); ++i) {
+            if (load_album_files(albums[i], true) && !albums[i].files.empty()) {
+                any = true;
+                album_i = (int)i;
+                break;
+            }
+        }
+    }
     if (!any) return false;
-    // Prefer starting on default if it has files
+
     album_i = 0;
     if (albums[0].files.empty()) {
         for (int i = 1; i < (int)albums.size(); ++i) {
@@ -367,24 +440,49 @@ static bool in_default_album() {
 
 static bool show_current() {
     if (albums.empty()) return false;
+    if (!ensure_album_ready(album_i)) return false;
     Album& a = albums[album_i];
     if (a.files.empty()) return false;
 
-    if (a.cursor < 0) a.cursor = 0;
-    if (a.cursor >= (int)a.order.size()) reshuffle(a);
+    // Try several entries so a missing file never bricks the UI
+    const int max_tries = (int)a.files.size();
+    for (int attempt = 0; attempt < max_tries; ++attempt) {
+        if (a.cursor < 0) a.cursor = 0;
+        if (a.order.empty()) reshuffle(a);
+        if (a.cursor >= (int)a.order.size()) {
+            // End of cycle: pick up any new files on disk, then reshuffle
+            merge_new_files(a);
+            reshuffle(a);
+            if (a.files.empty()) return false;
+        }
 
-    int fi = a.order[a.cursor];
-    const String& fname = a.files[fi];
-    char path[PATH_MAX_LEN];
-    snprintf(path, sizeof(path), "%s/%s", a.path, fname.c_str());
+        int fi = a.order[a.cursor];
+        if (fi < 0 || fi >= (int)a.files.size()) {
+            reshuffle(a);
+            continue;
+        }
+        const String fname = a.files[fi];  // copy — may erase
+        char pathbuf[PATH_MAX_LEN];
+        snprintf(pathbuf, sizeof(pathbuf), "%s/%s", a.path, fname.c_str());
 
-    bool ok = false;
-    if (ends_with_mg(fname.c_str())) ok = load_mg(path);
-    else if (ends_with_png(fname.c_str())) ok = load_jpg_png(path, true);
-    else ok = load_jpg_png(path, false);
+        bool ok = false;
+        if (ends_with_mg(fname.c_str())) ok = load_mg(pathbuf);
+        else if (ends_with_png(fname.c_str())) ok = load_jpg_png(pathbuf, true);
+        else ok = load_jpg_png(pathbuf, false);
 
-    if (!ok) M5.Display.fillScreen(COL_BG);
-    return ok;
+        if (ok) return true;
+
+        // Missing or bad file — drop from list/index and try next
+        Serial.printf("skip missing %s\n", pathbuf);
+        remove_file_at(a, fi);
+        if (a.files.empty()) {
+            M5.Display.fillScreen(COL_BG);
+            return false;
+        }
+        // remove_file_at reshuffled; stay on cursor 0
+    }
+    M5.Display.fillScreen(COL_BG);
+    return false;
 }
 
 static void next_image() {
@@ -392,7 +490,10 @@ static void next_image() {
     Album& a = albums[album_i];
     if (a.files.empty()) return;
     a.cursor++;
-    if (a.cursor >= (int)a.order.size()) reshuffle(a);
+    if (a.cursor >= (int)a.order.size()) {
+        merge_new_files(a);  // new files land in the next shuffle
+        reshuffle(a);
+    }
     show_current();
 }
 
@@ -406,6 +507,7 @@ static void prev_image() {
 }
 
 static void change_subfolder(int delta) {
+    refresh_subfolders();
     if (albums.size() < 2) return;
     int start = (strcmp(albums[0].name, "default") == 0) ? 1 : 0;
     int n = (int)albums.size() - start;
@@ -416,7 +518,7 @@ static void change_subfolder(int delta) {
         rel = (rel + delta) % n;
         if (rel < 0) rel += n;
         int idx = start + rel;
-        if (!albums[idx].files.empty()) {
+        if (ensure_album_ready(idx)) {
             album_i = idx;
             show_current();
             return;
@@ -427,22 +529,25 @@ static void change_subfolder(int delta) {
 static void go_default_album() {
     if (albums.empty()) return;
     album_i = 0;
+    ensure_album_ready(0);
     if (albums[0].files.empty()) {
+        refresh_subfolders();
         for (int i = 1; i < (int)albums.size(); ++i) {
-            if (!albums[i].files.empty()) { album_i = i; break; }
+            if (ensure_album_ready(i)) { album_i = i; break; }
         }
     }
     show_current();
 }
 
 static void enter_random_subfolder() {
+    refresh_subfolders();
     if (albums.size() < 2) return;
     int start = (strcmp(albums[0].name, "default") == 0) ? 1 : 0;
     int n = (int)albums.size() - start;
     if (n <= 0) return;
-    for (int attempt = 0; attempt < n; ++attempt) {
+    for (int attempt = 0; attempt < n * 2; ++attempt) {
         int pick = start + (int)(esp_random() % (uint32_t)n);
-        if (!albums[pick].files.empty()) {
+        if (ensure_album_ready(pick)) {
             album_i = pick;
             show_current();
             return;
