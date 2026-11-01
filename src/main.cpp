@@ -67,7 +67,8 @@ static bool is_image_name(const char* name) {
             if (low(name[n - sl + i]) != suf[i]) return false;
         return true;
     };
-    return match(".mg", 3) || match(".jpg", 4) || match(".png", 4) || match(".jpeg", 5);
+    // PNG support was dropped to keep the PNG decoder out of flash; convert PNGs to .mg or .jpg.
+    return match(".mg", 3) || match(".jpg", 4) || match(".jpeg", 5);
 }
 
 static bool ends_with_mg(const char* name) {
@@ -420,8 +421,8 @@ static bool load_jpg_png(const char* path, bool png) {
     if (got != sz) { free(buf); return false; }
 
     M5.Display.fillScreen(COL_BG);
-    bool ok = png ? M5.Display.drawPng(buf, sz, 0, 0)
-                  : M5.Display.drawJpg(buf, sz, 0, 0);
+    (void)png; // PNG no longer supported (never reached: is_image_name skips .png)
+    bool ok = M5.Display.drawJpg(buf, sz, 0, 0);
     free(buf);
     return ok;
 }
