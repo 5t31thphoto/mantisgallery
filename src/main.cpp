@@ -10,6 +10,7 @@
 
 #include <M5Unified.h>
 #include <SD.h>
+#include <dirent.h>
 #include <SPI.h>
 #include <string.h>
 #include <stdlib.h>
@@ -128,27 +129,32 @@ static void index_path_for(const char* dir, char* out, size_t out_sz) {
     snprintf(out, out_sz, "%s/%s", dir, INDEX_NAME);
 }
 
+// Fast directory listing: readdir() on the SD mount reports file vs folder straight from the
+// directory table. File::openNextFile() opens every entry (each image too), which costs several ms
+// per file - that walk over /images on every folder change was what made switching folders slow.
+static constexpr const char* SD_MOUNT = "/sd";   // SD.begin() default mount point
+template <typename Fn>
+static bool for_each_entry(const char* dir, Fn fn) {
+    char p[PATH_MAX_LEN + 8];
+    snprintf(p, sizeof(p), "%s%s", SD_MOUNT, dir);
+    DIR* d = opendir(p);
+    if (!d) return false;
+    while (struct dirent* e = readdir(d)) {
+        if (e->d_name[0] == '.') continue;
+        if (!fn(e->d_name, e->d_type == DT_DIR)) break;
+    }
+    closedir(d);
+    return true;
+}
+
 static bool scan_dir_images(const char* dir, std::vector<String>& out) {
     out.clear();
     out.reserve(128);
-    File d = SD.open(dir);
-    if (!d || !d.isDirectory()) { if (d) d.close(); return false; }
-    for (;;) {
-        File f = d.openNextFile();
-        if (!f) break;
-        if (!f.isDirectory()) {
-            const char* nm = f.name();
-            const char* base = strrchr(nm, '/');
-            base = base ? base + 1 : nm;
-            if (is_image_name(base)) {
-                out.push_back(String(base));
-                if ((int)out.size() >= MAX_FILES_PER_ALBUM) { f.close(); break; }
-            }
-        }
-        f.close();
-    }
-    d.close();
-    return !out.empty();
+    bool ok = for_each_entry(dir, [&](const char* base, bool isDir) {
+        if (!isDir && is_image_name(base)) out.push_back(String(base));
+        return (int)out.size() < MAX_FILES_PER_ALBUM;
+    });
+    return ok && !out.empty();
 }
 
 static bool load_index(const char* dir, std::vector<String>& out, int* out_count) {
@@ -158,25 +164,37 @@ static bool load_index(const char* dir, std::vector<String>& out, int* out_count
     if (!SD.exists(ipath)) return false;
     File f = SD.open(ipath, FILE_READ);
     if (!f) return false;
-
-    String magic = f.readStringUntil('\n');
-    magic.trim();
-    if (magic != "MGIDX1") { f.close(); return false; }
-
-    String cnts = f.readStringUntil('\n');
-    cnts.trim();
-    int cnt = cnts.toInt();
-    if (cnt <= 0 || cnt > MAX_FILES_PER_ALBUM) { f.close(); return false; }
-
-    out.reserve(cnt);
-    while (f.available() && (int)out.size() < cnt) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0 || line[0] == '.') continue;
-        if (!is_image_name(line.c_str())) continue;
-        out.push_back(line);
-    }
+    // One read for the whole index (readStringUntil pulls it a byte at a time).
+    size_t sz = f.size();
+    if (sz < 8 || sz > (size_t)MAX_FILES_PER_ALBUM * (NAME_MAX_LEN + 8) + 32) { f.close(); return false; }
+    char* buf = (char*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = (char*)malloc(sz + 1);
+    if (!buf) { f.close(); return false; }
+    size_t got = f.read((uint8_t*)buf, sz);
     f.close();
+    buf[got] = 0;
+
+    int cnt = -1;
+    int lineNo = 0;
+    char* save = nullptr;
+    for (char* line = strtok_r(buf, "\r\n", &save); line; line = strtok_r(nullptr, "\r\n", &save), ++lineNo) {
+        while (*line == ' ' || *line == '\t') ++line;
+        if (lineNo == 0) {
+            if (strcmp(line, "MGIDX1") != 0) break;
+            continue;
+        }
+        if (lineNo == 1) {
+            cnt = atoi(line);
+            if (cnt <= 0 || cnt > MAX_FILES_PER_ALBUM) { cnt = -1; break; }
+            out.reserve(cnt);
+            continue;
+        }
+        if ((int)out.size() >= cnt) break;
+        if (line[0] == '.' || !is_image_name(line)) continue;
+        out.push_back(String(line));
+    }
+    free(buf);
+    if (cnt <= 0) { out.clear(); return false; }
     if ((int)out.size() != cnt) { out.clear(); return false; }
     if (out_count) *out_count = cnt;
     return true;
@@ -196,32 +214,17 @@ static void save_index(const char* dir, const std::vector<String>& files) {
 // Append any on-disk images not already in the album list; rewrite index if needed.
 // Used when a shuffle cycle finishes — not on every boot (keeps startup fast).
 static int merge_new_files(Album& a) {
-    File d = SD.open(a.path);
-    if (!d || !d.isDirectory()) { if (d) d.close(); return 0; }
-
-    // Build a simple membership check (linear; albums capped at MAX_FILES_PER_ALBUM)
+    // Membership check is linear; albums are capped at MAX_FILES_PER_ALBUM
     int added = 0;
-    for (;;) {
-        File f = d.openNextFile();
-        if (!f) break;
-        if (!f.isDirectory()) {
-            const char* nm = f.name();
-            const char* base = strrchr(nm, '/');
-            base = base ? base + 1 : nm;
-            if (is_image_name(base)) {
-                bool found = false;
-                for (const auto& existing : a.files) {
-                    if (existing == base) { found = true; break; }
-                }
-                if (!found && (int)a.files.size() < MAX_FILES_PER_ALBUM) {
-                    a.files.push_back(String(base));
-                    added++;
-                }
-            }
-        }
-        f.close();
-    }
-    d.close();
+    for_each_entry(a.path, [&](const char* base, bool isDir) {
+        if (isDir || !is_image_name(base)) return true;
+        for (const auto& existing : a.files)
+            if (existing == base) return true;
+        if ((int)a.files.size() >= MAX_FILES_PER_ALBUM) return false;
+        a.files.push_back(String(base));
+        added++;
+        return true;
+    });
     if (added > 0) {
         save_index(a.path, a.files);
         a.loaded = true;
@@ -287,18 +290,9 @@ static bool ensure_album_ready(int idx) {
 
 // Pick up subfolders other apps created under /images (names only — no file scan).
 static void refresh_subfolders() {
-    if (!SD.exists(IMAGES_ROOT)) return;
-    File root = SD.open(IMAGES_ROOT);
-    if (!root || !root.isDirectory()) { if (root) root.close(); return; }
-
-    for (;;) {
-        File f = root.openNextFile();
-        if (!f) break;
-        if (f.isDirectory()) {
-            const char* nm = f.name();
-            const char* base = strrchr(nm, '/');
-            base = base ? base + 1 : nm;
-            if (base[0] != '.' && (int)albums.size() < MAX_ALBUMS) {
+    for_each_entry(IMAGES_ROOT, [&](const char* base, bool isDir) {
+        if (isDir) {
+            if ((int)albums.size() < MAX_ALBUMS) {
                 bool exists = false;
                 for (const auto& al : albums) {
                     if (strcmp(al.name, base) == 0) { exists = true; break; }
@@ -315,9 +309,8 @@ static void refresh_subfolders() {
                 }
             }
         }
-        f.close();
-    }
-    root.close();
+        return true;
+    });
 }
 
 // Boot: register folder names + load indexes only. Never full-scan every folder.
