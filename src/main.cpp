@@ -5,7 +5,8 @@
  * Per-folder ".mg_index": if file count matches, reuse list (fast boot).
  * Mismatch or missing index → full scan and rewrite index.
  *
- * UX unchanged: hold B / A·C / swipe / long-press slideshow.
+ * UX: hold B / A·C / swipe / long-press slideshow.
+ * Easter egg: triple-tap a photo to open the jiggle editor on it; tap a jiggly zone to poke it.
  */
 
 #include <M5Unified.h>
@@ -16,6 +17,7 @@
 #include <stdlib.h>
 #include <vector>
 #include <algorithm>
+#include "jiggle.h"
 
 static constexpr uint16_t COL_BG     = 0x18C3;
 static constexpr uint16_t COL_TEAL   = 0x038E;
@@ -35,12 +37,13 @@ static constexpr uint32_t TOUCH_LONG_MS = 650;
 static constexpr int      SWIPE_MIN_PX  = 40;
 static constexpr uint32_t SLIDE_MIN_MS  = 5000;
 static constexpr uint32_t SLIDE_MAX_MS  = 8000;
+static constexpr uint32_t TRIPLE_TAP_MS = 450;   // max gap between taps of the jiggle-editor triple-tap
 
 static constexpr uint16_t COL_BAR_YEL = 0xFFE0;
 static constexpr uint16_t COL_BAR_RED = 0xF800;
 static constexpr uint16_t COL_BAR_BG  = 0x2104;
 
-static constexpr size_t PATH_MAX_LEN = 96;
+static constexpr size_t PATH_MAX_LEN = 256;  // folder + "/" + long filename must fit, or the file gets skipped as "missing"
 static constexpr size_t NAME_MAX_LEN = 48;
 static constexpr int MAX_ALBUMS = 32;
 static constexpr int MAX_FILES_PER_ALBUM = 512;
@@ -97,8 +100,6 @@ struct Album {
 
 static std::vector<Album> albums;
 static int album_i = 0;
-static uint16_t* pixel_buf = nullptr;
-static constexpr size_t PIXEL_BYTES = SCREEN_W * SCREEN_H * 2;
 
 static void show_msg(const char* line1, const char* line2 = nullptr) {
     M5.Display.fillScreen(COL_BG);
@@ -380,14 +381,17 @@ static bool load_mg(const char* path) {
     }
     if (w == 0 || h == 0 || w > 640 || h > 480) { f.close(); return false; }
 
+    // Decode into the PSRAM image canvas (the jiggle warp samples from it); show_current() presents.
+    M5Canvas& img = jig::image();
     size_t need = (size_t)w * (size_t)h * 2;
-    if (w == SCREEN_W && h == SCREEN_H && pixel_buf) {
-        size_t got = f.read((uint8_t*)pixel_buf, need);
+    if (w == SCREEN_W && h == SCREEN_H) {
+        uint16_t* px = (uint16_t*)img.getBuffer();
+        size_t got = f.read((uint8_t*)px, need);
         f.close();
         if (got != need) return false;
-        M5.Display.setSwapBytes(true);
-        M5.Display.pushImage(0, 0, SCREEN_W, SCREEN_H, pixel_buf);
-        M5.Display.setSwapBytes(false);
+        if (jig::image_swapped()) {                       // file is little-endian RGB565
+            for (size_t i = 0, n = (size_t)w * h; i < n; ++i) px[i] = (uint16_t)((px[i] >> 8) | (px[i] << 8));
+        }
         return true;
     }
 
@@ -398,12 +402,12 @@ static bool load_mg(const char* path) {
     f.close();
     if (got != need) { free(tmp); return false; }
 
-    M5.Display.fillScreen(COL_BG);
+    img.fillScreen(COL_BG);
     int x = ((int)SCREEN_W - (int)w) / 2;
     int y = ((int)SCREEN_H - (int)h) / 2;
-    M5.Display.setSwapBytes(true);
-    M5.Display.pushImage(x, y, w, h, tmp);
-    M5.Display.setSwapBytes(false);
+    img.setSwapBytes(true);
+    img.pushImage(x, y, w, h, tmp);
+    img.setSwapBytes(false);
     free(tmp);
     return true;
 }
@@ -420,9 +424,10 @@ static bool load_jpg_png(const char* path, bool png) {
     f.close();
     if (got != sz) { free(buf); return false; }
 
-    M5.Display.fillScreen(COL_BG);
+    M5Canvas& img = jig::image();
+    img.fillScreen(COL_BG);
     (void)png; // PNG no longer supported (never reached: is_image_name skips .png)
-    bool ok = M5.Display.drawJpg(buf, sz, 0, 0);
+    bool ok = img.drawJpg(buf, sz, 0, 0);
     free(buf);
     return ok;
 }
@@ -433,6 +438,7 @@ static bool in_default_album() {
 }
 
 static bool show_current() {
+    jig::clear_zones();
     if (albums.empty()) return false;
     if (!ensure_album_ready(album_i)) return false;
     Album& a = albums[album_i];
@@ -464,7 +470,11 @@ static bool show_current() {
         else if (ends_with_png(fname.c_str())) ok = load_jpg_png(pathbuf, true);
         else ok = load_jpg_png(pathbuf, false);
 
-        if (ok) return true;
+        if (ok) {
+            jig::present();
+            jig::load_zones(pathbuf);
+            return true;
+        }
 
         // Missing or bad file — drop from list/index and try next
         Serial.printf("skip missing %s\n", pathbuf);
@@ -579,6 +589,10 @@ static int16_t  touch_x1 = 0, touch_y1 = 0;
 static uint32_t touch_t0    = 0;
 static bool     touch_moved = false;
 
+static int      tap_count  = 0;
+static uint32_t tap_last_ms = 0;
+static int16_t  tap_last_x = 0, tap_last_y = 0;
+
 void setup() {
     auto cfg = M5.config();
     cfg.clear_display = true;
@@ -591,9 +605,10 @@ void setup() {
     Serial.begin(115200);
     Serial.println("Mantis Gallery (index cache)");
 
-    pixel_buf = (uint16_t*)heap_caps_malloc(PIXEL_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!pixel_buf)
-        pixel_buf = (uint16_t*)heap_caps_malloc(PIXEL_BYTES, MALLOC_CAP_8BIT);
+    if (!jig::begin()) {
+        show_msg("Out of memory", "PSRAM needed for images");
+        while (true) { M5.update(); delay(200); }
+    }
 
     show_msg("Mounting SD…");
     if (!sd_begin()) {
@@ -614,10 +629,28 @@ void setup() {
     show_current();
 }
 
+static bool was_editing = false;
+
 void loop() {
     M5.update();
     uint32_t now = millis();
 
+    // Jiggle editor owns the screen, touch and buttons while it's open.
+    if (jig::editor_is_open()) {
+        jig::editor_tick(now);
+        was_editing = true;
+        delay(5);
+        return;
+    }
+    if (was_editing) {
+        was_editing = false;
+        touch_down = false;
+        btn_b_holding = false;
+        if (slideshow) {
+            slide_span_ms = random_slide_ms();
+            slide_due_ms = millis() + slide_span_ms;
+        }
+    }
     if (M5.BtnC.wasHold()) M5.Power.powerOff();
 
     if (!in_default_album()) {
@@ -697,7 +730,21 @@ void loop() {
                 slide_due_ms = millis() + slide_span_ms;
             }
         } else if (!touch_moved && held < TOUCH_LONG_MS) {
-            if (slideshow) {
+            // Triple-tap (same spot, quick) opens the jiggle editor on the photo being shown.
+            bool chained = (now - tap_last_ms) < TRIPLE_TAP_MS &&
+                           abs(touch_x1 - tap_last_x) < 40 && abs(touch_y1 - tap_last_y) < 40;
+            tap_count = chained ? tap_count + 1 : 1;
+            tap_last_ms = now;
+            tap_last_x = touch_x1;
+            tap_last_y = touch_y1;
+            if (tap_count >= 3 && !albums.empty()) {
+                tap_count = 0;
+                jig::editor_open();
+                return;
+            }
+            if (jig::poke(touch_x1, touch_y1)) {
+                // tapped a jiggle zone: it wobbles (and doesn't count as a slideshow tap)
+            } else if (slideshow) {
                 slide_span_ms = slide_span_ms * 2;
                 if (slide_span_ms > 60000) slide_span_ms = 60000;
                 slide_due_ms = millis() + slide_span_ms;
@@ -711,5 +758,6 @@ void loop() {
         slide_due_ms = millis() + slide_span_ms;
     }
 
-    delay(12);
+    jig::play_tick(millis(), !btn_b_holding);
+    delay(6);
 }

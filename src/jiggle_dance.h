@@ -1,0 +1,263 @@
+/**
+ * Dance mode — finds a steady rhythm in the IMU and fires beat events in sync with it.
+ * No Arduino dependencies (unit-tested on a PC).
+ *
+ *  1. Gravity is removed upstream; we get the "dynamic" acceleration vector each loop.
+ *  2. Resampled to 50 Hz into a 4 s ring buffer, projected onto the main direction of motion
+ *     (so bobbing, swaying or walking all work, whichever way the Core2 is held).
+ *  3. Every 100 ms an autocorrelation over 60–200 BPM gives the tempo and how rhythmic it is.
+ *  4. Peaks in the motion (the "hits") steer an internal metronome — a phase-locked loop — so beats
+ *     land on the hits rather than trailing behind them.
+ *  5. Steady rhythm → lock, dance strength fades in. Hits stop → unlock, fade out within ~1 s.
+ */
+#pragma once
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+namespace jig {
+
+class Rhythm {
+public:
+    static constexpr int   FS = 50;                 // analysis sample rate (Hz)
+    static constexpr int   N = 200;                 // 4 s window
+    static constexpr int   LAG_MIN = 15;            // 0.30 s → 200 BPM
+    static constexpr int   LAG_MAX = 50;            // 1.00 s →  60 BPM
+    static constexpr float MIN_RMS = 0.018f;        // g: quieter than this isn't dancing
+    static constexpr float HIT_FLOOR = 0.035f;      // g: a hit must be at least this strong
+    static constexpr float LOCK_CONF = 0.5f;        // autocorrelation needed to lock
+    static constexpr float KEEP_CONF = 0.25f;       // ...and to stay locked
+    static constexpr float LEAD = 0.04f;            // s: fire beats early so the spring's swing peaks on the hit
+    static constexpr int   HITS = 6;                // recent hit times kept for the evenness check
+
+    // dt: seconds since last call. d*: dynamic acceleration (g, gravity removed).
+    // up*: unit vector pointing "up" (from the gravity baseline). Returns true if a beat fired.
+    bool update(float dt, float dx, float dy, float dz, float upx, float upy, float upz) {
+        bool beat = false;
+        t_ += dt;
+        acc_[0] += dx * dt; acc_[1] += dy * dt; acc_[2] += dz * dt; acc_w_ += dt;
+        up_[0] = upx; up_[1] = upy; up_[2] = upz;
+        while (t_ - last_sample_t_ >= 1.0f / FS) {
+            last_sample_t_ += 1.0f / FS;
+            float w = acc_w_ > 1e-6f ? 1.0f / acc_w_ : 0.0f;
+            push_sample(acc_[0] * w, acc_[1] * w, acc_[2] * w);
+            acc_[0] = acc_[1] = acc_[2] = 0; acc_w_ = 0;
+        }
+
+        // Metronome
+        if (locked_ || amp_ > 0.0f) {
+            phase_ += dt / period_;
+            while (phase_ >= 1.0f) { phase_ -= 1.0f; fired_ = false; }
+            if (!fired_ && phase_ >= 1.0f - LEAD / period_) {
+                fired_ = true;
+                beat = true;
+                sign_ = -sign_;
+                ++beats_;
+            }
+        }
+        if (locked_) {
+            float rise = dt / (1.5f * period_);           // full strength after ~1.5 beats
+            amp_ = amp_ + rise > 1.0f ? 1.0f : amp_ + rise;
+        } else {
+            amp_ = amp_ - dt > 0.0f ? amp_ - dt : 0.0f;   // 1 s fade
+            if (amp_ <= 0.0f) phase_ = 0.0f;
+        }
+        return beat && amp_ > 0.0f;
+    }
+
+    bool  locked() const { return locked_; }
+    float amp() const { return amp_; }                     // 0..1 dance strength
+    float bpm() const { return 60.0f / period_; }
+    int   beat_sign() const { return sign_; }              // alternates ±1 every beat
+    float confidence() const { return conf_; }
+    float phase() const { return phase_; }
+    uint32_t beats() const { return beats_; }
+
+private:
+    float buf_[N][3] = {};      // dynamic accel, resampled
+    float sig_[N] = {};         // projected onto motion axis
+    int   head_ = 0;            // next write index
+    int   filled_ = 0;
+    float t_ = 0, last_sample_t_ = 0;
+    float acc_[3] = {0, 0, 0}, acc_w_ = 0;
+    float up_[3] = {0, 0, 1};
+    float axis_[3] = {0, 0, 1};
+    int   since_analysis_ = 0;
+
+    float thr_ = HIT_FLOOR;
+    float last_hit_t_ = -10.0f;
+    float conf_ = 0, rms_ = 0, period_ac_ = 0.5f;
+    int   good_runs_ = 0;
+    float bad_time_ = 0;
+
+    float hit_t_[HITS] = {};
+    int   nhits_ = 0;
+
+    bool  locked_ = false, fired_ = true;
+    float period_ = 0.5f, phase_ = 0.0f, amp_ = 0.0f;
+    int   sign_ = 1;
+    uint32_t beats_ = 0;
+
+    const float& sig_at(int ago) const { return sig_[(head_ - 1 - ago + 2 * N) % N]; }
+
+    void push_sample(float x, float y, float z) {
+        buf_[head_][0] = x; buf_[head_][1] = y; buf_[head_][2] = z;
+        sig_[head_] = x * axis_[0] + y * axis_[1] + z * axis_[2];
+        head_ = (head_ + 1) % N;
+        if (filled_ < N) ++filled_;
+        const float now = last_sample_t_;
+
+        // Hit = local maximum above threshold (detected one sample late).
+        if (filled_ >= 3) {
+            float a = sig_at(2), b = sig_at(1), c = sig_at(0);
+            float min_gap = locked_ ? 0.5f * period_ : 0.25f;
+            float when = now - 1.5f / FS;      // peak was 1 sample ago; averaging adds half a sample
+            if (b > a && b >= c && b > thr_ && when - last_hit_t_ > min_gap) on_hit(when);
+        }
+        if (++since_analysis_ >= FS / 10) { since_analysis_ = 0; analyse(); }
+
+        // Hits stopped → the rhythm is over.
+        if (locked_ && now - last_hit_t_ > 2.2f * period_) unlock();
+    }
+
+    void on_hit(float when) {
+        last_hit_t_ = when;
+        for (int i = HITS - 1; i > 0; --i) hit_t_[i] = hit_t_[i - 1];
+        hit_t_[0] = when;
+        if (nhits_ < HITS) ++nhits_;
+        if (!locked_) return;
+        // Phase error in cycles at the moment of the hit, wrapped to [-0.5, 0.5).
+        float ph = phase_ - (t_ - when) / period_;
+        ph -= floorf(ph + 0.5f);
+        phase_ -= 0.35f * ph;                 // pull the metronome toward the hit
+        period_ *= 1.0f - 0.05f * ph;         // and nudge the tempo
+        if (ph < -0.1f && phase_ >= 1.0f - LEAD / period_) fired_ = true;   // late hit: don't double-fire
+        if (phase_ < 0) phase_ = 0.0f;        // never wrap backwards: that would fire the beat twice
+    }
+
+    // Are the recent hits evenly spaced at period p (allowing a missed hit = 2p)?
+    bool hits_even(float p) const {
+        if (nhits_ < 4) return false;
+        int good = 0, n = nhits_ - 1;
+        for (int i = 0; i < n; ++i) {
+            float iv = hit_t_[i] - hit_t_[i + 1];
+            float k = roundf(iv / p);
+            if (k >= 1 && k <= 2 && fabsf(iv - k * p) < 0.2f * p) ++good;
+        }
+        return good >= n - 1;
+    }
+
+    void unlock() {
+        locked_ = false;
+        good_runs_ = 0;
+    }
+
+    void analyse() {
+        if (filled_ < N / 2) return;
+        const int n = filled_;
+        int start = (head_ - n + N) % N;
+
+        // Main motion axis: power iteration on the covariance of the window.
+        float m[3] = {0, 0, 0};
+        for (int i = 0; i < n; ++i) for (int k = 0; k < 3; ++k) m[k] += buf_[(start + i) % N][k];
+        for (int k = 0; k < 3; ++k) m[k] /= n;
+        float C[3][3] = {};
+        for (int i = 0; i < n; ++i) {
+            const float* v = buf_[(start + i) % N];
+            float d[3] = {v[0] - m[0], v[1] - m[1], v[2] - m[2]};
+            for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) C[r][c] += d[r] * d[c];
+        }
+        float ax[3] = {axis_[0], axis_[1], axis_[2]};
+        for (int it = 0; it < 8; ++it) {
+            float nx[3];
+            for (int r = 0; r < 3; ++r) nx[r] = C[r][0] * ax[0] + C[r][1] * ax[1] + C[r][2] * ax[2];
+            float len = sqrtf(nx[0] * nx[0] + nx[1] * nx[1] + nx[2] * nx[2]);
+            if (len < 1e-9f) break;
+            for (int r = 0; r < 3; ++r) ax[r] = nx[r] / len;
+        }
+        // Project the window on the new axis.
+        float x[N];
+        for (int i = 0; i < n; ++i) {
+            const float* v = buf_[(start + i) % N];
+            x[i] = v[0] * ax[0] + v[1] * ax[1] + v[2] * ax[2];
+        }
+        float mean = 0;
+        for (int i = 0; i < n; ++i) mean += x[i];
+        mean /= n;
+        float var = 0, m3 = 0;
+        for (int i = 0; i < n; ++i) { float d = x[i] - mean; var += d * d; m3 += d * d * d; }
+        var /= n; m3 /= n;
+        float sd = sqrtf(var);
+        // Orient so a "hit" points positive. A hit is the sharp, spiky side of the motion (skewness);
+        // if the motion is too symmetric to tell, use "up" (the push at the bottom of a bob), and
+        // failing that keep the previous direction.
+        float skew = sd > 1e-6f ? m3 / (var * sd) : 0.0f;
+        float upd = ax[0] * up_[0] + ax[1] * up_[1] + ax[2] * up_[2];
+        float keep = ax[0] * axis_[0] + ax[1] * axis_[1] + ax[2] * axis_[2];
+        bool flip = fabsf(skew) > 0.25f ? skew < 0 : (fabsf(upd) > 0.3f ? upd < 0 : keep < 0);
+        if (flip) {
+            for (int r = 0; r < 3; ++r) ax[r] = -ax[r];
+            for (int i = 0; i < n; ++i) x[i] = -x[i];
+            mean = -mean;
+        }
+        bool changed = (ax[0] * axis_[0] + ax[1] * axis_[1] + ax[2] * axis_[2]) < 0.995f;
+        for (int r = 0; r < 3; ++r) axis_[r] = ax[r];
+        if (changed) for (int i = 0; i < n; ++i) sig_[(start + i) % N] = x[i];
+        for (int i = 0; i < n; ++i) x[i] -= mean;
+        // RMS of the last second decides "still moving?"
+        float recent = 0;
+        for (int i = n - FS; i < n; ++i) recent += x[i] * x[i];
+        rms_ = sqrtf(recent / FS);
+        thr_ = mean + 0.8f * sd;
+        if (thr_ < HIT_FLOOR) thr_ = HIT_FLOOR;
+
+        // Normalised autocorrelation over the tempo range.
+        float r[LAG_MAX + 2];
+        for (int L = LAG_MIN - 1; L <= LAG_MAX + 1; ++L) {
+            float sxy = 0, sxx = 0, syy = 0;
+            for (int i = 0; i + L < n; ++i) {
+                sxy += x[i] * x[i + L]; sxx += x[i] * x[i]; syy += x[i + L] * x[i + L];
+            }
+            r[L] = (sxx > 0 && syy > 0) ? sxy / sqrtf(sxx * syy) : 0;
+        }
+        int lo = LAG_MIN, hi = LAG_MAX;
+        if (locked_) {                                   // follow the tempo we have; no octave jumps
+            int c = (int)lroundf(period_ * FS);
+            lo = (int)(c * 0.75f); hi = (int)ceilf(c * 1.25f);
+            if (lo < LAG_MIN) lo = LAG_MIN;
+            if (hi > LAG_MAX) hi = LAG_MAX;
+        }
+        int best = lo;
+        for (int L = lo; L <= hi; ++L) if (r[L] > r[best]) best = L;
+        // Prefer the faster tempo when half the lag is nearly as strong (avoids locking to every 2nd beat).
+        int half = (best + 1) / 2;
+        if (!locked_ && half >= LAG_MIN && r[half] > 0.8f * r[best]) best = half;
+        // Parabolic refinement for sub-sample lag.
+        float y0 = r[best - 1], y1 = r[best], y2 = r[best + 1];
+        float den = y0 - 2 * y1 + y2;
+        float off = fabsf(den) > 1e-6f ? 0.5f * (y0 - y2) / den : 0.0f;
+        if (off > 0.5f) off = 0.5f;
+        if (off < -0.5f) off = -0.5f;
+        conf_ = y1;
+        period_ac_ = (best + off) / FS;
+
+        const float dt = 0.1f;
+        bool moving = rms_ >= MIN_RMS && sd >= MIN_RMS * 0.8f;
+        if (!locked_) {
+            good_runs_ = (moving && conf_ >= LOCK_CONF) ? good_runs_ + 1 : 0;
+            if (good_runs_ >= 4 && t_ - last_hit_t_ < period_ac_ && hits_even(period_ac_)) {
+                locked_ = true;
+                period_ = period_ac_;
+                phase_ = (t_ - last_hit_t_) / period_;      // last hit was "beat 0"
+                bad_time_ = 0;
+                fired_ = true;                               // beat 0 already happened (the last hit)
+            }
+        } else {
+            period_ += 0.25f * (period_ac_ - period_);     // follow tempo changes
+            bad_time_ = (moving && conf_ >= KEEP_CONF) ? 0 : bad_time_ + dt;
+            if (bad_time_ > 1.0f) unlock();
+        }
+    }
+};
+
+}  // namespace jig
