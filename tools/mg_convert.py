@@ -5,6 +5,9 @@ Mantis Gallery — MG Converter (Tkinter GUI)
 Converts JPG/PNG/BMP/WEBP → .mg (RGB565 320×240) and can write
 .mg_index files so Core2 skips the first full SD scan.
 
+Jiggle tab (needs numpy, and jiggle_lab.py + jiggle_tab.py next to this file): open an .mg from the
+SD card, add jiggle zones, fine-tune and preview them, and save the .jig file beside the image.
+
 Index format (matches firmware):
     MGIDX1
     <count>
@@ -12,7 +15,7 @@ Index format (matches firmware):
     file2.mg
     ...
 
-Requires:  pip install pillow
+Requires:  pip install pillow numpy
 Run:       python mg_convert.py
 """
 
@@ -147,8 +150,8 @@ def run_gui() -> None:
 
     root = tk.Tk()
     root.title("Mantis Gallery — MG Converter")
-    root.geometry("640x520")
-    root.minsize(520, 420)
+    root.geometry("1200x820")
+    root.minsize(640, 520)
     root.configure(bg="#1a1a1a")
 
     style = ttk.Style()
@@ -158,6 +161,9 @@ def run_gui() -> None:
         pass
     style.configure("TRadiobutton", background="#1a1a1a", foreground="#e8e8e8")
     style.configure("TProgressbar", troughcolor="#2a2a2a", background="#007373")
+    style.configure("TNotebook", background="#1a1a1a", borderwidth=0)
+    style.configure("TNotebook.Tab", background="#2a2a2a", foreground="#e8e8e8", padding=(14, 6))
+    style.map("TNotebook.Tab", background=[("selected", "#007373")], foreground=[("selected", "#000000")])
 
     src_var = tk.StringVar()
     out_var = tk.StringVar()
@@ -335,7 +341,12 @@ def run_gui() -> None:
         fg=muted, bg="#1a1a1a", font=("Segoe UI", 10),
     ).pack(anchor="w", padx=14, pady=(0, 8))
 
-    fr = tk.Frame(root, bg="#1a1a1a")
+    nb = ttk.Notebook(root)
+    nb.pack(fill="both", expand=True)
+    conv = tk.Frame(nb, bg="#1a1a1a")
+    nb.add(conv, text="Convert")
+
+    fr = tk.Frame(conv, bg="#1a1a1a")
     fr.pack(fill="x", **pad)
     tk.Label(fr, text="Source folder", fg=muted, bg="#1a1a1a", width=14, anchor="w").pack(side="left")
     tk.Entry(fr, textvariable=src_var, bg="#2a2a2a", fg=fg, insertbackground=fg,
@@ -343,7 +354,7 @@ def run_gui() -> None:
     tk.Button(fr, text="Browse…", command=browse_src, bg="#2d2d2d", fg=fg,
               relief="flat", padx=10).pack(side="left")
 
-    fr2 = tk.Frame(root, bg="#1a1a1a")
+    fr2 = tk.Frame(conv, bg="#1a1a1a")
     fr2.pack(fill="x", **pad)
     tk.Label(fr2, text="Output / SD", fg=muted, bg="#1a1a1a", width=14, anchor="w").pack(side="left")
     tk.Entry(fr2, textvariable=out_var, bg="#2a2a2a", fg=fg, insertbackground=fg,
@@ -351,13 +362,13 @@ def run_gui() -> None:
     tk.Button(fr2, text="Browse…", command=browse_out, bg="#2d2d2d", fg=fg,
               relief="flat", padx=10).pack(side="left")
 
-    fr3 = tk.Frame(root, bg="#1a1a1a")
+    fr3 = tk.Frame(conv, bg="#1a1a1a")
     fr3.pack(fill="x", **pad)
     tk.Label(fr3, text="Scale mode", fg=muted, bg="#1a1a1a", width=14, anchor="w").pack(side="left")
     ttk.Radiobutton(fr3, text="Cover (crop to fill)", variable=mode_var, value="cover").pack(side="left", padx=4)
     ttk.Radiobutton(fr3, text="Fit (letterbox)", variable=mode_var, value="fit").pack(side="left", padx=4)
 
-    btn_row = tk.Frame(root, bg="#1a1a1a")
+    btn_row = tk.Frame(conv, bg="#1a1a1a")
     btn_row.pack(pady=10)
     convert_btn = tk.Button(
         btn_row, text="Convert to .mg", command=do_convert,
@@ -376,18 +387,34 @@ def run_gui() -> None:
         bg="#2d2d2d", fg=fg, relief="flat", padx=10, pady=8,
     ).pack(side="left", padx=6)
 
-    progress = ttk.Progressbar(root, mode="determinate", length=400)
+    progress = ttk.Progressbar(conv, mode="determinate", length=400)
     progress.pack(fill="x", padx=14, pady=(0, 4))
 
-    tk.Label(root, textvariable=status_var, fg=lime, bg="#1a1a1a",
+    tk.Label(conv, textvariable=status_var, fg=lime, bg="#1a1a1a",
              font=("Segoe UI", 10)).pack(anchor="w", padx=14)
 
     log_box = scrolledtext.ScrolledText(
-        root, height=12, bg="#121212", fg="#c8c8c8",
+        conv, height=12, bg="#121212", fg="#c8c8c8",
         insertbackground=fg, relief="flat", font=("Consolas", 9),
     )
     log_box.pack(fill="both", expand=True, padx=14, pady=(6, 14))
     log_box.configure(state="disabled")
+
+    # ---- Jiggle tab -------------------------------------------------------------------------
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from jiggle_tab import JiggleTab
+        import jiggle_lab
+        if jiggle_lab.np is None:
+            raise ImportError("numpy is not installed (pip install numpy)")
+        nb.add(JiggleTab(nb, root), text="Jiggle")
+    except ImportError as e:
+        holder = tk.Frame(nb, bg="#1a1a1a")
+        tk.Label(holder, text=f"Jiggle editor unavailable: {e}\n\n"
+                              "It needs numpy (pip install numpy) and jiggle_lab.py + jiggle_tab.py\n"
+                              "in the same folder as mg_convert.py.",
+                 fg=muted, bg="#1a1a1a", justify="left").pack(padx=20, pady=20, anchor="w")
+        nb.add(holder, text="Jiggle")
 
     root.mainloop()
 

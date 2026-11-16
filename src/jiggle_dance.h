@@ -9,11 +9,18 @@
  *  4. Peaks in the motion (the "hits") steer an internal metronome — a phase-locked loop — so beats
  *     land on the hits rather than trailing behind them.
  *  5. Steady rhythm → lock, dance strength fades in. Hits stop → unlock, fade out within ~1 s.
+ *
+ * AudioOnset turns microphone audio into the same kind of signal: one "hit strength" value per 20 ms
+ * chunk (rises in bass and overall loudness — kicks, snares, claps), fed to a second Rhythm.
  */
 #pragma once
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
+
+#ifndef JIG_MUSIC_RUNS
+#define JIG_MUSIC_RUNS 6
+#endif
 
 namespace jig {
 
@@ -27,7 +34,7 @@ public:
     static constexpr float HIT_FLOOR = 0.035f;      // g: a hit must be at least this strong
     static constexpr float LOCK_CONF = 0.5f;        // autocorrelation needed to lock
     static constexpr float KEEP_CONF = 0.25f;       // ...and to stay locked
-    static constexpr float LEAD = 0.04f;            // s: fire beats early so the spring's swing peaks on the hit
+    static constexpr float LEAD = 0.04f;            // s: default lead (spring swing time); see set_lead
     static constexpr int   HITS = 6;                // recent hit times kept for the evenness check
 
     // dt: seconds since last call. d*: dynamic acceleration (g, gravity removed).
@@ -48,7 +55,7 @@ public:
         if (locked_ || amp_ > 0.0f) {
             phase_ += dt / period_;
             while (phase_ >= 1.0f) { phase_ -= 1.0f; fired_ = false; }
-            if (!fired_ && phase_ >= 1.0f - LEAD / period_) {
+            if (!fired_ && phase_ >= 1.0f - lead_ / period_) {
                 fired_ = true;
                 beat = true;
                 sign_ = -sign_;
@@ -65,6 +72,12 @@ public:
         return beat && amp_ > 0.0f;
     }
 
+    // Fire beats this many seconds before the predicted hit (spring swing time + input latency).
+    void  set_lead(float s) { lead_ = s; }
+    // Music has off-beats (hi-hats, bass on the "and"): count hits on half-beats as on the grid.
+    // Audio beats land between 20 ms chunks, which smears the autocorrelation, so music locks at a
+    // lower score — the hit-spacing check still has to pass.
+    void  set_music(bool on) { music_ = on; lock_conf_ = on ? 0.35f : LOCK_CONF; lock_runs_ = on ? JIG_MUSIC_RUNS : 4; }
     bool  locked() const { return locked_; }
     float amp() const { return amp_; }                     // 0..1 dance strength
     float bpm() const { return 60.0f / period_; }
@@ -94,6 +107,11 @@ private:
     int   nhits_ = 0;
 
     bool  locked_ = false, fired_ = true;
+    float lead_ = LEAD;
+    bool  music_ = false;
+    float hit_max_ = 0;
+    float lock_conf_ = LOCK_CONF;
+    int   lock_runs_ = 4;                           // consecutive good analyses (100 ms apart) to lock
     float period_ = 0.5f, phase_ = 0.0f, amp_ = 0.0f;
     int   sign_ = 1;
     uint32_t beats_ = 0;
@@ -112,7 +130,11 @@ private:
             float a = sig_at(2), b = sig_at(1), c = sig_at(0);
             float min_gap = locked_ ? 0.5f * period_ : 0.25f;
             float when = now - 1.5f / FS;      // peak was 1 sample ago; averaging adds half a sample
-            if (b > a && b >= c && b > thr_ && when - last_hit_t_ > min_gap) on_hit(when);
+            // Music: only the strongest hits steer (kicks), so snares and talking don't drag the tempo.
+            hit_max_ *= expf(-1.0f / (FS * 4.0f));
+            if (b > hit_max_) hit_max_ = b;
+            bool strong = !music_ || b >= 0.5f * hit_max_;
+            if (b > a && b >= c && b > thr_ && strong && when - last_hit_t_ > min_gap) on_hit(when);
         }
         if (++since_analysis_ >= FS / 10) { since_analysis_ = 0; analyse(); }
 
@@ -131,7 +153,7 @@ private:
         ph -= floorf(ph + 0.5f);
         phase_ -= 0.35f * ph;                 // pull the metronome toward the hit
         period_ *= 1.0f - 0.05f * ph;         // and nudge the tempo
-        if (ph < -0.1f && phase_ >= 1.0f - LEAD / period_) fired_ = true;   // late hit: don't double-fire
+        if (ph < -0.1f && phase_ >= 1.0f - lead_ / period_) fired_ = true;   // late hit: don't double-fire
         if (phase_ < 0) phase_ = 0.0f;        // never wrap backwards: that would fire the beat twice
     }
 
@@ -139,12 +161,20 @@ private:
     bool hits_even(float p) const {
         if (nhits_ < 4) return false;
         int good = 0, n = nhits_ - 1;
+        // Music: half-beat gaps count too (off-beats), but tighter, and most gaps must be whole beats
+        // — kicks give that, syllables of speech almost never do.
+        const float unit = music_ ? 0.5f * p : p;
+        const float tol = music_ ? 0.12f * p : 0.2f * p;
+        int whole = 0;
         for (int i = 0; i < n; ++i) {
             float iv = hit_t_[i] - hit_t_[i + 1];
-            float k = roundf(iv / p);
-            if (k >= 1 && k <= 2 && fabsf(iv - k * p) < 0.2f * p) ++good;
+            float k = roundf(iv / unit);
+            if (k >= 1 && k * unit <= 2 * p && fabsf(iv - k * unit) < tol) {
+                ++good;
+                if (!music_ || ((int)k % 2) == 0) ++whole;
+            }
         }
-        return good >= n - 1;
+        return good >= n - 1 && 2 * whole >= n;
     }
 
     void unlock() {
@@ -168,6 +198,19 @@ private:
             for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) C[r][c] += d[r] * d[c];
         }
         float ax[3] = {axis_[0], axis_[1], axis_[2]};
+        {   // If the old axis is blind to the motion (e.g. it's all sideways), restart from the
+            // direction with the most variance so the iteration can't get stuck at zero.
+            float t0 = C[0][0] * ax[0] + C[0][1] * ax[1] + C[0][2] * ax[2];
+            float t1 = C[1][0] * ax[0] + C[1][1] * ax[1] + C[1][2] * ax[2];
+            float t2 = C[2][0] * ax[0] + C[2][1] * ax[1] + C[2][2] * ax[2];
+            float tr = C[0][0] + C[1][1] + C[2][2];
+            if (t0 * t0 + t1 * t1 + t2 * t2 < 1e-4f * tr * tr) {
+                int k = C[1][1] > C[0][0] ? 1 : 0;
+                if (C[2][2] > C[k][k]) k = 2;
+                ax[0] = ax[1] = ax[2] = 0;
+                ax[k] = 1;
+            }
+        }
         for (int it = 0; it < 8; ++it) {
             float nx[3];
             for (int r = 0; r < 3; ++r) nx[r] = C[r][0] * ax[0] + C[r][1] * ax[1] + C[r][2] * ax[2];
@@ -227,11 +270,19 @@ private:
             if (lo < LAG_MIN) lo = LAG_MIN;
             if (hi > LAG_MAX) hi = LAG_MAX;
         }
+        // Mild preference for dance tempos (~120 BPM) so double-time hats or half-time steps don't win.
+        // Music repeats at the bar too (kick-snare every 2 beats), so it gets a firmer pull to ~120.
+        const float width = music_ ? 0.6f : 1.1f;
+        auto prior = [width](int L) {
+            float o = log2f((60.0f * FS / L) / 120.0f) / width;
+            return expf(-0.5f * o * o);
+        };
         int best = lo;
-        for (int L = lo; L <= hi; ++L) if (r[L] > r[best]) best = L;
-        // Prefer the faster tempo when half the lag is nearly as strong (avoids locking to every 2nd beat).
+        for (int L = lo; L <= hi; ++L) if (r[L] * prior(L) > r[best] * prior(best)) best = L;
+        // Prefer the faster tempo when half the lag is nearly as strong (avoids locking to every 2nd
+        // beat) — unless that would be above 160 BPM, which is almost always double-time.
         int half = (best + 1) / 2;
-        if (!locked_ && half >= LAG_MIN && r[half] > 0.8f * r[best]) best = half;
+        if (!locked_ && half >= LAG_MIN && r[half] > 0.8f * r[best] && 60.0f * FS / half <= 160.0f) best = half;
         // Parabolic refinement for sub-sample lag.
         float y0 = r[best - 1], y1 = r[best], y2 = r[best + 1];
         float den = y0 - 2 * y1 + y2;
@@ -244,8 +295,10 @@ private:
         const float dt = 0.1f;
         bool moving = rms_ >= MIN_RMS && sd >= MIN_RMS * 0.8f;
         if (!locked_) {
-            good_runs_ = (moving && conf_ >= LOCK_CONF) ? good_runs_ + 1 : 0;
-            if (good_runs_ >= 4 && t_ - last_hit_t_ < period_ac_ && hits_even(period_ac_)) {
+            good_runs_ = (moving && conf_ >= lock_conf_) ? good_runs_ + 1 : 0;
+            float bpm_ac = 60.0f / period_ac_;
+            bool tempo_ok = !music_ || (bpm_ac >= 70.0f && bpm_ac <= 160.0f);
+            if (good_runs_ >= lock_runs_ && tempo_ok && t_ - last_hit_t_ < period_ac_ && hits_even(period_ac_)) {
                 locked_ = true;
                 period_ = period_ac_;
                 phase_ = (t_ - last_hit_t_) / period_;      // last hit was "beat 0"
@@ -260,4 +313,52 @@ private:
     }
 };
 
+// Microphone → hit strength. Feed each recorded chunk (mono int16); returns ≥ 0, roughly 0.1–0.4 for a
+// kick drum, 0 when the room is quiet. Scaled to sit in the same range as the IMU signal Rhythm expects.
+// The room's noise floor is learned (fast down, slow up), so a noisy room isn't mistaken for music.
+#ifndef JIG_KICK_HZ
+#define JIG_KICK_HZ 120.0f
+#endif
+class AudioOnset {
+public:
+    static constexpr float KICK_HZ = JIG_KICK_HZ;   // low-pass for the kick/bass band
+    static constexpr float OPEN_DB = 8.0f;          // music = this far above the room floor
+    static constexpr float SCALE = 0.025f;          // dB of rise → hit strength
+
+    float process(const int16_t* s, size_t n, uint32_t rate) {
+        if (!n) return 0.0f;
+        const float a = 1.0f - expf(-6.2831853f * KICK_HZ / rate);
+        const float hp = 1.0f - expf(-6.2831853f * 20.0f / rate);   // remove DC / rumble
+        float el = 0, ea = 0;
+        for (size_t i = 0; i < n; ++i) {
+            float x = s[i] * (1.0f / 32768.0f);
+            dc_ += (x - dc_) * hp;
+            x -= dc_;
+            lp1_ += a * (x - lp1_);
+            lp2_ += a * (lp1_ - lp2_);
+            el += lp2_ * lp2_;
+            ea += x * x;
+        }
+        float low = 10.0f * log10f(el / n + 1e-10f), all = 10.0f * log10f(ea / n + 1e-10f);
+        level_db_ = all;
+        float dt = (float)n / rate;
+        if (floor_db_ < -99.0f) floor_db_ = all;
+        else if (all < floor_db_) floor_db_ += (all - floor_db_) * (1.0f - expf(-dt / 0.3f));   // quiet: follow down
+        else floor_db_ += (all - floor_db_) * (1.0f - expf(-dt / 30.0f));                    // loud: creep up slowly
+        float rise = (low - prev_low_ > 0 ? low - prev_low_ : 0) + 0.3f * (all - prev_all_ > 0 ? all - prev_all_ : 0);
+        prev_low_ = low;
+        prev_all_ = all;
+        if (all < floor_db_ + OPEN_DB) return 0.0f;
+        return rise * SCALE;
+    }
+    float level_db() const { return level_db_; }
+    float floor_db() const { return floor_db_; }
+    bool  music() const { return level_db_ > floor_db_ + OPEN_DB; }
+
+private:
+    float dc_ = 0, lp1_ = 0, lp2_ = 0;
+    float prev_low_ = -100.0f, prev_all_ = -100.0f, level_db_ = -100.0f, floor_db_ = -100.0f;
+};
+
 }  // namespace jig
+
