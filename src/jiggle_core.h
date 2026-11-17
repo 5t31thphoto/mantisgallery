@@ -461,11 +461,12 @@ inline void poke_zone(Zone& z, float px, float py, float strength = 1.0f) {
 }
 
 // Dance beat: drop and rebound. side = -1 left zone / +1 right / 0 centre; sign alternates each beat.
-inline void dance_kick(Zone& z, float amp, int side, int sign) {
+// groove_x/y: direction and strength of your recent movement (0 = none); each beat swings that way too.
+inline void dance_kick(Zone& z, float amp, int side, int sign, float groove_x = 0, float groove_y = 0) {
     if (z.side != 2) side = z.side;           // explicit side from the editor
     float k = amp * z.w1 * z.dance;
-    z.vy += k * 0.70f * (1.0f + 0.5f * side * sign);
-    z.vx += k * 0.25f * sign;
+    z.vy += k * (0.70f * (1.0f + 0.5f * side * sign) + 0.6f * groove_y * sign);
+    z.vx += k * (0.25f * sign + 0.6f * groove_x * sign);
     z.vs += k * 0.20f;
     z.awake = true;
 }

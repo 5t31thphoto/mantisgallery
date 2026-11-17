@@ -66,7 +66,7 @@ public:
             float rise = dt / (1.5f * period_);           // full strength after ~1.5 beats
             amp_ = amp_ + rise > 1.0f ? 1.0f : amp_ + rise;
         } else {
-            amp_ = amp_ - dt > 0.0f ? amp_ - dt : 0.0f;   // 1 s fade
+            amp_ = amp_ - dt / coast_ > 0.0f ? amp_ - dt / coast_ : 0.0f;   // fade over the coast time
             if (amp_ <= 0.0f) phase_ = 0.0f;
         }
         return beat && amp_ > 0.0f;
@@ -74,6 +74,8 @@ public:
 
     // Fire beats this many seconds before the predicted hit (spring swing time + input latency).
     void  set_lead(float s) { lead_ = s; }
+    // Keep dancing this long after the rhythm stops (also the fade-out time).
+    void  set_coast(float s) { coast_ = s; }
     // Music has off-beats (hi-hats, bass on the "and"): count hits on half-beats as on the grid.
     // Audio beats land between 20 ms chunks, which smears the autocorrelation, so music locks at a
     // lower score — the hit-spacing check still has to pass.
@@ -108,6 +110,7 @@ private:
 
     bool  locked_ = false, fired_ = true;
     float lead_ = LEAD;
+    float coast_ = 1.0f;
     bool  music_ = false;
     float hit_max_ = 0;
     float lock_conf_ = LOCK_CONF;
@@ -139,7 +142,7 @@ private:
         if (++since_analysis_ >= FS / 10) { since_analysis_ = 0; analyse(); }
 
         // Hits stopped → the rhythm is over.
-        if (locked_ && now - last_hit_t_ > 2.2f * period_) unlock();
+        if (locked_ && now - last_hit_t_ > 2.2f * period_ + coast_ - 1.0f) unlock();
     }
 
     void on_hit(float when) {
@@ -308,7 +311,7 @@ private:
         } else {
             period_ += 0.25f * (period_ac_ - period_);     // follow tempo changes
             bad_time_ = (moving && conf_ >= KEEP_CONF) ? 0 : bad_time_ + dt;
-            if (bad_time_ > 1.0f) unlock();
+            if (bad_time_ > coast_) unlock();
         }
     }
 };
@@ -322,8 +325,8 @@ private:
 class AudioOnset {
 public:
     static constexpr float KICK_HZ = JIG_KICK_HZ;   // low-pass for the kick/bass band
-    static constexpr float OPEN_DB = 8.0f;          // music = this far above the room floor
-    static constexpr float SCALE = 0.025f;          // dB of rise → hit strength
+    static constexpr float OPEN_DB = 3.0f;          // music = this far above the room floor
+    static constexpr float SCALE = 0.05f;           // dB of rise → hit strength (Core2 mic is quiet)
 
     float process(const int16_t* s, size_t n, uint32_t rate) {
         if (!n) return 0.0f;
@@ -343,7 +346,7 @@ public:
         level_db_ = all;
         float dt = (float)n / rate;
         if (floor_db_ < -99.0f) floor_db_ = all;
-        else if (all < floor_db_) floor_db_ += (all - floor_db_) * (1.0f - expf(-dt / 0.3f));   // quiet: follow down
+        else if (all < floor_db_) floor_db_ += (all - floor_db_) * (1.0f - expf(-dt / 3.0f));   // quiet: follow down (slowly, so gaps between beats don't count)
         else floor_db_ += (all - floor_db_) * (1.0f - expf(-dt / 30.0f));                    // loud: creep up slowly
         float rise = (low - prev_low_ > 0 ? low - prev_low_ : 0) + 0.3f * (all - prev_all_ > 0 ? all - prev_all_ : 0);
         prev_low_ = low;

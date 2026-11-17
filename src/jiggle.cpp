@@ -90,6 +90,7 @@ float    g_mic_hit = 0;                  // latest chunk's hit strength…
 float    g_mic_hold = 0;                 // …fed to the tracker for one chunk's worth of time (s)
 int      g_dance_src = 0;                // 0 none, 1 IMU, 2 music (for the log)
 float    g_acc_last[3] = {0, 0, 1};
+float    g_groove[2] = {0, 0};               // decaying memory of your movement's direction
 bool     g_was_dancing = false;
 float    g_base[3] = {0, 0, 0};
 float    g_slow[3] = {0, 0, 0};
@@ -643,6 +644,7 @@ bool begin() {
 
     g_rhythm_mic.set_music(true);
     g_rhythm_mic.set_lead(MIC_LEAD);
+    g_rhythm.set_coast(4.0f);                // your rhythm keeps going ~4 s after you stop
 
     Serial.printf("jig: ready (swapped=%d imu=%d dma=%d fast-src=%d)\n", (int)g_swapped,
                   (int)M5.Imu.isEnabled(), (int)g_dma, g_src_fast != nullptr);
@@ -785,6 +787,16 @@ void play_tick(uint32_t now, bool may_draw) {
         gx = -SAG * dz(g_base[0] - g_slow[0]); gy = -SAG * dz(g_base[1] - g_slow[1]);
     }
     bool stirred = fabsf(jx + gx) > 0.03f || fabsf(jy + gy) > 0.03f || fabsf(ts) > 0.03f;
+    // Groove: rectified recent motion per axis, rising fast, fading over ~4 s, only while dancing.
+    {
+        float up = 1.0f - expf(-dt / 0.3f), down = 1.0f - expf(-dt / 4.0f);
+        float m[2] = {fabsf(jx), fabsf(jy)};
+        for (int i = 0; i < 2; ++i) {
+            float target = clampf(m[i], 0, 1);
+            g_groove[i] += (target - g_groove[i]) * (target > g_groove[i] ? up : down);
+            if (dance <= 0.0f) g_groove[i] = 0;
+        }
+    }
     if (g_n == 0) return;
 
     if (beat) {
@@ -793,7 +805,7 @@ void play_tick(uint32_t now, bool may_draw) {
         cen /= g_n;
         for (int i = 0; i < g_n; ++i) {
             int side = g_z[i].cx < cen - 3 ? -1 : (g_z[i].cx > cen + 3 ? 1 : 0);
-            if (g_z[i].wmap) dance_kick(g_z[i], dance, side, R.beat_sign());
+            if (g_z[i].wmap) dance_kick(g_z[i], dance, side, R.beat_sign(), g_groove[0], g_groove[1]);
         }
     }
 
