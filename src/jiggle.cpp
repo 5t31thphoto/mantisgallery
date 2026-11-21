@@ -24,7 +24,9 @@
 #include "jiggle_dance.h"
 #include "jiggle_water.h"
 #include "jiggle_select.h"
+#include "jiggle_grabcut.h"
 #include "jiggle_parallax.h"
+#include "jiggle_hang.h"
 #include <SD.h>
 #if defined(ESP_PLATFORM)
 #include <freertos/FreeRTOS.h>
@@ -67,7 +69,9 @@ constexpr float ECHO_SLOW_TAU = 1.5f;    // s: "average down" the gravity swing 
 constexpr uint32_t FRAME_MS = 16;        // redraw cap (~60 fps); big zones are limited by the SPI bus
 
 // ---- Music ---------------------------------------------------------------------------------------
-constexpr bool     MIC_DANCE = true;      // dance to music heard by the microphone
+constexpr bool     MIC_DANCE = true;      // dance to music heard by the microphone (when switched on: swipe up)
+constexpr float    DANCE_GAIN = 0.35f;    // beat nudge strength (×zone's own dance setting): subtle, additive
+constexpr float    DANCE_ROOM = 0.5f;     // no kick while a zone is already this far out (of its travel)
 constexpr uint32_t MIC_SR = 16000;
 constexpr size_t   MIC_N = 320;           // 20 ms chunks
 constexpr float    MIC_LEAD = 0.03f;      // beat lead for audio (spring swing − recording latency)
@@ -80,9 +84,13 @@ constexpr size_t STRIP_PIX = (size_t)STRIP_ROWS * IMG_W;
 
 // ---- Editor layout -----------------------------------------------------------------------------
 constexpr int ROW_H = 30;                // each toolbar row
-constexpr int TB1_N = 6;                 // Round · Half · Tear · Water · Depth · Cancel
+constexpr int TB1_N = 8;                 // Round · Half · Tear · Water · Depth · Hang · Grid · Cancel
 constexpr int TB1_WATER = 3;
 constexpr int TB1_DEPTH = 4;
+constexpr int TB1_HANG = 5;
+constexpr int TB1_GRID = 6;
+constexpr int TB2G_N = 4;                // grid: turn · turn · reset · on/off
+constexpr int TB2H_N = 5;                // hang: Tool · Item · Kind · Swing · Del
 constexpr int TB2D_N = 5;                // depth: Tool · Plane · Depth · Drift · Del
 constexpr int TB2W_N = 5;                // water: Tool · Mode · Rain · Region · Del
 constexpr int TB2_N = 4;                 // Rot · Feel · Tip · Del   (only while a zone is selected)
@@ -106,6 +114,9 @@ bool g_shown[MAX_ZONES];                 // screen currently shows this zone dis
 Water    g_wat[WATER_MAX];               // water regions
 int      g_nw = 0;
 uint32_t g_last_water = 0;
+Hang     g_hang[HANG_MAX];               // hanging things (hair, cloth, charms)
+int      g_nh = 0;
+uint32_t g_last_hang = 0;
 Parallax g_par;                          // depth planes (none = no parallax)
 uint16_t* g_anim = nullptr;              // parallax with zones: the content with the zones drawn in
 bool      g_anim_sw = true;
@@ -126,6 +137,7 @@ float    g_mic_hit = 0;                  // latest chunk's hit strength…
 float    g_mic_hold = 0;                 // …fed to the tracker for one chunk's worth of time (s)
 bool     g_mic_new = false;              // a chunk was just analysed
 float    g_dance = 0;                    // dance strength 0..1 (music)
+bool     g_dance_on = false;             // swipe up switches dancing on / off
 int      g_kick_sign = 1;
 uint32_t g_last_kick = 0;
 bool     g_was_music = false, g_was_echo = false;
@@ -140,6 +152,11 @@ float    g_echo = 0;                     // echo strength 0..1
 float    g_hold[MAX_ZONES][3];           // targets a resting zone is holding
 uint32_t g_last_us = 0;
 uint32_t g_last_draw = 0;
+// Drawing never holds the loop for long: a frame that takes longer than this is finished over the next
+// ticks (the gallery reads the touch screen and buttons in between, so taps and swipes always land).
+constexpr uint32_t SLICE_US = 12000;
+uint32_t g_tick_us0 = 0;
+bool over_budget() { return micros() - g_tick_us0 > SLICE_US; }
 
 // perf
 uint32_t g_pf_t0 = 0, g_pf_frames = 0, g_pf_us = 0, g_pf_px = 0;
@@ -157,10 +174,12 @@ void free_map(Zone& z) {
     z.span = nullptr;
 }
 
+void zone_off_water(Zone& z);
 void rebuild(Zone& z) {
     free_map(z);
     size_t b = zone_mem_bytes(z);
     prepare_zone(z, b ? alloc_psram(b) : nullptr);
+    zone_off_water(z);
 }
 
 int shape_from_name(const char* s) {
@@ -186,9 +205,33 @@ void clear_waters() {
     layer_sync();                                     // back to the plain photo
 }
 
+// A jiggle zone never drags water: the water is its own layer, animated by itself. Where a zone's
+// falloff reaches into water its weight is cleared, so the zone moves only what it covers.
+void zone_off_water(Zone& z) {
+    if (!z.wmap) return;
+    for (int i = 0; i < g_nw; ++i) {
+        const Water& w = g_wat[i];
+        if (!w.mask) continue;
+        for (int y = 0; y < z.bh; ++y)
+            for (int x = 0; x < z.bw; ++x)
+                if (z.wmap[y * z.bw + x] && mask_get(w.mask, z.bx + x, z.by + y)) z.wmap[y * z.bw + x] = 0;
+    }
+}
 void prepare_waters() {
     for (int i = 0; i < g_nw; ++i) water_prepare(g_wat[i], water_alloc);
+    for (int i = 0; i < g_n; ++i) zone_off_water(g_z[i]);
     layer_sync();
+}
+void clear_hangs() {
+    for (int i = 0; i < g_nh; ++i) hang_free(g_hang[i]);
+    g_nh = 0;
+}
+void prepare_hangs() {                                 // (before prepare_waters: that builds the layer)
+    for (int i = 0; i < g_nh; ++i) hang_prepare(g_hang[i], (const uint16_t*)g_img.getBuffer(), g_swapped, water_alloc);
+}
+bool any_hang_def() {
+    for (int i = 0; i < g_nh; ++i) if (hang_count(g_hang[i]) >= 12) return true;
+    return false;
 }
 
 int water_mode_from_name(const char* s) {
@@ -221,6 +264,7 @@ bool parse_water_line(char* line, Water* ws, int& nw, int& cur) {
             char* eq = strchr(tok, '=');
             if (!eq) continue;
             *eq = 0;
+            if (strcmp(tok, "name") == 0) { size_t L = strlen(eq + 1); if (L > sizeof(w.name) - 1) L = sizeof(w.name) - 1; memcpy(w.name, eq + 1, L); w.name[L] = 0; continue; }
             for (int p = 0; p < WP_COUNT; ++p)
                 if (strcmp(tok, wparam_info((uint8_t)p).key) == 0) {
                     char* end = nullptr;
@@ -287,6 +331,7 @@ void save_waters(F& f, const Water* ws, int nw) {
         f.printf("water %s", water_mode_name(w.mode));
         for (int p = 0; p < WP_COUNT; ++p)
             if (fabsf(w.prm[p] - wparam_info((uint8_t)p).dflt) > 1e-6f) f.printf(" %s=%.3g", wparam_info((uint8_t)p).key, w.prm[p]);
+        if (w.name[0]) f.printf(" name=%s", w.name);
         f.printf("\n");
         for (int l = 0; l < w.nlines; ++l) {
             if (!w.line[l].n) continue;
@@ -337,6 +382,7 @@ void layer_sync() {
     }
     bool live = false;
     for (int i = 0; i < g_nw; ++i) live |= g_wat[i].edge != nullptr;
+    for (int i = 0; i < g_nh; ++i) live |= g_hang[i].ready;          // (hangs draw into it too)
     if (!live) { g_layer = nullptr; return; }
     if (g_src_fast) { g_layer = g_src_fast; g_layer_sw = true; return; }
     g_layer = (uint16_t*)g_scratch.getBuffer();
@@ -353,7 +399,7 @@ bool any_water(const Water* ws, int nw) {
 bool any_plane(const Parallax& P);
 void save_zones() {
     if (!g_jig_path[0]) return;
-    if (g_n == 0 && !any_water(g_wat, g_nw) && !any_plane(g_par)) {
+    if (g_n == 0 && !any_water(g_wat, g_nw) && !any_plane(g_par) && !any_hang_def()) {
         if (SD.exists(g_jig_path)) SD.remove(g_jig_path);
         return;
     }
@@ -365,12 +411,14 @@ void save_zones() {
         f.printf("%s %d %d %d %d %s", shape_info(z.shape).name, (int)lroundf(z.cx), (int)lroundf(z.cy),
                  (int)lroundf(z.r), (int)z.rot, material_info(z.material).name);
         if (tip_used(z)) f.printf(" tip %d %d", (int)lroundf(z.tip_u * 100), (int)lroundf(z.tip_w * 100));
+        if (z.name[0]) f.printf(" name=%s", z.name);
         for (int t = 0; t < TUNE_COUNT; ++t)
             if (tune_set(z, (uint8_t)t)) f.printf(" %s=%.3g", tune_info((uint8_t)t).key, z.tune[t]);
         f.printf("\n");
     }
     save_waters(f, g_wat, g_nw);                     // after the zones: older firmware reads those and stops
     save_parallax(f, g_par);
+    save_hangs(f, g_hang, g_nh);
     f.close();
     Serial.printf("jig: saved %d zone(s), %d water -> %s\n", g_n, g_nw, g_jig_path);
 }
@@ -397,6 +445,7 @@ bool parse_zone(char* line, Zone& z) {
         if (m >= 0) { z.material = (uint8_t)m; continue; }
         if (char* eq = strchr(tok, '=')) {        // advanced tuning from the PC editor
             *eq = 0;
+            if (strcmp(tok, "name") == 0) { size_t L = strlen(eq + 1); if (L > sizeof(z.name) - 1) L = sizeof(z.name) - 1; memcpy(z.name, eq + 1, L); z.name[L] = 0; continue; }
             for (int t = 0; t < TUNE_COUNT; ++t)
                 if (strcmp(tok, tune_info((uint8_t)t).key) == 0) {
                     char* end = nullptr;
@@ -606,9 +655,7 @@ void water_update() {
             par_rows(water_rows, &job, g_wat[i].by, g_wat[i].by + g_wat[i].bh);   // both cores
         }
 }
-void draw_water() {
-    if (!g_layer) return;
-    water_update();
+void water_push() {
     int cur = 0;
     bool inflight = false;
     M5.Display.startWrite();
@@ -637,21 +684,158 @@ void draw_water() {
     M5.Display.endWrite();
 }
 
+// The water frame in progress: 1 = rendering into the layer, 2 = the hanging things over it, 3 = sending.
+struct WaterJobState { uint8_t phase = 0; int wi = 0, y = -1, nd = 0; int which[8]; bool par = false; };
+WaterJobState g_wj;
+int hang_update(bool water_moved, int* which);
+void hang_push(const int* which, int nd);
+// Advance it until done (true) or this tick's time is up (false).
+bool water_job() {
+    const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
+    while (g_wj.phase == 1) {
+        if (g_wj.wi >= g_nw) { g_wj.phase = 2; break; }
+        const Water& w = g_wat[g_wj.wi];
+        if (g_wj.y < 0) g_wj.y = w.by;
+        if (!w.edge || g_wj.y >= w.by + w.bh) { ++g_wj.wi; g_wj.y = -1; continue; }
+        if (over_budget()) return false;
+        const int ye = g_wj.y + STRIP_ROWS < w.by + w.bh ? g_wj.y + STRIP_ROWS : w.by + w.bh;
+        WaterJob job{&w, photo, g_swapped};
+        par_rows(water_rows, &job, g_wj.y, ye);       // both cores
+        g_wj.y = ye;
+    }
+    if (g_wj.phase == 2 && g_wj.par) { g_wj.phase = 0; return true; }   // (depth: the rest is its content step)
+    if (g_wj.phase == 2) {
+        g_wj.nd = g_nh > 0 ? hang_update(true, g_wj.which) : 0;
+        if (g_wj.nd) g_last_hang = millis();
+        g_wj.phase = 3; g_wj.wi = 0; g_wj.y = -1;
+    }
+    int cur = 0;
+    bool inflight = false;
+    M5.Display.startWrite();
+    while (g_wj.phase == 3) {
+        if (g_wj.wi >= g_nw) { g_wj.phase = 4; break; }
+        const Water& w = g_wat[g_wj.wi];
+        if (g_wj.y < 0) g_wj.y = w.by;
+        if (!w.edge || g_wj.y >= w.by + w.bh) { ++g_wj.wi; g_wj.y = -1; continue; }
+        if (over_budget()) break;
+        const int y = g_wj.y, ye = y + STRIP_ROWS < w.by + w.bh ? y + STRIP_ROWS : w.by + w.bh;
+        g_wj.y = ye;
+        int xa, xb;
+        water_rows_extent(w, y, ye, xa, xb);           // just the columns that hold water
+        if (xa >= xb) continue;
+        uint16_t* out = g_strip[cur];
+        if (inflight && USE_DMA && g_dma) { M5.Display.waitDMA(); inflight = false; }
+        const int ow = xb - xa;
+        for (int yy = y; yy < ye; ++yy) {
+            const uint16_t* row = g_layer + yy * IMG_W + xa;
+            uint16_t* o = out + (yy - y) * ow;
+            if (g_layer_sw) memcpy(o, row, (size_t)ow * 2);
+            else for (int x = 0; x < ow; ++x) o[x] = bswap16(row[x]);
+        }
+        push_strip(xa, y, ow, ye - y, out, inflight);
+        cur ^= 1;
+    }
+    if (inflight) M5.Display.waitDMA();
+    M5.Display.endWrite();
+    if (g_wj.phase != 4) return false;
+    if (g_wj.nd) hang_push(g_wj.which, g_wj.nd);
+    g_wj.phase = 0;
+    return true;
+}
+
+// ---- hanging things --------------------------------------------------------------------------------
+bool regions_meet(int ax0, int ay0, int ax1, int ay1, int bx0, int by0, int bx1, int by1) {
+    return !(ax0 >= bx1 || bx0 >= ax1 || ay0 >= by1 || by0 >= ay1);
+}
+// Which hangs to redraw this frame: moving, settling (one last frame at rest), or over water that moved.
+bool hang_due(int i, bool water_moved) {
+    const Hang& h = g_hang[i];
+    if (!h.ready) return false;
+    if (h.awake || !h.drawn) return true;
+    if (water_moved)
+        for (int k = 0; k < g_nw; ++k)
+            if (g_wat[k].edge && regions_meet(h.x0, h.y0, h.x1, h.y1, g_wat[k].bx, g_wat[k].by, g_wat[k].bx + g_wat[k].bw, g_wat[k].by + g_wat[k].bh))
+                return true;
+    return false;
+}
+// Into the layer: each due hang's region back to the photo (and its water), then every hang drawn.
+// Returns how many regions were redrawn (their indices in `which`).
+int hang_update(bool water_moved, int* which) {
+    if (!g_layer || g_nh == 0) return 0;
+    int nd = 0;
+    for (int i = 0; i < g_nh; ++i) if (hang_due(i, water_moved)) which[nd++] = i;
+    if (!nd) return 0;
+    const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
+    for (int k = 0; k < nd; ++k) {
+        const Hang& h = g_hang[which[k]];
+        for (int y = h.y0; y < h.y1; ++y) {
+            const uint16_t* sr = photo + y * IMG_W + h.x0;
+            uint16_t* d = g_layer + y * IMG_W + h.x0;
+            if (g_layer_sw == g_swapped) memcpy(d, sr, (size_t)(h.x1 - h.x0) * 2);
+            else for (int x = 0; x < h.x1 - h.x0; ++x) d[x] = bswap16(sr[x]);
+        }
+        for (int w = 0; w < g_nw; ++w)
+            if (g_wat[w].edge) water_render(g_wat[w], photo, g_swapped, g_layer, g_layer_sw, h.x0, h.y0, h.x1, h.y1, 0);
+    }
+    for (int i = 0; i < g_nh; ++i) {                  // (a resting hang draws itself exactly as the photo)
+        bool touched = false;
+        for (int k = 0; k < nd; ++k) {
+            const Hang& a = g_hang[which[k]];
+            touched |= regions_meet(a.x0, a.y0, a.x1, a.y1, g_hang[i].x0, g_hang[i].y0, g_hang[i].x1, g_hang[i].y1);
+        }
+        if (touched) hang_render(g_hang[i], g_layer, g_layer_sw);
+    }
+    for (int k = 0; k < nd; ++k) g_hang[which[k]].drawn = !g_hang[which[k]].awake;
+    return nd;
+}
+// Send the redrawn regions to the screen.
+void hang_push(const int* which, int nd) {
+    int cur = 0;
+    bool inflight = false;
+    M5.Display.startWrite();
+    for (int k = 0; k < nd; ++k) {
+        const Hang& h = g_hang[which[k]];
+        const int ow = h.x1 - h.x0;
+        for (int y = h.y0; y < h.y1; y += STRIP_ROWS) {
+            const int ye = y + STRIP_ROWS < h.y1 ? y + STRIP_ROWS : h.y1;
+            uint16_t* out = g_strip[cur];
+            if (inflight && USE_DMA && g_dma) { M5.Display.waitDMA(); inflight = false; }
+            for (int yy = y; yy < ye; ++yy) {
+                const uint16_t* row = g_layer + yy * IMG_W + h.x0;
+                uint16_t* o = out + (yy - y) * ow;
+                if (g_layer_sw) memcpy(o, row, (size_t)ow * 2);
+                else for (int x = 0; x < ow; ++x) o[x] = bswap16(row[x]);
+            }
+            push_strip(h.x0, y, ow, ye - y, out, inflight);
+            cur ^= 1;
+        }
+    }
+    if (inflight) M5.Display.waitDMA();
+    M5.Display.endWrite();
+}
+
 // ---- parallax -------------------------------------------------------------------------------------
 // Content (what the planes show of themselves): the photo with the water drawn in (the layer), and the
 // zones drawn into g_anim on top of that when there are zones.
+// The parallax frame being sent (it may take a few ticks).
+struct ParJobState { bool on = false; ParFrame F; DirtyRects dr; int ri = 0, y = 0; uint32_t px = 0, us = 0; float v0[2] = {0, 0}; };
+ParJobState g_pj;
+void par_push(uint32_t now);
 const uint16_t* par_content(bool& sw) {
     if (g_anim) { sw = g_anim_sw; return g_anim; }
     sw = render_src_swapped();
     return render_src();
 }
+bool g_par_full_sync = true;                           // the planes' fills need the whole content again
 void anim_sync() {                                     // g_anim ← the layer (zones redraw themselves)
+    g_par_full_sync = true;
     if (!g_anim) return;
     const uint16_t* s = render_src();
     g_anim_sw = render_src_swapped();
     memcpy(g_anim, s, (size_t)IMG_W * IMG_H * 2);
 }
 void prepare_parallax() {
+    g_pj.on = false; g_wj.phase = 0;
     parallax_prepare(g_par, (const uint16_t*)g_img.getBuffer(), g_swapped, water_alloc);
     if (g_par.ready && g_n > 0) {
         if (!g_anim) g_anim = (uint16_t*)alloc_psram((size_t)IMG_W * IMG_H * 2);
@@ -662,31 +846,41 @@ void prepare_parallax() {
     g_par.drawn = false;
 }
 void clear_parallax() {
+    g_pj.on = false; g_wj.phase = 0;
     parallax_free(g_par);
     g_par = Parallax();
     if (g_anim) { free(g_anim); g_anim = nullptr; }
     if (g_front) { free(g_front); g_front = nullptr; }
 }
 bool any_plane(const Parallax& P) {
-    if (P.grid) return true;
+    if (par_ground(P)) return true;
     for (int k = 0; k < P.n; ++k) if (plane_any(P.pl[k])) return true;
     return false;
 }
 
 struct ParJob { const ParFrame* F; uint16_t* out; int x0, x1, ys; };
-void par_rows_job(void* c, int, int y0, int y1) {
+void par_rows_job(void* c, int lane, int y0, int y1) {
     ParJob& j = *(ParJob*)c;
-    parallax_render(*j.F, j.out + (y0 - j.ys) * (j.x1 - j.x0), j.x0, y0, j.x1, y1);
+    parallax_render(*j.F, j.out + (y0 - j.ys) * (j.x1 - j.x0), j.x0, y0, j.x1, y1, lane);
 }
+
 
 // One parallax frame: step the view, update the content (water, zones), redraw what changed.
 void par_tick(uint32_t now, float dt, bool may_draw, bool zones_any) {
     const bool moved = parallax_step(g_par, dt, PAR_GX_S * g_gyro_xy[0], PAR_GY_S * g_gyro_xy[1], M5.Imu.isEnabled());
-    g_par_moving = moved || g_par.prm[PP_AMBIENT] > 0.0f;
-    if (!may_draw || now - g_last_draw < FRAME_MS) return;
+    g_par_moving = moved || g_par.prm[PP_AMBIENT] > 0.0f || g_pj.on;
+    if (g_pj.on) { if (may_draw) par_push(now); return; }       // finish the frame in progress first
+    bool water_done = false;
+    if (g_wj.phase == 0) {
+        if (!may_draw || now - g_last_draw < FRAME_MS) return;
+        if (g_nw > 0 && g_layer) { g_wj.phase = 1; g_wj.wi = 0; g_wj.y = -1; g_wj.par = true; }
+    }
+    if (g_wj.phase) {                                  // water: into the layer, a slice at a time
+        if (!may_draw || !water_job()) return;
+        water_done = true;
+    }
     DirtyRects content;
-    if (g_nw > 0 && g_layer) {                         // water: into the layer (and the content buffer)
-        water_update();
+    if (water_done) {                                  // (and the content buffer)
         for (int i = 0; i < g_nw; ++i) {
             const Water& w = g_wat[i];
             if (!w.edge) continue;
@@ -705,69 +899,110 @@ void par_tick(uint32_t now, float dt, bool may_draw, bool zones_any) {
             }
         }
     }
+    {                                                  // hanging things: into the layer and the content
+        int which[HANG_MAX];
+        const int nd = hang_update(g_nw > 0, which);
+        for (int k = 0; k < nd; ++k) {
+            const Hang& h = g_hang[which[k]];
+            if (g_anim)
+                for (int y = h.y0; y < h.y1; ++y) {
+                    const uint16_t* sr = g_layer + y * IMG_W + h.x0;
+                    uint16_t* d = g_anim + y * IMG_W + h.x0;
+                    if (g_anim_sw == g_layer_sw) memcpy(d, sr, (size_t)(h.x1 - h.x0) * 2);
+                    else for (int x = 0; x < h.x1 - h.x0; ++x) d[x] = bswap16(sr[x]);
+                }
+            content.add(h.x0, h.y0, h.x1, h.y1);
+            for (int z = 0; z < g_n; ++z)
+                if (g_z[z].wmap && regions_meet(g_z[z].bx, g_z[z].by, g_z[z].bx + g_z[z].bw, g_z[z].by + g_z[z].bh, h.x0, h.y0, h.x1, h.y1))
+                    g_shown[z] = true, zones_any = true;
+        }
+    }
     if (zones_any && g_anim) draw_frame(&content);
+    {                                                  // the changed content into the planes' fills
+        bool csw;
+        const uint16_t* c = par_content(csw);
+        if (g_par_full_sync) { parallax_sync_content(g_par, c, csw, 0, 0, IMG_W, IMG_H); g_par_full_sync = false; }
+        else for (int i = 0; i < content.n; ++i)
+            parallax_sync_content(g_par, c, csw, content.r[i][0], content.r[i][1], content.r[i][2], content.r[i][3]);
+    }
     if (!moved && content.n == 0) return;
     g_last_draw = now;
 
     // screen rects: planes that slid (or the whole frame if the background slides too), plus content
     // changes, spread by the most any plane is shifted
-    DirtyRects dr;
+    DirtyRects& dr = g_pj.dr;
+    dr.n = 0;
     if (moved) {
-        if (g_par.prm[PP_FOCUS] > 0.0f || g_par.grid || !g_par.drawn) dr.add(0, 0, IMG_W, IMG_H);   // (the ground: all of it)
+        if (g_par.prm[PP_FOCUS] > 0.0f || par_ground(g_par) || !g_par.drawn) dr.add(0, 0, IMG_W, IMG_H);   // (the ground: all of it)
         else for (int k = 0; k < g_par.n; ++k) { int r[4]; parallax_plane_rect(g_par, k, r); dr.add(r[0], r[1], r[2], r[3]); }
     }
     const int m = g_par.margin;
     for (int i = 0; i < content.n; ++i) dr.add(content.r[i][0] - m, content.r[i][1] - m, content.r[i][2] + m, content.r[i][3] + m);
-
     bool sw;
     const uint16_t* anim = par_content(sw);
-    ParFrame F;
-    parallax_frame(F, g_par, anim, sw, g_nw > 0 || g_n > 0);
-    uint32_t t0 = micros(), px = 0;
+    parallax_frame(g_pj.F, g_par, anim, sw, g_nw > 0 || g_n > 0);
+    g_pj.v0[0] = g_par.v[0]; g_pj.v0[1] = g_par.v[1];
+    g_pj.ri = 0; g_pj.y = dr.n ? dr.r[0][1] : 0; g_pj.px = 0; g_pj.us = 0;
+    g_pj.on = true;
+    par_push(now);
+}
+
+// Send the frame in progress, strip by strip, until it's done or this tick's time is up.
+void par_push(uint32_t now) {
+    DirtyRects& dr = g_pj.dr;
+    uint32_t t0 = micros();
     int cur = 0;
     bool inflight = false;
     M5.Display.startWrite();
-    for (int i = 0; i < dr.n; ++i) {
-        const int x0 = dr.r[i][0], x1 = dr.r[i][2];
-        for (int y = dr.r[i][1]; y < dr.r[i][3]; y += STRIP_ROWS) {
-            const int ye = y + STRIP_ROWS < dr.r[i][3] ? y + STRIP_ROWS : dr.r[i][3];
-            ParJob job{&F, g_strip[cur], x0, x1, y};
-            par_rows(par_rows_job, &job, y, ye);        // both cores
-            int bx0 = x0, bx1 = x1, by0 = y, by1 = ye;
-            uint16_t* buf = g_strip[cur];
-            const int w = x1 - x0;
-            if (g_front && g_par.drawn) {               // send only what changed (exact: same picture)
-                bx0 = IMG_W; bx1 = -1; by0 = IMG_H; by1 = -1;
-                for (int yy = y; yy < ye; ++yy) {
-                    const uint16_t* a = buf + (yy - y) * w;
-                    const uint16_t* f = g_front + yy * IMG_W + x0;
-                    int l = 0, r = w - 1;
-                    while (l < w && a[l] == f[l]) ++l;
-                    if (l == w) continue;
-                    while (a[r] == f[r]) --r;
-                    if (x0 + l < bx0) bx0 = x0 + l;
-                    if (x0 + r + 1 > bx1) bx1 = x0 + r + 1;
-                    if (yy < by0) by0 = yy;
-                    by1 = yy + 1;
-                }
-                if (by1 < 0) continue;                  // nothing changed in this strip
-                const int w2 = bx1 - bx0;
-                if (w2 != w || by0 != y)                // pack the changed box to the buffer's start
-                    for (int yy = by0; yy < by1; ++yy)
-                        memmove(buf + (yy - by0) * w2, buf + (yy - y) * w + (bx0 - x0), (size_t)w2 * 2);
-            }
-            if (g_front)
-                for (int yy = by0; yy < by1; ++yy) memcpy(g_front + yy * IMG_W + bx0, buf + (yy - by0) * (bx1 - bx0), (size_t)(bx1 - bx0) * 2);
-            push_strip(bx0, by0, bx1 - bx0, by1 - by0, buf, inflight);
-            px += (uint32_t)(bx1 - bx0) * (by1 - by0);
-            cur ^= 1;
+    while (g_pj.ri < dr.n) {
+        const int x0 = dr.r[g_pj.ri][0], x1 = dr.r[g_pj.ri][2];
+        if (g_pj.y >= dr.r[g_pj.ri][3]) {
+            if (++g_pj.ri < dr.n) g_pj.y = dr.r[g_pj.ri][1];
+            continue;
         }
+        if (over_budget()) break;
+        const int y = g_pj.y, ye = y + STRIP_ROWS < dr.r[g_pj.ri][3] ? y + STRIP_ROWS : dr.r[g_pj.ri][3];
+        g_pj.y = ye;
+        ParJob job{&g_pj.F, g_strip[cur], x0, x1, y};
+        par_rows(par_rows_job, &job, y, ye);        // both cores
+        int bx0 = x0, bx1 = x1, by0 = y, by1 = ye;
+        uint16_t* buf = g_strip[cur];
+        const int w = x1 - x0;
+        if (g_front && g_par.drawn) {               // send only what changed (exact: same picture)
+            bx0 = IMG_W; bx1 = -1; by0 = IMG_H; by1 = -1;
+            for (int yy = y; yy < ye; ++yy) {
+                const uint16_t* a = buf + (yy - y) * w;
+                const uint16_t* f = g_front + yy * IMG_W + x0;
+                int l = 0, r = w - 1;
+                while (l < w && a[l] == f[l]) ++l;
+                if (l == w) continue;
+                while (a[r] == f[r]) --r;
+                if (x0 + l < bx0) bx0 = x0 + l;
+                if (x0 + r + 1 > bx1) bx1 = x0 + r + 1;
+                if (yy < by0) by0 = yy;
+                by1 = yy + 1;
+            }
+            if (by1 < 0) continue;                  // nothing changed in this strip
+            const int w2 = bx1 - bx0;
+            if (w2 != w || by0 != y)                // pack the changed box to the buffer's start
+                for (int yy = by0; yy < by1; ++yy)
+                    memmove(buf + (yy - by0) * w2, buf + (yy - y) * w + (bx0 - x0), (size_t)w2 * 2);
+        }
+        if (inflight && USE_DMA && g_dma) { M5.Display.waitDMA(); inflight = false; }   // (the other buffer is free)
+        if (g_front)
+            for (int yy = by0; yy < by1; ++yy) memcpy(g_front + yy * IMG_W + bx0, buf + (yy - by0) * (bx1 - bx0), (size_t)(bx1 - bx0) * 2);
+        push_strip(bx0, by0, bx1 - bx0, by1 - by0, buf, inflight);
+        g_pj.px += (uint32_t)(bx1 - bx0) * (by1 - by0);
+        cur ^= 1;
     }
     if (inflight) M5.Display.waitDMA();
     M5.Display.endWrite();
-    g_par.dv[0] = g_par.v[0]; g_par.dv[1] = g_par.v[1];
+    g_pj.us += micros() - t0;
+    if (g_pj.ri < dr.n) return;                     // (more next tick)
+    g_pj.on = false;
+    g_par.dv[0] = g_pj.v0[0]; g_par.dv[1] = g_pj.v0[1];   // the view this frame shows
     g_par.drawn = true;
-    g_pf_us += micros() - t0; g_pf_px += px; ++g_pf_frames;
+    g_pf_us += g_pj.us; g_pf_px += g_pj.px; ++g_pf_frames;
     if (now - g_pf_t0 >= 3000) {
         if (g_pf_frames)
             Serial.printf("jig: depth %.1f fps, frame %.1f ms, %lu px/frame\n", g_pf_frames * 1000.0f / (now - g_pf_t0),
@@ -782,6 +1017,12 @@ void rest_all() {
         g_shown[i] = false;
         g_hold[i][0] = g_hold[i][1] = g_hold[i][2] = 0;
     }
+    for (int i = 0; i < g_nh; ++i) {                   // hanging things: home, and drawn once more
+        Hang& h = g_hang[i];
+        if (!h.ready) continue;
+        for (int k = 0; k < h.nrows * h.nc; ++k) { h.x[k][0] = h.xp[k][0] = h.rest[k][0]; h.x[k][1] = h.xp[k][1] = h.rest[k][1]; }
+        h.th = h.thp = 0; h.fade = 0; h.drawn = false;
+    }
 }
 
 void kick_all() {
@@ -789,6 +1030,13 @@ void kick_all() {
         g_z[i].vy += 0.6f * g_z[i].w1;
         g_z[i].vs += 0.4f * g_z[i].w1;
         g_z[i].awake = true;
+    }
+    for (int i = 0; i < g_nh; ++i) {                   // and a flick of each hanging thing
+        Hang& h = g_hang[i];
+        if (!h.ready) continue;
+        const int k = (h.nrows - 1) * h.nc + h.nc / 2;
+        hang_poke(h, h.x[k][0], h.x[k][1], 0.8f);
+        h.drawn = false;
     }
 }
 
@@ -810,7 +1058,7 @@ char     e_toast[48] = {0};
 uint32_t e_toast_until = 0;
 
 // Water editing
-enum WTool : uint8_t { WT_BRUSH = 0, WT_SMART, WT_ERASE, WT_POLY, WT_LINE, WT_COUNT };
+enum WTool : uint8_t { WT_BRUSH = 0, WT_SMART, WT_ERASE, WT_POLY, WT_LINE, WT_GRID, WT_COUNT };
 Water    e_w[WATER_MAX];                 // working copies (masks included)
 int      e_nw = 0, e_wi = -1;            // regions, the one being edited
 bool     e_wmode = false;                // editing water (not zones)
@@ -818,10 +1066,15 @@ bool     e_dmode = false;                // editing depth planes
 Plane    e_p[PLANE_MAX];                 // working copies of the planes (masks included)
 int      e_np = 0, e_pi = -1;
 float    e_pprm[PP_COUNT];
-bool     e_pgrid = false;               // the ground grid rides through the editor unchanged
+bool     e_pgrid = false;               // the ground grid (Grid tool in depth mode)
 float    e_gq[8];
 const float DEPTHS[] = {0.15f, 0.3f, 0.5f, 0.7f, 0.9f};
-bool e_mm() { return e_wmode || e_dmode; }   // editing a mask (water area or depth plane)
+Hang     e_h[HANG_MAX];                  // working copies of the hanging things (masks included)
+int      e_nh = 0, e_hi = -1;
+bool     e_hmode = false;                // editing hanging things
+int      e_pinned = 0;                   // Pin taps placed (0: next tap is A, 1: next is B)
+bool e_gmode = false;                         // fitting the ground grid (shared by water and depth)
+bool e_mm() { return e_wmode || e_dmode || e_hmode || e_gmode; }   // editing a mask (water area, depth plane, hanging thing)
 uint8_t  e_wtool = WT_BRUSH;
 int      e_brush = 8;                    // brush radius (px)
 // Smart selection: what you tapped / stroked, the mask before it (so A/C can step the edge), a result
@@ -842,10 +1095,22 @@ float g_out_u[SHAPE_COUNT][OUTLINE_PTS], g_out_w[SHAPE_COUNT][OUTLINE_PTS];
 bool  g_out_init = false;
 
 void toast(const char* msg);
-int bar_bottom() { return (e_active >= 0 || e_wmode || e_dmode) ? 2 * ROW_H : ROW_H; }
+int bar_bottom() { return (e_active >= 0 || e_wmode || e_dmode || e_hmode || e_gmode) ? 2 * ROW_H : ROW_H; }
+// The bars sit at the top, or (a tap on the hint line moves them) just above the footer, so what's
+// under them can be edited too - hair is usually right at the top.
+bool e_low = false;
+int row_y(int row) { return e_low ? IMG_H - FOOT_H - (row + 1) * ROW_H : row * ROW_H; }   // (low: row 1 nearest the footer)
+int bars_y() { return e_low ? IMG_H - FOOT_H - bar_bottom() : 0; }
+int hint_y() { return e_low ? bars_y() - HINT_H : bar_bottom(); }
+bool in_bars(int y) { const int a = e_low ? hint_y() : 0, b = e_low ? bars_y() + bar_bottom() : bar_bottom() + HINT_H; return y >= a && y < b; }
+// The picture you can see and touch between the bars (and the footer).
+int vis_top() { return e_low ? 0 : bar_bottom() + HINT_H; }
+int vis_bot() { return e_low ? hint_y() : IMG_H - FOOT_H; }
 
 const char* wtool_label(uint8_t t) {
     if (t == WT_SMART) return "Smart";
+    if (t == WT_GRID) return "Grid";
+    if (t == WT_LINE && e_hmode) return "Pin";
     return t == WT_ERASE ? "Erase" : (t == WT_POLY ? "Shape" : (t == WT_LINE ? (e_wi >= 0 && e_w[e_wi].mode == W_OCEAN ? "Shore" : "Flow") : "Paint"));
 }
 
@@ -879,10 +1144,145 @@ void e_dab(int x, int y) {
 // ---- smart selection -----------------------------------------------------------------------------
 void e_draw();
 Plane* e_plane() { return (e_pi >= 0 && e_pi < e_np) ? &e_p[e_pi] : nullptr; }
+Hang* e_hang() { return (e_hi >= 0 && e_hi < e_nh) ? &e_h[e_hi] : nullptr; }
+bool e_new_hang() {
+    if (e_nh >= HANG_MAX) return false;
+    Hang& h = e_h[e_nh];
+    hang_free(h);
+    h = Hang();
+    h.ax = h.ay = h.bx = h.by = -1;                // (no pin yet: it hangs from its top)
+    if (!hang_ensure_mask(h, water_alloc)) return false;
+    e_hi = e_nh++;
+    e_pinned = 0;
+    return true;
+}
+// Where it hangs from when no Pin was set: the middle of its top row.
+void hang_default_pin(Hang& h) {
+    if (h.ax >= 0 || !h.mask) return;
+    for (int y = 0; y < IMG_H; ++y) {
+        int a = -1, b = -1;
+        for (int x = 0; x < IMG_W; ++x) if (mask_get(h.mask, x, y)) { if (a < 0) a = x; b = x; }
+        if (a >= 0) { h.ax = (int16_t)a; h.bx = (int16_t)b; h.ay = h.by = (int16_t)y; return; }
+    }
+}
 uint8_t* e_cur_mask() {
     if (e_dmode) { Plane* p = e_plane(); return p ? p->mask : nullptr; }
+    if (e_hmode) { Hang* h = e_hang(); return h ? h->mask : nullptr; }
     Water* w = e_water(); return w ? w->mask : nullptr;
 }
+// ---- the ground grid: fitted by eye to the ground (Grid button). Depth planes stand on it and the water
+// takes its perspective from it (one grid for the whole picture).
+int8_t e_gk = -1;                                  // corner being dragged (-1: the whole grid)
+bool* e_grid_on() { return &e_pgrid; }
+float* e_grid_q() { return e_gq; }
+// A starting grid: over the water, its box narrowed toward the top; the ground, the lower frame.
+void e_grid_default() {
+    float* q = e_grid_q(); bool* on = e_grid_on();
+    if (!q || !on) return;
+    int x0 = 20, x1 = 300, y0 = 150, y1 = 230;
+    const uint8_t* m = nullptr;                    // (the lower part of the frame)
+    if (m) {
+        int a = IMG_W, b = -1, c = IMG_H, d = -1;
+        for (int y = 0; y < IMG_H; ++y)
+            for (int x = 0; x < IMG_W; ++x)
+                if (mask_get(m, x, y)) { if (x < a) a = x; if (x > b) b = x; if (y < c) c = y; if (y > d) d = y; }
+        if (b > a + 8 && d > c + 4) { x0 = a; x1 = b; y0 = c; y1 = d; }
+    }
+    const float in = (x1 - x0) * 0.3f;
+    const float g[8] = {(float)x0, (float)y1, (float)x1, (float)y1, x1 - in, (float)y0, x0 + in, (float)y0};
+    memcpy(q, g, sizeof(g));
+    *on = true;
+}
+// Turn it about its middle (levels the horizon with the photo's).
+void e_grid_turn(float deg) {
+    float* q = e_grid_q(); bool* on = e_grid_on();
+    if (!q || !on || !*on) return;
+    const float cx = (q[0] + q[2] + q[4] + q[6]) * 0.25f, cy = (q[1] + q[3] + q[5] + q[7]) * 0.25f;
+    const float cs = cosf(deg * 0.0174533f), sn = sinf(deg * 0.0174533f);
+    for (int k = 0; k < 4; ++k) {
+        const float dx = q[2 * k] - cx, dy = q[2 * k + 1] - cy;
+        q[2 * k] = cx + dx * cs - dy * sn; q[2 * k + 1] = cy + dx * sn + dy * cs;
+    }
+}
+int bar_bottom();
+// Where a corner's handle shows: on the corner, or pulled in to the visible picture (under the bars and
+// the footer, or past the frame) - it still drags the corner itself.
+void e_grid_handle(const float* q, int k, int& hx, int& hy) {
+    const int top = vis_top() + 6, bot = vis_bot() - 7;
+    hx = (int)clampf(q[2 * k], 7.0f, IMG_W - 8.0f);
+    hy = (int)clampf(q[2 * k + 1], (float)top, (float)bot);
+}
+void e_grid_press(int x, int y) {
+    float* q = e_grid_q(); bool* on = e_grid_on();
+    e_gk = -1;
+    if (!q || !on || !*on) return;
+    int best = 28 * 28;
+    for (int k = 0; k < 4; ++k) {
+        int hx, hy;
+        e_grid_handle(q, k, hx, hy);
+        const int dx = x - hx, dy = y - hy;
+        if (dx * dx + dy * dy < best) { best = dx * dx + dy * dy; e_gk = (int8_t)k; }
+    }
+}
+void e_grid_drag(int dx, int dy) {
+    float* q = e_grid_q(); bool* on = e_grid_on();
+    if (!q || !on || !*on) return;
+    for (int k = 0; k < 4; ++k) {
+        if (e_gk >= 0 && k != e_gk) continue;
+        q[2 * k] = clampf(q[2 * k] + dx, -200.0f, IMG_W + 200.0f);
+        q[2 * k + 1] = clampf(q[2 * k + 1] + dy, -400.0f, IMG_H + 200.0f);
+    }
+}
+void e_draw_grid(M5Canvas& c) {
+    const bool* on = e_grid_on(); const float* q = e_grid_q();
+    if (!on || !*on || !q) return;
+    const bool act = e_wtool == WT_GRID;
+    const uint16_t col = act ? C_LIME : C_DIM;
+    const WHomog H = water_homog(q);
+    for (int k = 0; k <= 8; ++k) {                     // 8 × 8 squares
+        float ax, ay, bx, by;
+        water_hmap(H, k / 8.0f, 0, ax, ay); water_hmap(H, k / 8.0f, 1, bx, by);
+        c.drawLine((int)ax, (int)ay, (int)bx, (int)by, col);
+        water_hmap(H, 0, k / 8.0f, ax, ay); water_hmap(H, 1, k / 8.0f, bx, by);
+        c.drawLine((int)ax, (int)ay, (int)bx, (int)by, col);
+    }
+    if (!act) return;
+    // where it meets the sky (dashed): the vanishing line
+    const float G = H.d * H.h - H.e * H.g, Hh = -(H.a * H.h - H.b * H.g), I = H.a * H.e - H.b * H.d;
+    if (fabsf(Hh) > 1e-9f)
+        for (int x = 0; x < IMG_W; x += 12) {
+            const int y0 = (int)(-(G * x + I) / Hh), y1 = (int)(-(G * (x + 6) + I) / Hh);
+            if (y0 > -10 && y0 < IMG_H + 10) c.drawLine(x, y0, x + 6, y1, C_YEL);
+        }
+    if (fabsf(Hh) > 1e-9f) {                           // named, so it's not a mystery line
+        const int yh = (int)(-(G * 30 + I) / Hh);
+        if (yh > vis_top() + 8 && yh < vis_bot() - 8) {
+            c.setTextDatum(middle_left); c.setTextColor(C_YEL);
+            c.drawString("horizon", 6, yh - 8);
+            c.setTextDatum(middle_center);
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        int hx, hy;
+        e_grid_handle(q, k, hx, hy);
+        const uint16_t hc = k < 2 ? C_LIME : C_YEL;                       // near corners / far corners
+        if (hx != (int)q[2 * k] || hy != (int)q[2 * k + 1]) {             // pulled in: points the way to it
+            float dx = q[2 * k] - hx, dy = q[2 * k + 1] - hy, l = sqrtf(dx * dx + dy * dy);
+            c.drawLine(hx, hy, hx + (int)(dx / l * 11), hy + (int)(dy / l * 11), hc);
+        }
+        c.fillCircle(hx, hy, 6, C_BLACK);
+        c.drawCircle(hx, hy, 6, hc);
+        c.drawCircle(hx, hy, 5, hc);
+    }
+}
+
+void e_tool_picked() {
+    if (e_wtool != WT_GRID) return;
+    bool* on = e_grid_on();
+    if (on && !*on) { e_grid_default(); toast("Drag corners to fit - hold: grid off"); }
+    else toast("Drag corners or inside - hold: grid off");
+}
+
 bool e_new_plane() {
     if (e_np >= PLANE_MAX) return false;
     Plane& p = e_p[e_np];
@@ -915,7 +1315,7 @@ void e_smart_run() {
     if (!m || !e_smart_mem()) return;
     memcpy(m, e_before, MASK_BYTES);
     SelGrow g = sel_grow((const uint16_t*)g_img.getBuffer(), g_swapped, e_marks, e_gstep, e_selbuf, water_alloc);
-    int n = sel_apply(m, e_selbuf, e_gadd, e_dmode ? -1 : 1, water_alloc);   // water keeps off the bank; planes take their rim
+    int n = sel_apply(m, e_selbuf, e_gadd, (e_dmode || e_hmode) ? -1 : 1, water_alloc, e_marks);   // water keeps off the bank; planes / hangs take their rim
     e_glevels = g.levels; e_gidx = g.index; e_glive = g.levels > 0;
     char msg[48];
     if (!n) snprintf(msg, sizeof(msg), e_gadd ? "Already in - try another spot" : "Nothing to remove there");
@@ -962,13 +1362,16 @@ void e_finish() {
             e_busy("Fitting to the edges...");
             memset(e_marks, 0, MASK_BYTES);
             mask_poly(e_marks, e_px, e_py, e_pn, true);
-            sel_snap((const uint16_t*)g_img.getBuffer(), g_swapped, e_marks, 8, e_selbuf, water_alloc);
-            sel_apply(m, e_selbuf, true, e_dmode ? -1 : 1, water_alloc);
+            if (!sel_grabcut((const uint16_t*)g_img.getBuffer(), g_swapped, e_marks, e_selbuf, water_alloc))   // GrabCut
+                sel_snap((const uint16_t*)g_img.getBuffer(), g_swapped, e_marks, 8, e_selbuf, water_alloc);      // (low memory)
+            sel_apply(m, e_selbuf, true, (e_dmode || e_hmode) ? -1 : 1, water_alloc);
         } else {
             mask_poly(m, e_px, e_py, e_pn, true);
         }
         e_pn = 0; e_glive = false;
         toast("Fitted - Smart/Paint/Erase to touch up");
+    } else if (e_wtool == WT_LINE && e_hmode) {
+        toast("Pinned - tap again to move it");
     } else if (e_wtool == WT_LINE && w) {
         if (e_pn < 2) { toast("Tap 2+ points along the water"); return; }
         if (w->nlines >= WLINE_MAX) { toast("3 lines max - A removes the last"); return; }
@@ -982,6 +1385,11 @@ void e_finish() {
 }
 
 void e_undo_point() {
+    if (e_hmode && e_wtool == WT_LINE) {               // Pin: clear it (it hangs from its top again)
+        Hang* h = e_hang();
+        if (h) { h->ax = h->ay = h->bx = h->by = -1; e_pinned = 0; toast("Pin cleared - it hangs from its top"); e_dirty = true; }
+        return;
+    }
     Water* w = e_water();
     if (e_pn > 0) { --e_pn; e_dirty = true; return; }
     if (w && e_wtool == WT_LINE && w->nlines > 0) { --w->nlines; toast("Removed the last line"); e_dirty = true; }
@@ -1019,6 +1427,38 @@ void e_tint_planes(M5Canvas& c) {
             buf[i] = g_swapped ? bswap16(px) : px;
         }
     }
+}
+
+void e_tint_hangs(M5Canvas& c) {
+    uint16_t* buf = (uint16_t*)c.getBuffer();
+    for (int k = 0; k < e_nh; ++k) {
+        const uint8_t* m = e_h[k].mask;
+        if (!m) continue;
+        const bool act = e_hmode && k == e_hi;
+        if (!e_hmode) continue;
+        for (int i = 0; i < IMG_W * IMG_H; ++i) {
+            if (!((m[i >> 3] >> (i & 7)) & 1)) continue;
+            uint16_t px = g_swapped ? bswap16(buf[i]) : buf[i];
+            px = rgb565_mix(px, (uint16_t)0xFD20, act ? 110 : 45);   // orange
+            buf[i] = g_swapped ? bswap16(px) : px;
+        }
+    }
+    const Hang* h = e_hang();
+    if (!e_hmode || !h || h->ax < 0) return;
+    c.drawWideLine(h->ax, h->ay, h->bx, h->by, 3.0f, C_BLACK);
+    c.drawWideLine(h->ax, h->ay, h->bx, h->by, 1.5f, C_YEL);
+    c.fillCircle(h->ax, h->ay, 3, C_YEL);
+    c.fillCircle(h->bx, h->by, 3, C_YEL);
+    if (hang_count(*h) < 12) return;                   // which way it hangs
+    const float rx = (h->ax + h->bx) * 0.5f, ry = (h->ay + h->by) * 0.5f;
+    float dx, dy;
+    hang_dir(*h, dx, dy);
+    float l = sqrtf(dx * dx + dy * dy);
+    if (l < 4) { dx = 0; dy = 1; l = 1; }
+    dx /= l; dy /= l;
+    const float ex = rx + dx * 16, ey = ry + dy * 16;
+    c.drawWideLine(rx, ry, ex, ey, 1.0f, C_YEL);
+    c.fillTriangle((int)(ex + dx * 5), (int)(ey + dy * 5), (int)(ex - dy * 3), (int)(ey + dx * 3), (int)(ex + dy * 3), (int)(ey - dx * 3), C_YEL);
 }
 
 void e_draw_lines(M5Canvas& c) {
@@ -1092,11 +1532,22 @@ void tip_screen(const Zone& z, float& x, float& y) {
 }
 
 const char* context_hint() {
+    if (e_gmode) return e_pgrid ? "Squares flat on the ground  -  A/C turn" : "Grid off  -  tap Grid: on";
     if (e_dmode) {
         switch (e_wtool) {
         case WT_BRUSH: return "Paint what's at this depth  -  A/C size";
         case WT_SMART: return "Tap or paint over it  -  hold: remove";
         case WT_ERASE: return "Erase  -  A/C size";
+        case WT_GRID:  return "Squares flat on the ground  -  A/C turn";
+        default:       return "Tap around it  -  A undo  -  C fill (fitted)";
+        }
+    }
+    if (e_hmode) {
+        switch (e_wtool) {
+        case WT_BRUSH: return "Paint what hangs (hair, cloth)  -  A/C size";
+        case WT_SMART: return "Tap or paint over it  -  hold: remove";
+        case WT_ERASE: return "Erase  -  A/C size";
+        case WT_LINE:  return "Tap where it hangs from (1 or 2)  -  A clear";
         default:       return "Tap around it  -  A undo  -  C fill (fitted)";
         }
     }
@@ -1106,6 +1557,7 @@ const char* context_hint() {
         case WT_SMART: return "Tap or paint over the water  -  hold: remove";
         case WT_ERASE: return "Erase water off the banks  -  A/C size";
         case WT_POLY:  return "Tap around the water  -  A undo  -  C fill";
+        case WT_GRID:  return "Squares flat on the water  -  A/C turn";
         default:       return (e_water() && e_water()->mode == W_OCEAN) ? "Tap along the shore  -  A undo  -  C done"
                                                                       : "Tap along the flow  -  A undo  -  C done";
         }
@@ -1124,7 +1576,7 @@ const char* context_hint() {
 }
 
 void bar_button(M5Canvas& c, int row, int i, int n, bool on, bool live) {
-    int x0 = i * IMG_W / n, x1 = (i + 1) * IMG_W / n, y0 = row * ROW_H;
+    int x0 = i * IMG_W / n, x1 = (i + 1) * IMG_W / n, y0 = row_y(row);
     if (on) c.fillRoundRect(x0 + 2, y0 + 2, x1 - x0 - 4, ROW_H - 4, 5, C_TEAL);
     else    c.drawRoundRect(x0 + 2, y0 + 2, x1 - x0 - 4, ROW_H - 4, 5, live ? C_DIM : C_BG);
 }
@@ -1132,9 +1584,11 @@ void bar_button(M5Canvas& c, int row, int i, int n, bool on, bool live) {
 void e_draw() {
     M5Canvas& c = g_scratch;
     memcpy(c.getBuffer(), g_img.getBuffer(), (size_t)IMG_W * IMG_H * 2);
-    if (!e_dmode) e_tint_water(c);
+    if (!e_dmode && !e_hmode) e_tint_water(c);
     e_tint_planes(c);
-    if (!e_dmode) e_draw_lines(c);
+    e_tint_hangs(c);
+    if (!e_dmode && !e_hmode) e_draw_lines(c);
+    if (e_mm()) e_draw_grid(c);
     if (e_mm() && e_wtool == WT_SMART && t_down && e_marks) {      // the stroke being painted
         uint16_t* buf = (uint16_t*)c.getBuffer();
         for (int i = 0; i < IMG_W * IMG_H; ++i)
@@ -1167,15 +1621,16 @@ void e_draw() {
     c.setTextDatum(middle_center);
 
     // Row 1: shapes + Cancel
-    c.fillRect(0, 0, IMG_W, ROW_H, C_BG);
+    const int by = row_y(0), by2 = row_y(1);
+    c.fillRect(0, by, IMG_W, ROW_H, C_BG);
     for (int i = 0; i < TB1_N; ++i) {
         int x0 = i * IMG_W / TB1_N, x1 = (i + 1) * IMG_W / TB1_N;
-        int cx = (x0 + x1) / 2, cy = ROW_H / 2;
-        bool on = (i < SHAPE_COUNT && e_armed == i) || (i == TB1_WATER && e_wmode) || (i == TB1_DEPTH && e_dmode);
+        int cx = (x0 + x1) / 2, cy = by + ROW_H / 2;
+        bool on = (i < SHAPE_COUNT && e_armed == i) || (i == TB1_WATER && e_wmode) || (i == TB1_DEPTH && e_dmode) || (i == TB1_HANG && e_hmode) || (i == TB1_GRID && e_gmode);
         bar_button(c, 0, i, TB1_N, on, true);
-        if (i == TB1_WATER || i == TB1_DEPTH) {
+        if (i == TB1_WATER || i == TB1_DEPTH || i == TB1_HANG || i == TB1_GRID) {
             c.setTextColor(on ? C_LIME : C_TEXT);
-            c.drawString(i == TB1_WATER ? "Water" : "Depth", cx, cy);
+            c.drawString(i == TB1_WATER ? "Water" : (i == TB1_DEPTH ? "Depth" : (i == TB1_HANG ? "Hang" : "Grid")), cx, cy);
         } else if (i < SHAPE_COUNT) {
             Zone icon;
             icon.shape = (uint8_t)i;
@@ -1189,9 +1644,19 @@ void e_draw() {
         }
     }
 
+    // Row 2 (grid): turn · turn · reset · on/off
+    if (e_gmode) {
+        c.fillRect(0, by2, IMG_W, ROW_H, C_BG);
+        const char* lbl[TB2G_N] = {"Turn <", "Turn >", "Reset", e_pgrid ? "Grid: on" : "Grid: off"};
+        for (int i = 0; i < TB2G_N; ++i) {
+            bar_button(c, 1, i, TB2G_N, i == 3 && e_pgrid, true);
+            c.setTextColor(C_TEXT);
+            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2G_N), by2 + ROW_H / 2);
+        }
+    }
     // Row 2 (water): tool · mode · rain · region · delete
     if (e_wmode) {
-        c.fillRect(0, ROW_H, IMG_W, ROW_H, C_BG);
+        c.fillRect(0, by2, IMG_W, ROW_H, C_BG);
         const Water* w = e_water();
         char region[32];
         snprintf(region, sizeof(region), "Area %d/%d", e_wi + 1, e_nw);
@@ -1200,40 +1665,56 @@ void e_draw() {
         for (int i = 0; i < TB2W_N; ++i) {
             bar_button(c, 1, i, TB2W_N, (i == 2 && w && w->prm[WP_RAIN] >= 0.5f), true);
             c.setTextColor(C_TEXT);
-            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2W_N), ROW_H + ROW_H / 2);
+            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2W_N), by2 + ROW_H / 2);
         }
     }
     // Row 2 (depth): tool · plane · its depth · drift · delete
     if (e_dmode) {
-        c.fillRect(0, ROW_H, IMG_W, ROW_H, C_BG);
+        c.fillRect(0, by2, IMG_W, ROW_H, C_BG);
         const Plane* p = e_plane();
         char pl[32], dp[16];
         snprintf(pl, sizeof(pl), "Plane %d/%d", e_pi + 1, e_np);
-        snprintf(dp, sizeof(dp), "Depth %.1f", p ? p->depth : 0.0f);
+        if (e_pgrid) snprintf(dp, sizeof(dp), e_pprm[PP_GROUND] >= 0.5f ? "Ground: on" : "Ground: off");
+        else snprintf(dp, sizeof(dp), "Depth %.1f", p ? p->depth : 0.0f);
         const bool drift = e_pprm[PP_AMBIENT] > 0.0f;
         const char* lbl[TB2D_N] = {wtool_label(e_wtool), pl, dp, drift ? "Drift: on" : "Drift: off", "Del"};
         for (int i = 0; i < TB2D_N; ++i) {
-            bar_button(c, 1, i, TB2D_N, i == 3 && drift, true);
+            bar_button(c, 1, i, TB2D_N, (i == 3 && drift) || (i == 2 && e_pgrid && e_pprm[PP_GROUND] >= 0.5f), true);
             c.setTextColor(C_TEXT);
-            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2D_N), ROW_H + ROW_H / 2);
+            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2D_N), by2 + ROW_H / 2);
+        }
+    }
+    // Row 2 (hanging things): tool · which · kind · swing · delete
+    if (e_hmode) {
+        c.fillRect(0, by2, IMG_W, ROW_H, C_BG);
+        const Hang* h = e_hang();
+        char it[24], sw[16];
+        snprintf(it, sizeof(it), "Item %d/%d", e_hi + 1, e_nh);
+        const float s = h ? h->prm[HP_SWING] : 1.0f;
+        snprintf(sw, sizeof(sw), "Swing: %s", s < 0.75f ? "low" : (s < 1.3f ? "mid" : "high"));
+        const char* lbl[TB2H_N] = {wtool_label(e_wtool), it, h ? hang_kind_info(h->kind).label : "-", sw, "Del"};
+        for (int i = 0; i < TB2H_N; ++i) {
+            bar_button(c, 1, i, TB2H_N, false, true);
+            c.setTextColor(C_TEXT);
+            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2H_N), by2 + ROW_H / 2);
         }
     }
     // Row 2: selected zone's options
-    if (e_active >= 0 && !e_wmode && !e_dmode) {
+    if (e_active >= 0 && !e_wmode && !e_dmode && !e_hmode && !e_gmode) {
         const Zone& z = e_z[e_active];
-        c.fillRect(0, ROW_H, IMG_W, ROW_H, C_BG);
+        c.fillRect(0, by2, IMG_W, ROW_H, C_BG);
         char feel[16];
         snprintf(feel, sizeof(feel), "%s", material_info(z.material).label);
         const char* lbl[TB2_N] = {"Rot", feel, z.tip ? "Point: on" : "Point: off", "Del"};
         for (int i = 0; i < TB2_N; ++i) {
             bar_button(c, 1, i, TB2_N, i == 2 && z.tip, true);
             c.setTextColor(C_TEXT);
-            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2_N), ROW_H + ROW_H / 2);
+            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2_N), by2 + ROW_H / 2);
         }
     }
 
     // Hint line
-    int hy = bar_bottom();
+    int hy = hint_y();
     bool toasting = e_toast[0] && (int32_t)(millis() - e_toast_until) < 0;
     const char* hint = toasting ? e_toast : context_hint();
     c.fillRect(0, hy, IMG_W, HINT_H, C_BLACK);
@@ -1246,7 +1727,10 @@ void e_draw() {
     if (e_mm()) {
         const bool pts = e_wtool == WT_POLY || e_wtool == WT_LINE;
         c.setTextColor(C_TEXT);
-        if (e_wtool == WT_SMART) {
+        if (e_wtool == WT_GRID) {
+            c.drawString("A  turn", 55, fy + FOOT_H / 2);
+            c.drawString("turn  C", 265, fy + FOOT_H / 2);
+        } else if (e_wtool == WT_SMART) {
             c.setTextColor(e_glive ? C_TEXT : C_DIM);
             c.drawString("A  smaller", 55, fy + FOOT_H / 2);
             c.drawString("bigger  C", 265, fy + FOOT_H / 2);
@@ -1254,7 +1738,7 @@ void e_draw() {
             c.drawString(pts ? "A  undo" : "A  smaller", 55, fy + FOOT_H / 2);
             c.drawString(pts ? (e_wtool == WT_POLY ? "fill  C" : "done  C") : "bigger  C", 265, fy + FOOT_H / 2);
         }
-        if (!pts && e_wtool != WT_SMART) {                                         // brush size preview
+        if (!pts && e_wtool != WT_SMART && e_wtool != WT_GRID) {                   // brush size preview
             c.drawCircle(IMG_W - 14, fy - 14, e_brush < 12 ? e_brush : 12, C_LIME);
         }
     } else {
@@ -1305,8 +1789,18 @@ void e_close(bool save) {
             for (int k = 0; k < MASK_BYTES && e_w[i].mask && !any; ++k) any = e_w[i].mask[k] != 0;
             if (!any) continue;                           // an empty area isn't kept
             water_copy_def(g_wat[g_nw], e_w[i], water_alloc);
+            g_wat[g_nw].grid = e_pgrid;                   // the water lies on the ground: its perspective
+            if (e_pgrid) memcpy(g_wat[g_nw].gq, e_gq, sizeof(e_gq));
             ++g_nw;
         }
+        clear_hangs();
+        for (int k = 0; k < e_nh; ++k) {
+            if (hang_count(e_h[k]) < 12) continue;       // an empty one isn't kept
+            hang_default_pin(e_h[k]);
+            hang_copy_def(g_hang[g_nh], e_h[k], water_alloc);
+            ++g_nh;
+        }
+        prepare_hangs();
         prepare_waters();
         parallax_free(g_par);
         g_par = Parallax();
@@ -1322,6 +1816,8 @@ void e_close(bool save) {
     for (int i = 0; i < e_nw; ++i) water_free(e_w[i]);
     for (int k = 0; k < e_np; ++k) plane_free(e_p[k]);
     e_np = 0; e_pi = -1; e_dmode = false;
+    for (int k = 0; k < e_nh; ++k) hang_free(e_h[k]);
+    e_nh = 0; e_hi = -1; e_hmode = false;
     e_smart_free();
     e_nw = 0; e_wi = -1; e_wmode = false; e_pn = 0;
     layer_sync();                                     // the editor drew on the canvas the layer may use
@@ -1343,20 +1839,56 @@ void e_delete_active() {
 }
 
 void e_bar_tap(int x, int y, uint32_t held) {
+    if (y >= row_y(0) && y < row_y(0) + ROW_H) y = y - row_y(0);                       // row 1
+    else if (bar_bottom() > ROW_H && y >= row_y(1) && y < row_y(1) + ROW_H) y = ROW_H + y - row_y(1);   // row 2
+    else {                                             // the hint line: move the bars to the other end
+        e_low = !e_low;
+        toast(e_low ? "Bars at the bottom - tap this line to move them" : "Bars at the top");
+        e_dirty = true;
+        return;
+    }
     if (y < ROW_H) {
         int i = x * TB1_N / IMG_W;
+        if (i == TB1_GRID) {                          // the ground grid on / off
+            e_gmode = !e_gmode;
+            e_wmode = false; e_dmode = false; e_hmode = false;
+            e_armed = -1; e_active = -1; e_pn = 0; e_glive = false;
+            if (e_gmode) {
+                e_wtool = WT_GRID;
+                if (!e_pgrid) {
+                    e_grid_default();
+                    bool planes = false;
+                    for (int k = 0; k < e_np; ++k) planes |= plane_any(e_p[k]);
+                    if (!planes) e_pprm[PP_GROUND] = 0.0f;   // (just the grid: the ground doesn't start sliding)
+                }
+                toast("Drag the corners: squares flat on the ground");
+            } else e_wtool = WT_SMART;
+            e_dirty = true;
+            return;
+        }
+        if (e_gmode) { e_gmode = false; e_wtool = WT_SMART; }
+        if (i == TB1_HANG) {                          // hanging things on / off
+            e_hmode = !e_hmode;
+            e_wmode = false; e_dmode = false;
+            e_armed = -1; e_active = -1; e_pn = 0; e_glive = false;
+            if (e_wtool == WT_GRID) e_wtool = WT_SMART;
+            if (e_hmode && e_nh == 0) e_new_hang();
+            if (e_hmode) toast(e_low ? "Select it, then Pin where it hangs" : "At the top? Tap this line: bars go down");
+            e_dirty = true;
+            return;
+        }
         if (i == TB1_DEPTH) {                         // depth planes on / off
             e_dmode = !e_dmode;
-            e_wmode = false;
+            e_wmode = false; e_hmode = false;
             e_armed = -1; e_active = -1; e_pn = 0; e_glive = false;
             if (e_wtool == WT_LINE) e_wtool = WT_SMART;
             if (e_dmode && e_np == 0) e_new_plane();
-            if (e_dmode) toast("Tap what's nearest (Smart), or Shape around it");
+            if (e_dmode) toast(e_pgrid ? "Select what stands on the ground (Smart)" : "Tap what's nearest (Smart), or Shape around it");
             e_dirty = true;
             return;
         }
         if (i == TB1_WATER) {                         // water editing on / off
-            e_dmode = false; e_glive = false;
+            e_dmode = false; e_hmode = false; e_glive = false;
             e_wmode = !e_wmode;
             e_armed = -1; e_active = -1; e_pn = 0;
             if (e_wmode && e_nw == 0) e_new_water();
@@ -1365,7 +1897,7 @@ void e_bar_tap(int x, int y, uint32_t held) {
             return;
         }
         if (i < SHAPE_COUNT) {
-            e_wmode = false; e_dmode = false; e_pn = 0;
+            e_wmode = false; e_dmode = false; e_hmode = false; e_pn = 0;
             if (e_armed == i) { e_armed = -1; e_dirty = true; return; }
             if (e_n >= MAX_ZONES) { toast("4 zones max - Del one first"); return; }
             e_armed = i;
@@ -1375,13 +1907,61 @@ void e_bar_tap(int x, int y, uint32_t held) {
         }
         return;
     }
+    if (e_gmode) {
+        switch (x * TB2G_N / IMG_W) {
+        case 0: e_grid_turn(-2.0f); break;
+        case 1: e_grid_turn(+2.0f); break;
+        case 2: e_grid_default(); toast("Grid reset"); break;
+        case 3:
+            e_pgrid = !e_pgrid;
+            if (e_pgrid && e_gq[0] == 0 && e_gq[1] == 0 && e_gq[2] == 0) e_grid_default();
+            toast(e_pgrid ? "Grid on" : "Grid off - flat water, planes at their own depth");
+            break;
+        }
+        e_dirty = true;
+        return;
+    }
+    if (e_hmode) {
+        Hang* h = e_hang();
+        switch (x * TB2H_N / IMG_W) {
+        case 0:                                   // tool: Paint → Smart → Erase → Shape → Pin
+            e_wtool = (uint8_t)((e_wtool + 1) % WT_COUNT);
+            if (e_wtool == WT_GRID) e_wtool = WT_BRUSH;
+            e_pn = 0; e_glive = false; e_pinned = 0;
+            break;
+        case 1:                                   // next one (hold: a new one)
+            if (held >= 500) { if (!e_new_hang()) toast("3 hanging things max"); else toast("New - select it"); }
+            else if (e_nh > 0) { e_hi = (e_hi + 1) % e_nh; e_pinned = 0; }
+            e_pn = 0; e_glive = false;
+            break;
+        case 2:                                   // hair → cloth → charm
+            if (h) h->kind = (uint8_t)((h->kind + 1) % HANG_KIND_COUNT);
+            break;
+        case 3:                                   // swing: low → mid → high
+            if (h) h->prm[HP_SWING] = h->prm[HP_SWING] < 0.75f ? 1.0f : (h->prm[HP_SWING] < 1.3f ? 1.6f : 0.5f);
+            break;
+        case 4:                                   // delete this one
+            if (h) {
+                hang_free(*h);
+                for (int k = e_hi; k < e_nh - 1; ++k) { e_h[k] = e_h[k + 1]; e_h[k + 1] = Hang(); }
+                --e_nh;
+                if (e_nh == 0) e_new_hang(); else if (e_hi >= e_nh) e_hi = e_nh - 1;
+                toast("Deleted");
+                e_glive = false;
+            }
+            break;
+        }
+        e_dirty = true;
+        return;
+    }
     if (e_dmode) {
         Plane* p = e_plane();
         switch (x * TB2D_N / IMG_W) {
-        case 0:                                   // tool: Paint → Smart → Erase → Shape (no lines here)
+        case 0:                                   // tool: Paint → Smart → Erase → Shape (the grid: Grid button)
             e_wtool = (uint8_t)((e_wtool + 1) % WT_COUNT);
-            if (e_wtool == WT_LINE) e_wtool = WT_BRUSH;
+            if (e_wtool == WT_LINE || e_wtool == WT_GRID) e_wtool = WT_BRUSH;
             e_pn = 0; e_glive = false;
+            e_tool_picked();
             break;
         case 1:                                   // next plane (hold: a new one)
             if (held >= 500) { if (!e_new_plane()) toast("4 planes max"); else toast("New plane"); }
@@ -1389,7 +1969,11 @@ void e_bar_tap(int x, int y, uint32_t held) {
             e_pn = 0; e_glive = false;
             break;
         case 2:                                   // its depth: far → near
-            if (p) {
+            if (e_pgrid) {                        // with the grid: planes stand on it; does the ground slide too?
+                e_pprm[PP_GROUND] = e_pprm[PP_GROUND] >= 0.5f ? 0.0f : 1.0f;
+                toast(e_pprm[PP_GROUND] >= 0.5f ? "The ground slides too (planes stand on it)" : "The ground stays put (planes stand on it)");
+            }
+            else if (p) {
                 int k = 0;
                 while (k < 5 && DEPTHS[k] < p->depth - 0.01f) ++k;
                 p->depth = DEPTHS[(k + 1) % 5];
@@ -1416,10 +2000,12 @@ void e_bar_tap(int x, int y, uint32_t held) {
     if (e_wmode) {
         Water* w = e_water();
         switch (x * TB2W_N / IMG_W) {
-        case 0:                                   // tool: Paint → Erase → Shape → Flow/Shore line
+        case 0:                                   // tool: Paint → Smart → Erase → Shape → Flow/Shore line (grid: Grid button)
             e_wtool = (uint8_t)((e_wtool + 1) % WT_COUNT);
+            if (e_wtool == WT_GRID) e_wtool = WT_BRUSH;
             e_glive = false;
             e_pn = 0;
+            e_tool_picked();
             break;
         case 1:                                   // still → river → ocean
             if (w) {
@@ -1475,6 +2061,20 @@ void e_bar_tap(int x, int y, uint32_t held) {
 void e_image_tap(int x, int y, uint32_t held) {
     (void)held;
     if (e_mm()) {
+        if (e_hmode && e_wtool == WT_LINE) {           // Pin: A, then B (a third tap starts over)
+            Hang* h = e_hang();
+            if (h) {
+                if (e_pinned == 0) { h->ax = h->bx = (int16_t)x; h->ay = h->by = (int16_t)y; e_pinned = 1; toast("Pinned at a point - tap again for a line"); }
+                else { h->bx = (int16_t)x; h->by = (int16_t)y; e_pinned = 0; toast("Pinned along a line"); }
+            }
+            e_dirty = true;
+            return;
+        }
+        if (e_wtool == WT_GRID) {
+            bool* on = e_grid_on();
+            if (on && *on && held >= 600) { *on = false; toast("Grid off - flat water, planes at their own depth"); }
+            else if (on && !*on) { e_grid_default(); toast("Drag corners to fit - hold: grid off"); }
+        }
         if (e_wtool == WT_POLY || e_wtool == WT_LINE) {
             int maxp = e_wtool == WT_LINE ? WPTS_MAX : 32;
             if (e_pn < maxp) { e_px[e_pn] = (int16_t)x; e_py[e_pn] = (int16_t)y; ++e_pn; }
@@ -1638,6 +2238,7 @@ void present() {
 void clear_zones() {
     for (int i = 0; i < g_n; ++i) free_map(g_z[i]);
     g_n = 0;
+    clear_hangs();
     clear_waters();
     clear_parallax();
     g_jig_path[0] = 0;
@@ -1646,6 +2247,7 @@ void clear_zones() {
 int zone_count() { return g_n; }
 
 void load_zones(const char* image_path) {
+    g_pj.on = false; g_wj.phase = 0;                   // (no frame in progress for the old picture)
     clear_zones();
     if (!g_ok || !image_path) return;
     // Hidden sidecar: "/images/santa.mg" → "/images/.santa.mg.jig" (dot-files are skipped by scans).
@@ -1659,13 +2261,14 @@ void load_zones(const char* image_path) {
     // are cut (the rest of that line is skipped).
     static char line[1400];
     static uint8_t chunk[512];
-    int len = 0, line_no = 0, wcur = -1, pcur = -1;
+    int len = 0, line_no = 0, wcur = -1, pcur = -1, hcur = -1;
     bool ok = true, skipping = false, done = false;
     auto take_line = [&](char* ln) {
         if (line_no++ == 0) { if (strncmp(ln, "MGJIG1", 6) != 0) ok = false; return; }
         if (!ok) return;
         if (parse_water_line(ln, g_wat, g_nw, wcur)) return;
         if (parse_parallax_line(ln, g_par, pcur, water_alloc)) return;
+        if (parse_hang_line(ln, g_hang, g_nh, hcur, water_alloc)) return;
         if (g_n >= MAX_ZONES) return;
         Zone z;
         if (!parse_zone(ln, z)) return;
@@ -1691,13 +2294,15 @@ void load_zones(const char* image_path) {
     }
     if (len > 0 && !skipping && ok) { line[len] = 0; take_line(line); }
     f.close();
+    prepare_hangs();
     prepare_waters();
     prepare_parallax();
-    Serial.printf("jig: %d zone(s), %d water, %d depth plane(s) from %s\n", g_n, g_nw, g_par.n, g_jig_path);
+    Serial.printf("jig: %d zone(s), %d water, %d depth plane(s), %d hanging from %s\n", g_n, g_nw, g_par.n, g_nh, g_jig_path);
 }
 
 void play_tick(uint32_t now, bool may_draw) {
     uint32_t us = micros();
+    g_tick_us0 = us;
     float dt = (us - g_last_us) * 1e-6f;
     g_last_us = us;
     if (!g_ok) return;
@@ -1742,6 +2347,8 @@ void play_tick(uint32_t now, bool may_draw) {
     if (have) g_motion_echo.update(dt, dyn, gdev, g_w);
     for (int i = 0; i < g_nw; ++i)                     // water: real gravity + your jolts
         if (g_wat[i].edge) water_step(g_wat[i], dt, dn_live, dyn);
+    for (int i = 0; i < g_nh; ++i)                     // hanging things: the same
+        if (g_hang[i].ready) { if (hang_step(g_hang[i], dt, dn_live, dyn)) g_hang[i].drawn = false; }
     // Swayed back and forth and stopped: the forms keep swaying on their own springs, dying out
     // slowly (damping eased off, coming back over ECHO_FADE_S). Nothing is replayed.
     g_echo = g_motion_echo.strength();
@@ -1754,14 +2361,23 @@ void play_tick(uint32_t now, bool may_draw) {
     float motion[3];
     for (int k = 0; k < 3; ++k) motion[k] = dyn[k];
 
-    // ---- Dance = music. Nothing to do with motion. ---------------------------------------------
+    // ---- Dance = music, only when you've switched it on (swipe up). ----------------------------
+    // It dances only to a steady tempo the beat tracker has locked onto: a quiet room, talking, a fan
+    // or clicks never lock, so they never kick anything. Before the lock nothing moves.
     bool mic_beat = false;
     g_mic_new = false;
-    if (MIC_DANCE && g_n > 0 && !g_mic_on) {          // start listening once a photo has zones
+    const bool want_mic = MIC_DANCE && g_dance_on && g_n > 0;
+    if (want_mic && !g_mic_on) {
         if (M5.Speaker.isEnabled()) M5.Speaker.end(); // Core2: mic and speaker share one I2S port
         g_mic_on = M5.Mic.isEnabled() || M5.Mic.begin();
         g_mic_busy = false;
-        Serial.printf("jig: microphone %s\n", g_mic_on ? "listening" : "unavailable");
+        g_onset = AudioOnset();                       // learn this room afresh (the beat tracker unlocks by itself)
+        Serial.printf("jig: dance on, microphone %s\n", g_mic_on ? "listening" : "unavailable");
+    } else if (!want_mic && g_mic_on) {
+        for (int k = 0; k < 40 && M5.Mic.isRecording(); ++k) delay(1);   // (let the last chunk finish)
+        M5.Mic.end();
+        g_mic_on = false; g_mic_busy = false;
+        Serial.println("jig: dance off, microphone off");
     }
     if (g_mic_on) {                                   // record-and-poll, one 20 ms chunk at a time
         if (!g_mic_busy) {
@@ -1778,27 +2394,17 @@ void play_tick(uint32_t now, bool may_draw) {
         mic_beat = g_rhythm_mic.update(dt, 0, 0, g_mic_hit * on, 0, 0, 1);
         g_mic_hold -= dt;
     }
-    const bool music = g_mic_on && g_onset.music();
+    const bool music = g_mic_on && g_onset.music() && g_rhythm_mic.steady();
     g_dance = music ? (g_dance + dt < 1.0f ? g_dance + dt : 1.0f) : (g_dance - dt * 0.5f > 0.0f ? g_dance - dt * 0.5f : 0.0f);
     if (music != g_was_music) {
         g_was_music = music;
-        Serial.printf(music ? "jig: music - dancing (level %.0f dB, floor %.0f dB)\n" : "jig: music stopped (level %.0f dB, floor %.0f dB)\n",
-                      g_onset.level_db(), g_onset.floor_db());
+        if (music) Serial.printf("jig: music at %.0f BPM - dancing (level %.0f dB, floor %.0f dB)\n", g_rhythm_mic.bpm(), g_onset.level_db(), g_onset.floor_db());
+        else Serial.printf("jig: no steady beat - not dancing (level %.0f dB, floor %.0f dB)\n", g_onset.level_db(), g_onset.floor_db());
     }
-    // Beat: the locked tempo once the tracker has it; until then, every strong hit in the music.
-    bool beat = false;
-    int sign = g_kick_sign;
-    if (g_dance > 0.0f) {
-        if (g_rhythm_mic.locked()) {
-            if (mic_beat) { beat = true; sign = g_rhythm_mic.beat_sign(); }
-        } else if (g_mic_new && g_mic_hit > 0.08f && now - g_last_kick > 250) {
-            beat = true;
-            sign = g_kick_sign = -g_kick_sign;
-        }
-        if (beat) g_last_kick = now;
-    }
+    const bool beat = music && mic_beat;
+    const int sign = g_rhythm_mic.beat_sign();
 
-    if (g_n == 0 && g_nw == 0 && !g_par.ready) return;   // nothing to animate (water / depth alone still do)
+    if (g_n == 0 && g_nw == 0 && g_nh == 0 && !g_par.ready) return;   // nothing to animate (water / depth / hangs alone still do)
 
     if (beat) {
         float cen = 0;
@@ -1806,7 +2412,11 @@ void play_tick(uint32_t now, bool may_draw) {
         cen /= g_n;
         for (int i = 0; i < g_n; ++i) {
             int side = g_z[i].cx < cen - 3 ? -1 : (g_z[i].cx > cen + 3 ? 1 : 0);
-            if (g_z[i].wmap) dance_kick(g_z[i], g_dance, side, sign);
+            // Dance only adds a small nudge on top of whatever else moves the zone; it changes nothing else.
+            // A zone already swinging far gets no nudge, and while the echo has eased the damping the
+            // nudge is scaled down by as much (so the two can't pump each other up).
+            if (g_z[i].wmap && fabsf(g_z[i].dx) + fabsf(g_z[i].dy) < DANCE_ROOM)
+                dance_kick(g_z[i], DANCE_GAIN * g_dance * g_z[i].damp_k, side, sign);
         }
     }
 
@@ -1870,10 +2480,14 @@ void play_tick(uint32_t now, bool may_draw) {
         if (z.awake || g_shown[i]) any = true;
     }
     if (g_par.ready) { par_tick(now, dt, may_draw, any); return; }   // depth: everything goes through it
+    // Water: rendered into the layer and sent a slice at a time (a big sea can't hold the loop up);
+    // then the hanging things over it, and the zones over it draw on top.
     bool drew_water = false;
-    if (may_draw && g_nw > 0 && now - g_last_water >= WATER_FRAME_MS) {   // water: always moving
+    if (g_wj.phase == 0 && may_draw && g_nw > 0 && g_layer && now - g_last_water >= WATER_FRAME_MS) {
         g_last_water = now;
-        draw_water();
+        g_wj.phase = 1; g_wj.wi = 0; g_wj.y = -1; g_wj.par = false;
+    }
+    if (g_wj.phase && may_draw && water_job()) {
         drew_water = true;
         for (int i = 0; i < g_n; ++i)                  // zones over water draw on top of it
             for (int k = 0; k < g_nw; ++k) {
@@ -1885,6 +2499,22 @@ void play_tick(uint32_t now, bool may_draw) {
                 }
             }
     }
+    if (g_wj.phase) return;                            // (zones wait for the water to finish)
+    if (may_draw && g_nh > 0 && g_nw == 0 && now - g_last_hang >= FRAME_MS) {   // hanging things (no water)
+        int which[HANG_MAX];
+        const int nd = hang_update(false, which);
+        if (nd) {
+            g_last_hang = now;
+            hang_push(which, nd);
+            for (int k = 0; k < nd; ++k)                // zones over them draw on top
+                for (int i = 0; i < g_n; ++i) {
+                    const Hang& h = g_hang[which[k]];
+                    const Zone& z = g_z[i];
+                    if (z.wmap && regions_meet(z.bx, z.by, z.bx + z.bw, z.by + z.bh, h.x0, h.y0, h.x1, h.y1)) { g_shown[i] = true; any = true; }
+                }
+        }
+    }
+    if (over_budget() && !drew_water) return;          // (the zones next tick)
     if (!any || !may_draw) return;
     if (!drew_water && now - g_last_draw < FRAME_MS) return;
     g_last_draw = now;
@@ -1900,21 +2530,38 @@ bool poke(int x, int y) {
             return true;
         }
     }
+    for (int i = 0; i < g_nh; ++i)                     // a tap on hair / cloth / a charm: a flick
+        if (g_hang[i].ready && hang_poke(g_hang[i], (float)x, (float)y)) { g_hang[i].drawn = false; return true; }
     for (int i = 0; i < g_nw; ++i)                     // a tap on water: a ripple
         if (water_contains(g_wat[i], x, y)) { water_poke(g_wat[i], (float)x, (float)y, 160.0f, 2); return true; }
     return false;
 }
 
 int water_count() { return g_nw; }
+bool dance_toggle() {
+    g_dance_on = !g_dance_on;
+    if (!g_dance_on) g_dance = 0.0f;
+    return g_dance_on;
+}
+bool dance_is_on() { return g_dance_on; }
+// Something was drawn over the photo: show it again as it is now (zones in their poses, depth redrawn).
+void refresh() {
+    present();
+    for (int i = 0; i < g_n; ++i) g_shown[i] = true;
+    for (int i = 0; i < g_nh; ++i) g_hang[i].drawn = false;
+    g_last_draw = 0;
+}
 bool animating() {
     if (!g_ok) return false;
     if (g_layer) return true;
     if (g_par.ready && g_par_moving) return true;
     for (int i = 0; i < g_n; ++i) if (g_z[i].awake) return true;
+    for (int i = 0; i < g_nh; ++i) if (g_hang[i].awake) return true;
     return false;
 }
 
 void editor_open() {
+    g_pj.on = false; g_wj.phase = 0;
     if (!g_ok || e_open) return;
     rest_all();
     for (int i = 0; i < g_n; ++i) { e_z[i] = g_z[i]; e_z[i].wmap = e_z[i].gmap = e_z[i].tmap = nullptr; e_z[i].span = nullptr; }
@@ -1929,7 +2576,22 @@ void editor_open() {
     e_pi = e_np ? 0 : -1;
     for (int p = 0; p < PP_COUNT; ++p) e_pprm[p] = g_par.prm[p];
     e_pgrid = g_par.grid; memcpy(e_gq, g_par.gq, sizeof(e_gq));
-    e_wmode = false; e_dmode = false; e_wtool = WT_BRUSH; e_pn = 0;
+    if (!e_pgrid)                                      // (an older file: a water's own grid becomes the ground grid)
+        for (int i = 0; i < g_nw; ++i)
+            if (g_wat[i].grid) {
+                e_pgrid = true; memcpy(e_gq, g_wat[i].gq, sizeof(e_gq));
+                bool planes = false;
+                for (int k = 0; k < g_par.n; ++k) planes |= plane_any(g_par.pl[k]);
+                if (!planes) e_pprm[PP_GROUND] = 0.0f;
+                break;
+            }
+    e_gmode = false;
+    for (int k = 0; k < HANG_MAX; ++k) hang_free(e_h[k]);
+    e_nh = 0;
+    for (int k = 0; k < g_nh; ++k) { hang_copy_def(e_h[e_nh], g_hang[k], water_alloc); ++e_nh; }
+    e_hi = e_nh ? 0 : -1;
+    e_pinned = 0;
+    e_wmode = false; e_dmode = false; e_hmode = false; e_wtool = WT_BRUSH; e_pn = 0;
     e_active = -1;
     e_armed = -1;
     e_btn_ready = false;
@@ -1952,6 +2614,13 @@ void editor_tick(uint32_t now) {
             if (e_wtool == WT_POLY || e_wtool == WT_LINE) {
                 if (M5.BtnA.wasPressed()) e_undo_point();
                 if (M5.BtnC.wasPressed()) e_finish();
+            } else if (e_wtool == WT_GRID) {
+                if (M5.BtnA.wasPressed() || (M5.BtnA.isPressed() && (int32_t)(now - e_rep_a) >= 0)) {
+                    e_grid_turn(-1.0f); e_rep_a = now + (M5.BtnA.wasPressed() ? 380 : 80); e_dirty = true;
+                }
+                if (M5.BtnC.wasPressed() || (M5.BtnC.isPressed() && (int32_t)(now - e_rep_c) >= 0)) {
+                    e_grid_turn(+1.0f); e_rep_c = now + (M5.BtnC.wasPressed() ? 380 : 80); e_dirty = true;
+                }
             } else if (e_wtool == WT_SMART) {
                 if (M5.BtnA.wasPressed()) e_smart_step(-1);
                 if (M5.BtnC.wasPressed()) e_smart_step(+1);
@@ -1980,12 +2649,13 @@ void editor_tick(uint32_t now) {
             t_x0 = t_lx = td.x;
             t_y0 = t_ly = td.y;
             t_t0 = now;
-            t_bar = td.y < bar_bottom();
+            t_bar = in_bars(td.y);
             t_tip = !t_bar && !e_mm() && near_tip(td.x, td.y);
             if (!t_bar && e_mm() && (e_wtool == WT_BRUSH || e_wtool == WT_ERASE)) {
                 e_bx = -1; e_dab(td.x, td.y); e_dirty = true; e_glive = false;
             }
             if (!t_bar && e_mm() && e_wtool == WT_SMART) { e_bx = -1; e_mark(td.x, td.y); e_dirty = true; }
+            if (!t_bar && e_mm() && e_wtool == WT_GRID) e_grid_press(td.x, td.y);
         } else if (!t_bar) {
             if (!t_moved && (abs(td.x - t_x0) > 6 || abs(td.y - t_y0) > 6)) t_moved = true;
             if (e_mm()) {                     // masks: drags paint / erase / mark (shape & line take taps)
@@ -1993,7 +2663,8 @@ void editor_tick(uint32_t now) {
                     e_dab(td.x, td.y); e_dirty = true;
                 }
                 if (e_wtool == WT_SMART && (td.x != t_lx || td.y != t_ly)) { e_mark(td.x, td.y); e_dirty = true; }
-                t_lx = td.x; t_ly = td.y;
+                if (e_wtool == WT_GRID && t_moved && (td.x != t_lx || td.y != t_ly)) { e_grid_drag(td.x - t_lx, td.y - t_ly); e_dirty = true; }
+                if (e_wtool != WT_GRID || t_moved) { t_lx = td.x; t_ly = td.y; }
             } else if (t_moved) {             // first move applies the whole distance since touch-down
                 if (e_active >= 0 && (td.x != t_lx || td.y != t_ly)) {
                     if (t_tip) {

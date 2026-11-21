@@ -180,6 +180,7 @@ class Zone:
     tip_u: float = TIP_U
     tip_w: float = TIP_W
     tune: dict = field(default_factory=dict)       # key → value overrides (see TUNES)
+    name: str = ""                                 # the Studio's layer name
 
     def tuned(self, key, default):
         if key not in self.tune:
@@ -791,31 +792,56 @@ def contact_pass(zs, gaps, h):
 
 
 # ---- playback (port of play_tick's motion handling) ---------------------------------------------
+_SWAY_CACHE = {}
+
+
 class Sim:
     """Drives zones like the Core2 does. Feed screen-space accelerometer readings (g, gravity
     included: the Core2 held upright reads (0, -1, 0)), plus beats and pokes."""
 
-    def __init__(self, zones, image_rgb=None, waters=(), par=None):
+    def __init__(self, zones, image_rgb=None, waters=(), par=None, hangs=()):
         self.zs = [ZoneSim(z) for z in zones]
         self.ws = [WaterSim(w) for w in waters if w is not None]
+        import mg_hang as G
+        self.hs = [G.HangSim(h, image_rgb) for h in hangs if h is not None and h.ok() and image_rgb is not None]
         self.img = image_rgb
         self.depth = None
-        self.view_target = (0.0, 0.0)          # depth: where the Core2's tilt puts the view (−1..1)
+        self.ss = []                            # swaying things (mg_sway): add_sways
+        self.view_target = (0.0, 0.0)          # (old) a target view; the Core2 uses gyro rates (self.gyro)
+        self.gyro = (0.0, 0.0)                 # deg/s: top edge away (+x), right edge away (+y), like the IMU
         if par is not None and par.any() and image_rgb is not None:
             import mg_depth as D
             self.depth = D.DepthPreview(par, image_rgb)
-            self.view = D.View(par)
+            self.view = D.GyroView(par)
             self.v = (0.0, 0.0)
         self.base = None
         self.slow = None
         self.echo = MotionEcho(ECHO_FADE_S)
         self.dn_slow = None
 
+    def add_sways(self, sways, body=None):
+        """Swaying things over the photo (prepared once per mask / guides: their plates take a moment)."""
+        import mg_sway as SW
+        self.ss = []
+        for sw in sways:
+            key = (sw.kind, sw.mask.tobytes(), repr(sw.guides), repr(sorted(sw.prm.items())),
+                   None if body is None else body.tobytes(), self.img.tobytes() if self.img is not None else b"")
+            import hashlib
+            hk = hashlib.sha1(b"".join(k if isinstance(k, bytes) else k.encode() for k in key if k is not None)).hexdigest()
+            proto = _SWAY_CACHE.get(hk)
+            if proto is None:
+                proto = SW.SwaySim(sw, self.img, body)
+                _SWAY_CACHE[hk] = proto
+                while len(_SWAY_CACHE) > 8:
+                    _SWAY_CACHE.pop(next(iter(_SWAY_CACHE)))
+            import copy
+            self.ss.append(copy.deepcopy(proto))
+
     def step(self, dt, accel=(0.0, -1.0, 0.0), dance=0.0, twist=(0.0, 0.0)):
         """Same as the Core2: gravity pinned to the real one, jolts on top. `dance` is unused here
         (dance only adds beat kicks); kept for callers."""
         if self.depth is not None:
-            self.v = self.view.step(dt, self.view_target)
+            self.v = self.view.step(dt, self.gyro)
         a = list(accel)
         if self.base is None:
             self.base = a[:]
@@ -841,6 +867,11 @@ class Sim:
         self.echo.update(dt, dyn, gdev, twist[1])
         for ws in self.ws:                      # water: real gravity + your jolts
             ws.step(dt, dn_live, dyn)
+        for hs in self.hs:                      # hanging things: the same
+            hs.step(dt, dn_live, dyn)
+        sdk = 1.0 - ECHO_DAMP_CUT * self.echo.strength()
+        for ss in self.ss:                      # swaying things: real "down" (screen axes), jolts, the echo
+            ss.step(dt, tuple(dn_live), tuple(dyn), sdk)
         for z in self.zs:                       # swayed and stopped: keeps swaying, dying out slowly
             z.damp_k = 1.0 - ECHO_DAMP_CUT * self.echo.strength()
         dn = dn_live
@@ -885,6 +916,8 @@ class Sim:
                 self.hold[i] = [tx, ty, ts]
 
     def beat(self, amp, sign):
+        for ss in self.ss:
+            ss.kick(amp, sign)
         if not self.zs:
             return
         cen = sum(z.z.cx for z in self.zs) / len(self.zs)
@@ -897,6 +930,12 @@ class Sim:
             if z.z.contains(x, y):
                 z.poke(x, y)
                 return True
+        for hs in self.hs:                      # a tap on hair / cloth / a charm: a flick
+            if hs.poke(x, y):
+                return True
+        for ss in self.ss:
+            if ss.poke(x, y):
+                return True
         for ws in self.ws:                      # a tap on water: a ripple
             if ws.contains(x, y):
                 ws.poke(x, y, 160.0, 2)
@@ -904,23 +943,31 @@ class Sim:
         return False
 
     def awake(self):
-        return any(z.awake for z in self.zs)
+        return any(z.awake for z in self.zs) or any(h.awake for h in self.hs) or any(s.awake for s in self.ss)
 
     def offsets(self):
         OX = np.zeros((IMG_H, IMG_W)); OY = np.zeros((IMG_H, IMG_W))
         for z in self.zs:
             z.add_offsets(OX, OY)
+        for ws in self.ws:                      # a zone never drags water: it's its own layer (firmware)
+            m = getattr(ws.w, "mask", None)
+            if m is not None:
+                OX[m] = 0.0; OY[m] = 0.0
         return OX, OY
 
     def render(self):
         """Frame as uint8 RGB (H, W, 3): water first, zones drawn over it, then depth (like the Core2)."""
         OX, OY = self.offsets()
-        if not self.ws:
+        if not self.ws and not self.hs and not self.ss:
             frame = warp(self.img, OX, OY)
         else:
             layer = self.img.copy()             # the photo with the water drawn in…
             for ws in self.ws:
                 ws.render_into(layer, self.img)
+            for hs in self.hs:                  # …the hanging things over it…
+                hs.render(layer)
+            for ss in self.ss:                  # …hair / cloth / pendants…
+                ss.render(layer)
             frame = warp(layer, OX, OY)         # …and the zones warp that (effects stack)
         if self.depth is not None:
             frame = self.depth.render(frame, self.v)
@@ -990,6 +1037,7 @@ WPARAMS = [
     ("foam", "Painted shore foam", 0.0, 1.0, 0.0, "Paints foam where waves break at the shore line. For flat or stylised art; leave at 0 for photos."),
 ]
 WPARAM_KEYS = [p_[0] for p_ in WPARAMS]
+W_OCEAN_FEEL = 0.15
 W_SLOSH_PX, W_RIP_K, W_AMB_PX, W_RIVER_PX, W_RIVER_T, W_OCEAN_A, W_OCEAN_T = 7.0, 0.035, 0.9, 14.0, 1.6, 4.2, 2.4
 W_OCEAN_SHADE, W_RIP_SHADE = 0.16, 0.0035                # light on swells and ripples (see jiggle_water.h)
 W_SIM_DT = 0.04                                          # surface step: a fixed 25 Hz, drawn blended
@@ -1002,6 +1050,7 @@ class Water:
     lines: list = field(default_factory=list)        # flow / shore curves: [[(x, y), ...], ...]
     mask: object = None                              # (240, 320) bool
     grid: list | None = None                          # perspective grid corners [(x, y)×4]: near-L, near-R, far-R, far-L
+    name: str = ""                                    # the Studio's layer name
 
     def __post_init__(self):
         if self.mask is None and np is not None:
@@ -1013,7 +1062,7 @@ class Water:
 
     def copy(self):
         return Water(self.mode, dict(self.prm), [list(l) for l in self.lines], self.mask.copy(),
-                     None if self.grid is None else [tuple(p) for p in self.grid])
+                     None if self.grid is None else [tuple(p) for p in self.grid], self.name)
 
 
 def mask_brush(mask, cx, cy, r, v=True):
@@ -1168,6 +1217,8 @@ class WaterSim:
         self.ok = True
         self.pax = self.pay = None                  # perspective grid (see water_perspective)
         self.ghz = -1.0
+        self.oworld = False                         # ocean distances on the water's surface (grid)
+        self._w = w
         if w.grid:
             self._perspective(w.grid)
 
@@ -1198,6 +1249,30 @@ class WaterSim:
         self.pax, self.pay = 0.5 * ax * ax, 0.5 * ay * ay
         if abs(Hh) > 1e-9:
             self.ghz = -(G * (IMG_W * 0.5) + I) / Hh
+        if self._w.mode == W_OCEAN and self.od is not None:
+            # swells on the water's own surface: distance across the plane, rolling toward the near edge
+            vshore = -1e9
+            for l in self._w.lines[:WLINE_MAX]:
+                for sx, sy in l[:WPTS_MAX]:
+                    u, v, ww, _ = water_unmap(H, float(sx), float(sy))
+                    if abs(ww) > 1e-9:
+                        vshore = max(vshore, v)
+            vv = np.full((self.gh, self.gw), 1e9); onx = self.onx.copy(); ony = self.ony.copy()
+            for j in range(self.gh):
+                for i in range(self.gw):
+                    sx, sy = self.bx + (i - 1) * WCELL + WCELL * 0.5, self.by + (j - 1) * WCELL + WCELL * 0.5
+                    u, v, ww, _ = water_unmap(H, sx, sy)
+                    if abs(ww) > 1e-9:
+                        vv[j, i] = v
+                        x0, y0 = water_hmap(H, u, v); x1, y1 = water_hmap(H, u, v + 1e-3)
+                        dx, dy = x0 - x1, y0 - y1; l = math.hypot(dx, dy)
+                        if l > 1e-9:
+                            onx[j, i], ony[j, i] = dx / l, dy / l
+            vmin = vv[self.cin].min() if self.cin.any() else 0.0
+            v0 = vshore if vshore > -1e8 else vmin
+            self.od = np.maximum(0.0, (vv - v0) * kref)
+            self.onx, self.ony = onx, ony
+            self.oworld = True
 
     def poke(self, x, y, amt=160.0, r=2):
         if not self.ok:
@@ -1226,19 +1301,19 @@ class WaterSim:
             return
         w = self.w
         dt = min(dt, 0.1); self.t += dt
-        sl = w.get("slosh")
+        sl = w.get("slosh") * (W_OCEAN_FEEL if w.mode == W_OCEAN else 1.0)    # an ocean only just feels them
         tx, ty = sl * W_SLOSH_PX * dn[0], sl * W_SLOSH_PX * (dn[1] - 1.0) * 0.6
         ax, ay = (tx - self.sx) * 10.0 - self.svx * 1.6, (ty - self.sy) * 10.0 - self.svy * 1.6
         kx, ky = ax * dt, ay * dt
         self.svx += kx; self.svy += ky; self.sx += self.svx * dt; self.sy += self.svy * dt
         if abs(kx) + abs(ky) > 1e-4:
-            self.h1 += 9.0 * sl * (kx * self.cnx + ky * self.cny)
+            self.h1 += 9.0 * sl * (np.sqrt(2.0 * self.pax) if self.pax is not None else 1.0) * (kx * self.cnx + ky * self.cny)
         rip = w.get("ripple")
         jm = math.sqrt(sum(v * v for v in jolt))
         if jm > 0.06 and rip > 0:
             for _ in range(int(jm * 6.0 * sl) + 1):
                 px, py = self.bx + self._randf() * self.bw, self.by + self._randf() * self.bh
-                self.poke(px, py, 45.0 * jm * rip, 1)
+                self.poke(px, py, 45.0 * jm * rip * (0.4 if w.mode == W_OCEAN else 1.0), 1)
         if w.get("rain") >= 0.5 and rip > 0:
             self.rain_acc += dt * w.get("rate") * self.area / 1500.0
             while self.rain_acc >= 1.0:
@@ -1312,7 +1387,7 @@ class WaterSim:
         foam = np.zeros_like(X)
         if w.mode == W_OCEAN and self.od is not None:
             d = self._lerp(self.od, CX, CY); nx = self._lerp(self.onx, CX, CY); ny = self._lerp(self.ony, CX, CY)
-            lam = w.get("spacing") * np.maximum(p, 0.3)
+            lam = w.get("spacing") * (1.0 if self.oworld else np.maximum(p, 0.3))
             T = W_OCEAN_T / w.get("speed")
             ph = 2 * math.pi * (d / lam + t / T)
             env = 1.0 + w.get("sets") * 0.6 * math.sin(2 * math.pi * self.set_ph)
@@ -1386,6 +1461,8 @@ def parse_jig_all(text: str):
             w = Water(mode=[m_[0] for m_ in WMODES].index(tok[1]) if len(tok) > 1 and tok[1] in [m_[0] for m_ in WMODES] else W_STILL)
             for t in tok[2:]:
                 k, _, v = t.partition("=")
+                if k == "name":
+                    w.name = v.replace("_", " ")[:15]
                 if k in WPARAM_KEYS:
                     try:
                         fv = float(v)
@@ -1435,6 +1512,8 @@ def parse_jig_all(text: str):
                 z.material = mats.index(t)
             elif "=" in t:
                 k, _, v = t.partition("=")
+                if k == "name":
+                    z.name = v.replace("_", " ")[:15]
                 if k in TUNE_KEYS:
                     try:
                         _, _, lo, hi, _ = TUNES[TUNE_KEYS.index(k)]
@@ -1462,7 +1541,13 @@ def parse_parallax(text: str):
     return D.parse_lines([l.strip() for l in text.splitlines()[1:]])
 
 
-def format_jig(zones: list[Zone], waters=(), par=None) -> str:
+def parse_hangs(text: str):
+    """The hanging things in a .jig (hair, cloth, charms)."""
+    import mg_hang as G
+    return G.parse_lines([l.strip() for l in text.splitlines()[1:]])
+
+
+def format_jig(zones: list[Zone], waters=(), par=None, hangs=()) -> str:
     """Zones first (older firmware reads those and skips the rest), then each water region, then depth."""
     out = [JIG_MAGIC]
     for z in zones[:MAX_ZONES]:
@@ -1472,6 +1557,8 @@ def format_jig(zones: list[Zone], waters=(), par=None) -> str:
         for k in TUNE_KEYS:
             if k in z.tune:
                 line += f" {k}={z.tuned(k, 0.0):.3g}"
+        if z.name:
+            line += " name=" + z.name.replace(" ", "_")[:15]
         out.append(line)
     for w in list(waters)[:WATER_MAX]:
         if w is None or w.mask is None or not w.mask.any():
@@ -1480,6 +1567,8 @@ def format_jig(zones: list[Zone], waters=(), par=None) -> str:
         for k in WPARAM_KEYS:
             if k in w.prm:
                 line += f" {k}={w.get(k):.3g}"
+        if w.name:
+            line += " name=" + w.name.replace(" ", "_")[:15]
         out.append(line)
         for l in w.lines[:WLINE_MAX]:
             if l:
@@ -1496,7 +1585,19 @@ def format_jig(zones: list[Zone], waters=(), par=None) -> str:
     if par is not None:
         import mg_depth as D
         out += D.format_lines(par)
+    if hangs:
+        import mg_hang as G
+        out += G.format_lines([default_pin(h) for h in hangs])
     return "\n".join(out) + "\n"
+
+
+def default_pin(h):
+    """No Pin set: it hangs from the middle of its top row (as the Core2 does)."""
+    if h is not None and h.a[0] < 0 and h.mask is not None and h.mask.any():
+        ys, xs = np.nonzero(h.mask)
+        y = int(ys.min()); row = np.flatnonzero(h.mask[y])
+        h.a, h.b = (float(row.min()), float(y)), (float(row.max()), float(y))
+    return h
 
 
 # ---- body-part presets (Jiggle tab) ---------------------------------------------------------------
@@ -1546,7 +1647,9 @@ class Editor:
     water_sel: int = -1
     par: object = None                               # depth planes (mg_depth.Parallax)
     plane_sel: int = -1
-    target: str = "water"                            # which mask the tools edit: "water" or "depth"
+    hangs: list = field(default_factory=list)        # hanging things (mg_hang.Hang)
+    hang_sel: int = -1
+    target: str = "water"                            # which mask the tools edit: "water", "depth" or "hang"
     selected: int = -1
     armed: int = -1                 # shape waiting to be placed by a click
     mg_path: Path | None = None
@@ -1566,6 +1669,8 @@ class Editor:
         self.zones, self.waters = parse_jig_all(txt) if txt else ([], [])
         import mg_depth as D
         self.par = parse_parallax(txt) if txt else D.Parallax()
+        self.hangs = parse_hangs(txt) if txt else []
+        self.hang_sel = 0 if self.hangs else -1
         self.selected, self.armed, self.dirty = -1, -1, False
         self.water_sel = 0 if self.waters else -1
         self.plane_sel = 0 if self.par.planes else -1
@@ -1577,8 +1682,9 @@ class Editor:
         jp = jig_path_for(self.mg_path)
         has_water = any(w.mask is not None and w.mask.any() for w in self.waters)
         has_depth = self.par is not None and self.par.any()
-        if self.zones or has_water or has_depth:
-            jp.write_text(format_jig(self.zones, self.waters, self.par), encoding="utf-8", newline="\n")
+        has_hang = any(h.ok() for h in self.hangs)
+        if self.zones or has_water or has_depth or has_hang:
+            jp.write_text(format_jig(self.zones, self.waters, self.par, self.hangs), encoding="utf-8", newline="\n")
         elif jp.exists():
             jp.unlink()
         self.dirty = False
@@ -1762,11 +1868,44 @@ class Editor:
 
     def snapshot(self):
         return ([replace(z, tune=dict(z.tune)) for z in self.zones], [w.copy() for w in self.waters], self.water_sel,
-                None if self.par is None else self.par.copy(), self.plane_sel)
+                None if self.par is None else self.par.copy(), self.plane_sel, [h.copy() for h in self.hangs], self.hang_sel)
 
     def restore(self, snap):
-        zones, waters, ws, par, ps = snap
+        zones, waters, ws, par, ps, hs, hsel = snap
         self.zones, self.waters, self.water_sel, self.par, self.plane_sel = zones, waters, ws, par, ps
+        self.hangs, self.hang_sel = hs, hsel
+
+    # hanging things
+    @property
+    def hang(self):
+        return self.hangs[self.hang_sel] if 0 <= self.hang_sel < len(self.hangs) else None
+
+    def add_hang(self, kind="hair"):
+        import mg_hang as G
+        if len(self.hangs) >= G.HANG_MAX:
+            return False
+        self.hangs.append(G.Hang(kind, (-1.0, -1.0), (-1.0, -1.0), np.zeros((IMG_H, IMG_W), bool), {}))
+        self.hang_sel = len(self.hangs) - 1
+        self._changed()
+        return True
+
+    def delete_hang(self):
+        if self.hang is None:
+            return
+        del self.hangs[self.hang_sel]
+        self.hang_sel = min(self.hang_sel, len(self.hangs) - 1)
+        self._changed()
+
+    def pin(self, x, y, second=False):
+        """Where the current hanging thing hangs from: A (and B = A), then B for a line."""
+        h = self.hang
+        if h is None:
+            return
+        if second:
+            h.b = (float(x), float(y))
+        else:
+            h.a = h.b = (float(x), float(y))
+        self._changed()
 
     # depth planes
     @property
@@ -1833,6 +1972,9 @@ class Editor:
         if self.target == "depth":
             p = self.plane
             return None if p is None else p.mask
+        if self.target == "hang":
+            h = self.hang
+            return None if h is None else h.mask
         w = self.water
         return None if w is None else w.mask
 
@@ -1849,7 +1991,7 @@ class Editor:
         if m is None or self.image is None or not np.asarray(marks).any():
             return 0, None
         import mg_select as S
-        trim = (1 if trim else 0) if self.target != "depth" else -1   # water keeps off the bank; planes take their rim
+        trim = (1 if trim else 0) if self.target not in ("depth", "hang") else -1   # water keeps off the bank; planes / hangs take their rim
         self._smart = {"marks": np.asarray(marks, bool).copy(), "before": m.copy(), "add": add, "step": step, "trim": trim}
         return self._smart_run()
 
@@ -1858,7 +2000,7 @@ class Editor:
         st, m = self._smart, self._cur_mask()
         m[:] = st["before"]
         g = S.grow(self.image, st["marks"], st["step"])
-        n = S.apply(m, g.sel, st["add"], st["trim"])
+        n = S.apply(m, g.sel, st["add"], st["trim"], seeds=st["marks"])
         st["grown"] = g
         self._changed()
         return n, g
@@ -1892,7 +2034,7 @@ class Editor:
         if m is None or self.image is None:
             return 0
         import mg_select as S
-        n = S.apply(m, S.snap(self.image, np.asarray(rough, bool)), True, -1 if self.target == "depth" else (1 if trim else 0))
+        n = S.apply(m, S.snap(self.image, np.asarray(rough, bool)), True, -1 if self.target in ("depth", "hang") else (1 if trim else 0))
         self._changed()
         return n
 
@@ -1905,7 +2047,7 @@ class Editor:
         fitted = S.snap(self.image, m.copy())
         before = m.copy()
         m[:] = False
-        S.apply(m, fitted, True, -1 if self.target == "depth" else (1 if trim else 0))
+        S.apply(m, fitted, True, -1 if self.target in ("depth", "hang") else (1 if trim else 0))
         self._changed()
         return int((before ^ m).sum())
 
@@ -1934,8 +2076,20 @@ class Editor:
 
 
 # ---- motion presets for the preview -------------------------------------------------------------
-MOTIONS = [("shake", "Shake"), ("bounce", "Hop"), ("walk", "Walk"), ("run", "Run"), ("jolt", "Push"),
-           ("sway", "Sway"), ("spin", "Spin"), ("bumps", "Car bumps"), ("jump", "Big jump")]
+MOTIONS = [("tiltlr", "Tilt L/R"), ("sweep", "Sweep"), ("shake", "Shake"), ("bounce", "Hop"), ("walk", "Walk"),
+           ("run", "Run"), ("jolt", "Push"), ("sway", "Sway"), ("spin", "Spin"), ("bumps", "Car bumps"), ("jump", "Big jump")]
+
+
+def motion_gyro(kind: str, t: float):
+    """(about the screen's horizontal axis: top edge away +, about its vertical axis: right edge away +),
+    deg/s, for the motions that turn the Core2 (what drives the depth view on the device)."""
+    if kind == "tiltlr" and t < 4.0:                 # turn the right edge away and back, twice (±15°)
+        w = 2 * math.pi * 0.5
+        return 0.0, 15.0 * w * math.degrees(1) * math.radians(1) * math.cos(w * t) * min(1.0, t / 0.3)
+    if kind == "sweep" and t < 6.0:                  # a slow look around: ±22° side to side, ±8° up and down
+        w1, w2 = 2 * math.pi / 3.0, 2 * math.pi / 4.5
+        return 8.0 * w2 * math.cos(w2 * t), 22.0 * w1 * math.cos(w1 * t)
+    return 0.0, 0.0
 
 
 def motion_twist(kind: str, t: float):

@@ -197,6 +197,7 @@ struct Zone {
     float   cx = IMG_W / 2, cy = IMG_H / 2, r = R_DEFAULT;
     int16_t rot = 0;
     bool    tip = false;                     // control point on/off (any shape)
+    char    name[16] = {0};                  // the Studio's layer name (kept through a Core2 save)
     float   tip_u = TIP_U, tip_w = TIP_W;    // its position, local units (see shape_tip_default)
     float   tune[TUNE_COUNT] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN,
                                 NAN, NAN, NAN, NAN, NAN};

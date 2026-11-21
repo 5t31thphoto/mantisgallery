@@ -217,6 +217,7 @@ class JiggleTab(tk.Frame):
 
         self._build_water_panel(p)
         self._build_depth_panel(p)
+        self._build_hang_panel(p)
 
         f = self._section(p, "Response  (after a quick sideways shove)")
         self.resp = tk.Canvas(f, width=340, height=110, bg="#111", highlightthickness=0)
@@ -256,7 +257,7 @@ class JiggleTab(tk.Frame):
         self._btn(r, "Clear mask", lambda: self._edit(self._clear_mask), padx=5).pack(side="left")
         self.v_grid = tk.BooleanVar(value=False)
         tk.Checkbutton(f, text="Perspective grid: fit its squares to the water surface (Grid tool: drag the corners;\n"
-                               "drag inside to move it). Far ripples then travel slower, smaller and foreshortened.",
+                               "drag inside to move it; the wheel turns it). Far ripples then travel slower, smaller, foreshortened.",
                        variable=self.v_grid, bg=PANEL, fg=FG, selectcolor="#333", activebackground=PANEL, justify="left",
                        command=self._grid_toggled).pack(anchor="w")
         self.v_rain = tk.BooleanVar(value=False)
@@ -328,7 +329,7 @@ class JiggleTab(tk.Frame):
         r = tk.Frame(f, bg=PANEL); r.pack(fill="x", pady=2)
         tk.Label(r, text="Tool", fg=MUTED, bg=PANEL, width=10, anchor="w").pack(side="left")
         self.v_pgrid = tk.BooleanVar(value=False)
-        tk.Checkbutton(f, text="Ground grid: fit its squares flat on the ground (Grid tool: drag corners / drag inside).\n"
+        tk.Checkbutton(f, text="Ground grid: fit its squares flat on the ground (Grid tool: drag corners / inside; wheel turns).\n"
                                "It sets the horizon and how fast things recede; every depth comes from it.",
                        variable=self.v_pgrid, bg=PANEL, fg=FG, selectcolor="#333", activebackground=PANEL, justify="left",
                        command=self._pgrid_toggled).pack(anchor="w")
@@ -365,6 +366,86 @@ class JiggleTab(tk.Frame):
                          "Depth map…: a grayscale depth image (e.g. Depth Anything from ComfyUI) → planes.",
                  fg=MUTED, bg=PANEL, anchor="w", justify="left").pack(fill="x")
         self._pad_target = (0.0, 0.0)
+
+    # ----------------------------------------------------------------------------------- hang panel
+    def _build_hang_panel(self, p):
+        import mg_hang as G
+        f = self._section(p, "Hanging  (hair, cloth, charms: they swing as you tilt)")
+        r = tk.Frame(f, bg=PANEL); r.pack(fill="x")
+        self._btn(r, "+ Hang", lambda: self._edit(lambda: (self.ed.add_hang(), self._use_hang())), padx=5).pack(side="left")
+        self.v_hsel = tk.StringVar(value="")
+        self.hsel_cb = ttk.Combobox(r, textvariable=self.v_hsel, values=[], width=14, state="readonly")
+        self.hsel_cb.pack(side="left", padx=4)
+        self.hsel_cb.bind("<<ComboboxSelected>>", lambda e: self._pick_hang())
+        self._btn(r, "Delete", lambda: self._edit(self.ed.delete_hang), padx=5).pack(side="left")
+        r = tk.Frame(f, bg=PANEL); r.pack(fill="x", pady=2)
+        tk.Label(r, text="Kind", fg=MUTED, bg=PANEL, width=10, anchor="w").pack(side="left")
+        self.v_hkind = tk.StringVar(value="hair")
+        for key in G.KINDS:
+            tk.Radiobutton(r, text=G.KIND_LABEL[key], variable=self.v_hkind, value=key, bg=PANEL, fg=FG, selectcolor="#333",
+                           activebackground=PANEL, indicatoron=False, padx=6,
+                           command=lambda: self._edit(lambda: self._set_hang("kind", self.v_hkind.get()))).pack(side="left", padx=1)
+        r = tk.Frame(f, bg=PANEL); r.pack(fill="x", pady=2)
+        tk.Label(r, text="Tool", fg=MUTED, bg=PANEL, width=10, anchor="w").pack(side="left")
+        for key, label in (("off", "Off"), ("smart", "Smart"), ("paint", "Paint"), ("erase", "Erase"), ("shape", "Shape"), ("pin", "Pin")):
+            tk.Radiobutton(r, text=label, variable=self.wtool, value=key, bg=PANEL, fg=FG, selectcolor="#333", activebackground=PANEL,
+                           indicatoron=False, padx=6, command=lambda: (self._use_hang(), self._wtool_changed())).pack(side="left", padx=1)
+        self.hrows = {}
+        for key, label, lo, hi, d in G.HPARAMS:
+            self.hrows[key] = self._slider(f, label.split(" (")[0], lo, hi, 0.05, lambda v, k=key: self._set_hang(k, v))
+        self.hang_lbl = tk.Label(f, text="", fg=YEL, bg=PANEL, anchor="w", justify="left", wraplength=340)
+        self.hang_lbl.pack(fill="x")
+        tk.Label(f, text="Select it (Smart: click it; Shape: click around it, Enter), then Pin: click where it\n"
+                         "hangs from - once for a point (an earring's hook), twice for a line (a ponytail's\n"
+                         "tie, a waistband). No pin: it hangs from its top. Preview, then tilt or click it.",
+                 fg=MUTED, bg=PANEL, anchor="w", justify="left").pack(fill="x")
+        self._pin_next = 0
+
+    def _use_hang(self):
+        self.ed.target = "hang"
+        if self.ed.hang is None and self.ed.image is not None:
+            self.ed.add_hang(self.v_hkind.get() if hasattr(self, "v_hkind") else "hair")
+
+    def _pick_hang(self):
+        vals = list(self.hsel_cb.cget("values"))
+        if self.v_hsel.get() in vals:
+            self.ed.hang_sel = vals.index(self.v_hsel.get())
+            self.ed.target = "hang"
+            self._pin_next = 0
+            self._sync_panel(); self._render()
+
+    def _set_hang(self, what, v):
+        h = self.ed.hang
+        if h is None or self._syncing:
+            return
+        if what == "kind":
+            h.kind = v
+        else:
+            import mg_hang as G
+            if abs(float(v) - G.HDEF[what]) < 1e-6:
+                h.prm.pop(what, None)
+            else:
+                h.prm[what] = float(v)
+        self.ed.dirty = True
+        self._sync_hang()
+
+    def _sync_hang(self):
+        hs = self.ed.hangs
+        names = [f"{i + 1}: {h.kind}" for i, h in enumerate(hs)]
+        self.hsel_cb.configure(values=names)
+        h = self.ed.hang
+        if h is None:
+            self.v_hsel.set("")
+            self.hang_lbl.configure(text="Nothing hanging yet: + Hang, then select it.")
+            return
+        self.v_hsel.set(names[self.ed.hang_sel])
+        self.v_hkind.set(h.kind)
+        for key, var in self.hrows.items():
+            var.set(h.get(key))
+        pin = "no pin: hangs from its top" if h.a[0] < 0 else (
+            f"pinned at {int(h.a[0])},{int(h.a[1])}" if h.a == h.b else f"pinned {int(h.a[0])},{int(h.a[1])} – {int(h.b[0])},{int(h.b[1])}")
+        tgt = "editing this" if self.ed.target == "hang" else "tools are elsewhere"
+        self.hang_lbl.configure(text=f"{int(h.mask.sum())} px · {pin} · {tgt}")
 
     def _pparam_row(self, parent, key, label, lo, hi, help_):
         r = tk.Frame(parent, bg=PANEL); r.pack(fill="x")
@@ -606,6 +687,15 @@ class JiggleTab(tk.Frame):
 
     def _water_press(self, x, y):
         tool = self.wtool.get()
+        if tool == "pin":
+            self._use_hang()
+            self._push_undo()
+            self.ed.pin(x, y, second=self._pin_next == 1)
+            self._pin_next = 1 - self._pin_next
+            self.status.set("Pinned at a point - click again for a line (a tie, a waistband)." if self._pin_next
+                            else "Pinned along a line. Click again to start over.")
+            self._sync_panel(); self._render()
+            return
         if tool == "grid":
             w = self._grid_obj()
             if w is None or not w.grid:
@@ -994,9 +1084,19 @@ class JiggleTab(tk.Frame):
         self._after_edit()
 
     def _on_wheel(self, e, direction=None):
+        d = direction if direction is not None else (1 if getattr(e, "delta", 0) > 0 else -1)
+        if self.wtool.get() == "grid" and not self.preview.get():   # Grid tool: the wheel turns it (levels the horizon)
+            w = self._grid_obj()
+            if w is not None and w.grid:
+                cx = sum(p[0] for p in w.grid) / 4; cy = sum(p[1] for p in w.grid) / 4
+                c, s = math.cos(math.radians(d)), math.sin(math.radians(d))
+                self._push_undo()
+                w.grid = [(cx + (x - cx) * c - (y - cy) * s, cy + (x - cx) * s + (y - cy) * c) for x, y in w.grid]
+                self.ed.dirty = True
+                self._after_edit()
+            return
         if not self.ed.zone or self.preview.get():
             return
-        d = direction if direction is not None else (1 if getattr(e, "delta", 0) > 0 else -1)
         if getattr(e, "state", 0) & 0x0001:            # Shift: rotate
             self._edit(lambda: self.ed.rotate(5 * d), coalesce=True)
         else:
@@ -1060,6 +1160,7 @@ class JiggleTab(tk.Frame):
             self._refresh_list()
             self._sync_water()
             self._sync_depth()
+            self._sync_hang()
             z = self.ed.zone
             if z:
                 self.v_shape.set(J.SHAPES[z.shape][1])
@@ -1122,7 +1223,7 @@ class JiggleTab(tk.Frame):
         if J.np is None or self.ed.image is None:
             self.sim = None
             return
-        self.sim = J.Sim(self.ed.zones, self.ed.image, self.ed.waters, self.ed.par)
+        self.sim = J.Sim(self.ed.zones, self.ed.image, self.ed.waters, self.ed.par, [J.default_pin(h.copy()) for h in self.ed.hangs])
         if not keep_motion:
             self._motion = None
 
@@ -1215,6 +1316,13 @@ class JiggleTab(tk.Frame):
                     continue
                 a = 0.45 if i == self.ed.plane_sel else 0.2
                 img[p.mask] = (img[p.mask] * (1 - a) + J.np.array(cols[i % 4]) * a).astype(J.np.uint8)
+        if not self.preview.get() and self.ed.hangs and J.np is not None and self.ed.target == "hang" and self.wtool.get() != "off":
+            img = img.copy()
+            for i, h in enumerate(self.ed.hangs):
+                if h.mask is None:
+                    continue
+                a = 0.45 if i == self.ed.hang_sel else 0.2
+                img[h.mask] = (img[h.mask] * (1 - a) + J.np.array([255, 165, 0]) * a).astype(J.np.uint8)
         if self._marks is not None:
             img = img.copy(); img[self._marks] = (255, 230, 0)
         return img
@@ -1265,6 +1373,22 @@ class JiggleTab(tk.Frame):
         P = self.ed.par
         if self.ed.target == "depth" and P is not None and P.grid:
             self._draw_grid(P, True)
+        h = self.ed.hang
+        if self.ed.target == "hang" and h is not None and h.a[0] >= 0 and not self.preview.get():   # the pin
+            z = self.zoom
+            (ax, ay), (bx, by) = h.a, h.b
+            c.create_line(ax * z, ay * z, bx * z, by * z, fill="#000", width=4, tags="ov")
+            c.create_line(ax * z, ay * z, bx * z, by * z, fill=YEL, width=2, tags="ov")
+            for px_, py_ in (h.a, h.b):
+                c.create_oval(px_ * z - 4, py_ * z - 4, px_ * z + 4, py_ * z + 4, fill=YEL, outline="#000", tags="ov")
+            if h.mask is not None and h.mask.any():
+                import mg_hang as G
+                ys, xs = J.np.nonzero(h.mask)
+                rx, ry = (ax + bx) / 2, (ay + by) / 2
+                dx, dy = G.hang_dir(xs, ys, ax, ay, bx, by)
+                l = math.hypot(dx, dy)
+                if l >= 4:
+                    c.create_line(rx * z, ry * z, (rx + dx / l * 18) * z, (ry + dy / l * 18) * z, fill=YEL, width=2, arrow="last", tags="ov")
         for i, w in enumerate(self.ed.waters):
             if w.grid and self.ed.target == "water":
                 self._draw_grid(w, i == self.ed.water_sel)

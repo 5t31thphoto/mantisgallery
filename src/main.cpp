@@ -579,6 +579,20 @@ static bool     slideshow     = false;
 static uint32_t slide_due_ms  = 0;
 static uint32_t slide_span_ms = 0;
 
+// A short note over the photo (dance on / off), then the photo is redrawn.
+static uint32_t toast_until = 0;
+static void show_toast(const char* text) {
+    const int w = 150, h = 30, x = (SCREEN_W - w) / 2, y = 12;
+    M5.Display.fillRoundRect(x, y, w, h, 8, COL_BG);
+    M5.Display.drawRoundRect(x, y, w, h, 8, COL_TEAL);
+    M5.Display.setFont(&fonts::Font2);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(COL_TEXT);
+    M5.Display.drawString(text, SCREEN_W / 2, y + h / 2);
+    toast_until = millis() + 1200;
+    if (!toast_until) toast_until = 1;
+}
+
 static bool     btn_b_holding = false;
 static uint32_t btn_b_t0      = 0;
 static float    btn_b_last_t  = -1;
@@ -588,6 +602,7 @@ static int16_t  touch_x0 = 0, touch_y0 = 0;
 static int16_t  touch_x1 = 0, touch_y1 = 0;
 static uint32_t touch_t0    = 0;
 static bool     touch_moved = false;
+static bool     touch_wait_up = false;   // a finger still down from the editor: not a viewer press
 
 static int      tap_count  = 0;
 static uint32_t tap_last_ms = 0;
@@ -645,6 +660,8 @@ void loop() {
     if (was_editing) {
         was_editing = false;
         touch_down = false;
+        touch_wait_up = true;                // (closing with B while a finger is on the screen)
+        tap_count = 0;
         btn_b_holding = false;
         if (slideshow) {
             slide_span_ms = random_slide_ms();
@@ -698,7 +715,8 @@ void loop() {
     }
 
     auto td = M5.Touch.getDetail();
-    if (td.isPressed() && td.x >= 0) {
+    if (touch_wait_up && !td.isPressed()) touch_wait_up = false;
+    if (td.isPressed() && td.x >= 0 && !touch_wait_up) {     // (ignored until it lifts)
         if (!touch_down) {
             touch_down = true;
             touch_x0 = touch_x1 = td.x;
@@ -714,9 +732,13 @@ void loop() {
     } else if (touch_down) {
         touch_down = false;
         int16_t dx = touch_x1 - touch_x0;
+        int16_t dy = touch_y1 - touch_y0;
         uint32_t held = now - touch_t0;
 
-        if (!touch_moved && held >= TOUCH_LONG_MS) {
+        if (abs(dy) >= SWIPE_MIN_PX && abs(dy) > abs(dx)) {
+            // vertical swipe: up switches dancing to music on / off (down: not used yet)
+            if (dy < 0) show_toast(jig::dance_toggle() ? "Dance: on" : "Dance: off");
+        } else if (!touch_moved && held >= TOUCH_LONG_MS) {
             slideshow = !slideshow;
             if (slideshow) {
                 slide_span_ms = random_slide_ms();
@@ -758,6 +780,10 @@ void loop() {
         slide_due_ms = millis() + slide_span_ms;
     }
 
-    jig::play_tick(millis(), !btn_b_holding);
+    if (toast_until && (int32_t)(millis() - toast_until) >= 0) {   // the note's time is up: the photo again
+        toast_until = 0;
+        jig::refresh();
+    }
+    jig::play_tick(millis(), !btn_b_holding && !toast_until);
     delay(jig::animating() ? 1 : 6);   // don't sleep frames away while something is moving
 }

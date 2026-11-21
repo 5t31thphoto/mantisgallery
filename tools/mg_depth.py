@@ -33,7 +33,9 @@ PPARAMS = [("amount", "Depth (px the nearest ground slides)", 0.0, 24.0, 6.0,
            ("vert", "Up/down share", 0.0, 1.5, 1.0,
             "How much tipping forward / back moves things compared with left / right."),
            ("invert", "Reverse direction", 0.0, 1.0, 0.0,
-            "Flip which way the planes slide.")]
+            "Flip which way the planes slide."),
+           ("ground", "Ground slides with the tilt", 0.0, 1.0, 1.0,
+            "With a ground grid: the ground itself slides (near rows most). Off: it stays put and only the figures move.")]
 PKEYS = [p[0] for p in PPARAMS]
 PDEF = {p[0]: p[4] for p in PPARAMS}
 
@@ -43,9 +45,11 @@ class Plane:
     depth: float = 0.5                      # 0 = background depth, 1 = nearest
     mask: object = None                     # (H, W) bool
     ramp: tuple | None = None               # (ax, ay, bx, by, depth_b): depth runs from `depth` at A to depth_b at B
+    feet: tuple | None = None               # (x, y): where it meets the ground (the feet line); else its lowest row
+    name: str = ""                          # the Studio's layer name
 
     def copy(self):
-        return Plane(self.depth, None if self.mask is None else self.mask.copy(), self.ramp)
+        return Plane(self.depth, None if self.mask is None else self.mask.copy(), self.ramp, self.feet, self.name)
 
     def depth_at(self, X, Y):
         if not self.ramp:
@@ -81,6 +85,9 @@ class Parallax:
     def any(self):
         return bool(self.grid) or any(p.mask is not None and p.mask.any() for p in self.planes)
 
+    def ground_moves(self):
+        return bool(self.grid) and self.get("ground") >= 0.5
+
     def ground(self):
         """(c0, cx, cy): the ground's depth = clamp(c0 + cx·x + cy·y, 0, 1) — 1 at the nearest ground the
         frame shows, 0 on the horizon (inverse depth of a flat ground is linear on screen). None if no grid."""
@@ -104,8 +111,11 @@ class Parallax:
         for p in self.planes:
             if p.mask is None or not p.mask.any():
                 continue
-            ys, xs = np.nonzero(p.mask)
-            yb = int(ys.max()); xb = xs[ys == yb].mean()
+            if p.feet is not None:
+                xb, yb = p.feet
+            else:
+                ys, xs = np.nonzero(p.mask)
+                yb = int(ys.max()); xb = xs[ys == yb].mean()
             p.depth = float(min(1.0, max(0.0, c0 + cx * xb + cy * yb)))
             p.ramp = None
 
@@ -140,6 +150,11 @@ def parse_lines(lines):
                     elif k == "ramp":
                         a = v.split(",")
                         p.ramp = (int(a[0]), int(a[1]), int(a[2]), int(a[3]), min(1.0, max(0.0, float(a[4]))))
+                    elif k == "feet":
+                        a = v.split(",")
+                        p.feet = (int(a[0]), int(a[1]))
+                    elif k == "name":
+                        p.name = v.replace("_", " ")[:15]
                 except (ValueError, IndexError):
                     pass
             P.planes.append(p)
@@ -184,6 +199,10 @@ def format_lines(P):
         if p.ramp:
             ax, ay, bx, by, db = p.ramp
             line += f" ramp={int(ax)},{int(ay)},{int(bx)},{int(by)},{db:.3g}"
+        if p.feet is not None:
+            line += f" feet={int(p.feet[0])},{int(p.feet[1])}"
+        if p.name:
+            line += " name=" + p.name.replace(" ", "_")[:15]
         out.append(line)
         for y in range(H):
             row = p.mask[y]
@@ -248,6 +267,14 @@ def _nearest(seed, iters):
     return ny, nx, d
 
 
+def soften(cov):
+    """cov as alpha: the outer pixel half on an edge row, most on a corner-only touch (the frame isn't an edge)"""
+    c = np.pad(cov, 1, mode="edge")
+    edge = ~(c[:-2, 1:-1] & c[2:, 1:-1] & c[1:-1, :-2] & c[1:-1, 2:])
+    corner = ~(c[:-2, :-2] & c[:-2, 2:] & c[2:, :-2] & c[2:, 2:])
+    return np.where(cov, np.where(edge, 128 / 255, np.where(corner, 200 / 255, 1.0)), 0.0).astype(np.float32)
+
+
 class DepthPreview:
     """Prepared once per edit; render(content, view) per frame."""
 
@@ -259,7 +286,7 @@ class DepthPreview:
         self.photo = np.asarray(photo, np.float32)
         Y, X = np.mgrid[:H, :W].astype(np.float32)
         P.card_depths()
-        self.gr = P.ground()
+        self.gr = P.ground() if P.ground_moves() else None
         self.planes = [p for p in P.planes if p.mask is not None and p.mask.any()]
         self.ok = True
         dep = np.full((H, W), -1.0, np.float32)
@@ -300,6 +327,7 @@ class DepthPreview:
             nearer = (owner > 0) & (owner != k + 1) & (np.array([-1.0] + dhi)[owner] >= dhi[k])
             cov[k] |= p.mask & nearer
         self.cov = [c.astype(np.float32) for c in cov]
+        self.soft = [soften(c) for c in cov]
         self.order = sorted(range(len(self.planes)), key=lambda k: -dhi[k])
         self.X, self.Y = X, Y
         self.zoom = 1.0 + 2.0 * (self.margin - 3 + 1) / W if self.gr else 1.0
@@ -319,6 +347,12 @@ class DepthPreview:
         a00 = sl(img, ix, iy); a10 = sl(img, ix + 1, iy); a01 = sl(img, ix, iy + 1); a11 = sl(img, ix + 1, iy + 1)
         # sampling at x − sx = (x − ix) − fx: between x − ix − 1 (weight fx) and x − ix (1 − fx)
         return (a00 * (1 - fx) + a10 * fx) * (1 - fy) + (a01 * (1 - fx) + a11 * fx) * fy
+
+    def _alpha(self, k, kx, ky):
+        """the plane's silhouette, its edge feather showing as far as it has slid (as the Core2)"""
+        fade = min(1.0, self.planes[k].dhi() * max(abs(kx), abs(ky)))
+        s = self.soft[k]
+        return np.where(s > 0, 1.0 - (1.0 - s) * fade, 0.0).astype(np.float32)
 
     def render(self, content, view):
         """content: (H, W, 3) uint8 (the photo with water / zones drawn in). view: (vx, vy) in −1..1."""
@@ -342,7 +376,7 @@ class DepthPreview:
                     a = a if a.ndim == 3 else a[..., None]
                     return (a[iy, ix] * (1 - fx) + a[iy, ix + 1] * fx) * (1 - fy) + (a[iy + 1, ix] * (1 - fx) + a[iy + 1, ix + 1] * fx) * fy
                 c = g(src)
-                a = np.ones((H, W), np.float32) if lid == 0 else g(self.cov[lid - 1])[..., 0]
+                a = np.ones((H, W), np.float32) if lid == 0 else g(self._alpha(lid - 1, kx, ky))[..., 0]
                 wgt = a * rem
                 out += c * wgt[..., None]
                 rem -= wgt
@@ -360,10 +394,10 @@ class DepthPreview:
                         t = a[iy, ix] * (1 - fx[..., None]) + a[iy, ix + 1] * fx[..., None]
                         b = a[iy + 1, ix] * (1 - fx[..., None]) + a[iy + 1, ix + 1] * fx[..., None]
                         return t * (1 - fy[..., None]) + b * fy[..., None]
-                    c, a = g(src), g(self.cov[lid - 1])[..., 0]
+                    c, a = g(src), g(self._alpha(lid - 1, kx, ky))[..., 0]
                 else:
                     sx, sy = (p.depth - f) * kx, (p.depth - f) * ky
-                    c, a = self._shift(src, sx, sy), self._shift(self.cov[lid - 1], sx, sy)
+                    c, a = self._shift(src, sx, sy), self._shift(self._alpha(lid - 1, kx, ky), sx, sy)
             else:
                 c, a = (self._shift(src, -f * kx, -f * ky) if f > 0 else src), np.ones((H, W), np.float32)
             wgt = a * rem
@@ -384,6 +418,46 @@ class View:
         P = self.P
         self.t += dt
         tg = list(target)
+        amb = P.get("ambient") if P else 0.0
+        if amb > 0:
+            T = 2 * math.pi * self.t
+            tg[0] += amb * (0.55 * math.sin(T / 11.0) + 0.22 * math.sin(T / 4.3 + 1.0))
+            tg[1] += amb * (0.40 * math.sin(T / 8.3 + 2.0) + 0.15 * math.sin(T / 3.7 + 0.5))
+        w = 9.0 * (P.get("response") if P else 1.0)
+        n = max(1, int(math.ceil(dt * w / 0.25)))
+        h = dt / n
+        for _ in range(n):
+            for a in range(2):
+                self.vv[a] += (w * w * (tg[a] - self.v[a]) - 2 * w * self.vv[a]) * h
+                self.v[a] += self.vv[a] * h
+        return tuple(self.v)
+
+
+class GyroView:
+    """The Core2's view exactly (jiggle_parallax.h parallax_step): gyro rates (deg/s) are integrated into a
+    held tilt that eases back to centre over a few seconds, through a soft limit, plus the slow drift,
+    then a critically damped spring. rates: (about the screen's horizontal axis: top edge away = +,
+    about its vertical axis: right edge away = +)."""
+    RECENTER_S, DEAD_DPS = 2.5, 0.6
+
+    def __init__(self, P):
+        self.P, self.t = P, 0.0
+        self.th = [0.0, 0.0]; self.v = [0.0, 0.0]; self.vv = [0.0, 0.0]
+
+    def step(self, dt, rates=(0.0, 0.0)):
+        P = self.P
+        self.t += dt
+        dead = lambda r: 0.0 if abs(r) < self.DEAD_DPS else (r - self.DEAD_DPS if r > 0 else r + self.DEAD_DPS)
+        rx, ry = rates
+        self.th[0] += dead(ry) * math.radians(1) * dt          # right edge away → near planes slide right
+        self.th[1] += -dead(rx) * math.radians(1) * dt         # top edge away → near planes slide up
+        leak = math.exp(-dt / self.RECENTER_S)
+        self.th = [a * leak for a in self.th]
+        full = math.radians(P.get("tilt") if P else 14.0)
+        tg = []
+        for a in range(2):
+            u = 1.5 * self.th[a] / full
+            tg.append(u / math.sqrt(1 + u * u))
         amb = P.get("ambient") if P else 0.0
         if amb > 0:
             T = 2 * math.pi * self.t

@@ -524,7 +524,10 @@ inline void sel_snap(const uint16_t* img, bool sw, const uint8_t* rough, int ban
 // ---- apply ---------------------------------------------------------------------------------------------
 // trim: 1 = an added area keeps 1 px off what isn't in the mask (water off the bank), 0 = exact,
 // −1 = an added area also takes its edge pixels (a depth plane carries its own rim, no ghost halo).
-inline int sel_apply(uint8_t* mask, const uint8_t* sel_in, bool add, int trim, void* (*alloc)(size_t)) {
+// Removing with `seeds` (what was tapped / stroked): only the selected pieces under them go - holding on
+// a stray blob takes that blob off, not everything of a similar colour nearby.
+inline int sel_apply(uint8_t* mask, const uint8_t* sel_in, bool add, int trim, void* (*alloc)(size_t),
+                     const uint8_t* seeds = nullptr) {
     SelBuf B(alloc);
     uint8_t* t = B.get<uint8_t>(MASK_BYTES);
     uint8_t* avail = B.get<uint8_t>(MASK_BYTES);
@@ -534,6 +537,21 @@ inline int sel_apply(uint8_t* mask, const uint8_t* sel_in, bool add, int trim, v
     if (!B.ok) return 0;
     SelStack S{stk, SEL_STACK};
     memcpy(t, sel_in, MASK_BYTES);
+    if (!add && seeds) {
+        bool hit = false;
+        for (int b = 0; b < MASK_BYTES && !hit; ++b) hit = (t[b] & mask[b] & seeds[b]) != 0;
+        if (hit) {
+            for (int b = 0; b < MASK_BYTES; ++b) { avail[b] = t[b] & mask[b]; t2[b] = 0; }
+            for (int i = 0; i < IMG_W * IMG_H; ++i) {
+                if (!bget(seeds, i) || !bget(avail, i)) continue;
+                bool edge;
+                sel_flood(i % IMG_W, i / IMG_W, [&](int xx, int yy) { return bget(avail, yy * IMG_W + xx); },
+                          [&](int xx, int yy) { bclr(avail, yy * IMG_W + xx); bset(t2, yy * IMG_W + xx); },
+                          [&](int, int, int) {}, S, edge);
+            }
+            memcpy(t, t2, MASK_BYTES);
+        }
+    }
     for (int b = 0; b < MASK_BYTES; ++b) avail[b] = (uint8_t)~t[b];
     for (int y = 1; y < IMG_H - 1; ++y)                // small enclosed gaps
         for (int x = 1; x < IMG_W - 1; ++x) {

@@ -60,6 +60,11 @@ public:
                 beat = true;
                 sign_ = -sign_;
                 ++beats_;
+                if (locked_) {                              // did a hit land on the beat since the last one?
+                    ontime_ = ontime_ * 0.75f + (ontime_hits_ > 0 ? 0.25f : 0.0f);
+                    ontime_hits_ = 0;
+                    if (locked_beats_ < 255) ++locked_beats_;
+                }
             }
         }
         if (locked_) {
@@ -85,6 +90,9 @@ public:
     float bpm() const { return 60.0f / period_; }
     int   beat_sign() const { return sign_; }              // alternates ±1 every beat
     float confidence() const { return conf_; }
+    // A real, steady beat: locked for a few beats, and most recent beats had a hit right on them.
+    // (Talking can line up for a moment; it doesn't keep landing on a tempo.)
+    bool  steady() const { return locked_ && locked_beats_ >= 4 && ontime_ >= 0.6f; }
     float phase() const { return phase_; }
     uint32_t beats() const { return beats_; }
 
@@ -118,6 +126,9 @@ private:
     float period_ = 0.5f, phase_ = 0.0f, amp_ = 0.0f;
     int   sign_ = 1;
     uint32_t beats_ = 0;
+    float ontime_ = 0;                              // share of recent beats with a hit on them
+    int   ontime_hits_ = 0;
+    uint8_t locked_beats_ = 0;
 
     const float& sig_at(int ago) const { return sig_[(head_ - 1 - ago + 2 * N) % N]; }
 
@@ -154,6 +165,7 @@ private:
         // Phase error in cycles at the moment of the hit, wrapped to [-0.5, 0.5).
         float ph = phase_ - (t_ - when) / period_;
         ph -= floorf(ph + 0.5f);
+        if (fabsf(ph) < 0.15f) ++ontime_hits_;
         phase_ -= 0.35f * ph;                 // pull the metronome toward the hit
         period_ *= 1.0f - 0.05f * ph;         // and nudge the tempo
         if (ph < -0.1f && phase_ >= 1.0f - lead_ / period_) fired_ = true;   // late hit: don't double-fire
@@ -183,6 +195,7 @@ private:
     void unlock() {
         locked_ = false;
         good_runs_ = 0;
+        ontime_ = 0; ontime_hits_ = 0; locked_beats_ = 0;
     }
 
     void analyse() {
@@ -491,21 +504,36 @@ public:
         float low = 10.0f * log10f(el / n + 1e-10f), all = 10.0f * log10f(ea / n + 1e-10f);
         level_db_ = all;
         const float dt = (float)n / rate;
-        // Floor: falls quickly to quieter levels; rises slowly only while there's no music.
+        if (chunks_ < 25) {                               // the first half second: learn the room as it is
+            floor_db_ = chunks_ == 0 ? all : (all < floor_db_ ? all : floor_db_ + (all - floor_db_) * 0.2f);
+            prev_low_ = low; prev_all_ = all; ++chunks_;
+            return last_hit_ = 0.0f;
+        }
+        // Floor: falls quickly to quieter levels; rises slowly while there's no music, and very slowly
+        // even during "music" (so nothing that isn't music can keep it switched on for good).
         if (all < floor_db_) floor_db_ += (all - floor_db_) * (1.0f - expf(-dt / 3.0f));
-        else if (!music_)    floor_db_ += (all - floor_db_) * (1.0f - expf(-dt / 15.0f));
-        float rise = (low - prev_low_ > 0 ? low - prev_low_ : 0) + 0.3f * (all - prev_all_ > 0 ? all - prev_all_ : 0);
+        else floor_db_ += (all - floor_db_) * (1.0f - expf(-dt / (music_ ? 90.0f : 15.0f)));
+        const float dl = low - prev_low_, da = all - prev_all_;
         prev_low_ = low;
         prev_all_ = all;
+        // How much the room's own sound wobbles from chunk to chunk (a quiet room's bass band jumps a few
+        // dB on its own): a hit must rise clearly past that, not just past zero.
+        if (!music_) wobble_ += ((dl > 0 ? dl : -dl) - wobble_) * (1.0f - expf(-dt / 3.0f));
+#ifndef JIG_GATE_K
+#define JIG_GATE_K 0.0f      // (0: every rise is a candidate hit; the steady-beat test rejects noise and talking)
+#endif
+        const float gate = JIG_GATE_K > 0 ? 0.5f + JIG_GATE_K * wobble_ : 0.0f;
+        float rise = (dl > gate ? dl - gate : 0) + 0.3f * (da > gate ? da - gate : 0);
         float hit = rise * SCALE;
         // Music detector: loud enough + hitting, with hysteresis so gaps between beats don't stop it.
         activity_ = activity_ * expf(-dt / 1.5f) + (hit > HIT && all > floor_db_ + CLOSE_DB ? 1.0f : 0.0f);
-        bool loud = all > floor_db_ + OPEN_DB;
+        // how much of the last second or two was loud (music with gaps between kicks still counts)
+        loud_ += ((all > floor_db_ + OPEN_DB ? 1.0f : 0.0f) - loud_) * (1.0f - expf(-dt / 1.5f));
         if (!music_) {
-            on_t_ = (loud && activity_ > 1.5f) ? on_t_ + dt : 0.0f;
+            on_t_ = (loud_ > 0.25f && activity_ > 1.5f) ? on_t_ + dt : 0.0f;
             if (on_t_ >= 0.4f) { music_ = true; off_t_ = 0; }
         } else {
-            off_t_ = (all < floor_db_ + CLOSE_DB || activity_ < 0.2f) ? off_t_ + dt : 0.0f;
+            off_t_ = (loud_ < 0.08f || activity_ < 0.2f) ? off_t_ + dt : 0.0f;
             if (off_t_ >= 2.0f) { music_ = false; on_t_ = 0; }
         }
         last_hit_ = all > floor_db_ + CLOSE_DB ? hit : 0.0f;
@@ -519,7 +547,8 @@ public:
 private:
     float dc_ = 0, lp1_ = 0, lp2_ = 0;
     float prev_low_ = -100.0f, prev_all_ = -100.0f, level_db_ = -100.0f, floor_db_ = FLOOR_START;
-    float activity_ = 0, on_t_ = 0, off_t_ = 0, last_hit_ = 0;
+    float activity_ = 0, on_t_ = 0, off_t_ = 0, last_hit_ = 0, wobble_ = 1.0f, loud_ = 0;
+    int   chunks_ = 0;
     bool  music_ = false;
 };
 

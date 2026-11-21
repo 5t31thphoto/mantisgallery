@@ -24,6 +24,9 @@ int  zone_count();
 void play_tick(uint32_t now_ms, bool may_draw);  // IMU → springs → redraw moving zones
 bool poke(int x, int y);
 int water_count();                             // water regions on this photo
+bool dance_toggle();                           // swipe up: dancing to music on / off. Returns the new state
+bool dance_is_on();
+void refresh();                                // redraw the photo as it is now (after something covered it)
 bool animating();                              // water, or a zone in motion: keep the loop tight                     // tap on a zone: give it a shove. true if a zone was hit
 
 void editor_open();

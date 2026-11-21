@@ -66,6 +66,7 @@ struct WLine { uint8_t n = 0; int16_t x[WPTS_MAX], y[WPTS_MAX]; };
 struct Water {
     // ---- definition (saved)
     uint8_t mode = W_STILL;
+    char    name[16] = {0};                     // the Studio's layer name (kept through a Core2 save)
     float   prm[WP_COUNT];
     uint8_t nlines = 0;
     WLine   line[WLINE_MAX];
@@ -92,6 +93,7 @@ struct Water {
     float* pax = nullptr;                        // perspective (grid): per cell ½·(across scale)², ½·(depth scale)²
     float* pay = nullptr;                        //   — far water: slower, smaller, foreshortened ripples
     float ghz = -1.0f;                           // the grid's horizon (vanishing line), y px
+    bool  oworld = false;                        // ocean distances are on the water's surface (grid), not on screen
     uint32_t rng = 12345;
 
     Water() { for (int i = 0; i < WP_COUNT; ++i) prm[i] = wparam_info((uint8_t)i).dflt; }
@@ -202,7 +204,7 @@ inline void* water_default_alloc(size_t n) { return malloc(n); }
 inline void water_free_runtime(Water& w) {
     void* ps[] = {w.edge, w.dsafe, w.sp_off, w.sp, w.h0, w.h1, w.gx, w.gy, w.gxp, w.gyp, w.cin, w.cnx, w.cny,
                   w.fx, w.fy, w.od, w.onx, w.ony, w.pax, w.pay};
-    w.pax = w.pay = nullptr; w.ghz = -1.0f;
+    w.pax = w.pay = nullptr; w.ghz = -1.0f; w.oworld = false;
     for (void* p : ps) if (p) free(p);
     w.edge = nullptr; w.dsafe = nullptr; w.sp_off = nullptr; w.sp = nullptr;
     w.h0 = w.h1 = w.gx = w.gy = w.gxp = w.gyp = nullptr; w.cin = nullptr; w.cnx = w.cny = nullptr;
@@ -223,6 +225,7 @@ inline bool water_ensure_mask(Water& w, WAlloc al = water_default_alloc) {
 inline void water_copy_def(Water& dst, const Water& src, WAlloc al = water_default_alloc) {
     water_free(dst);
     dst.mode = src.mode;
+    memcpy(dst.name, src.name, sizeof(dst.name));
     memcpy(dst.prm, src.prm, sizeof(dst.prm));
     dst.nlines = src.nlines;
     for (int i = 0; i < WLINE_MAX; ++i) dst.line[i] = src.line[i];
@@ -289,6 +292,40 @@ inline bool water_perspective(Water& w, WAlloc al) {
         w.pax[k] = 0.5f * ax * ax; w.pay[k] = 0.5f * ay * ay;   // (½: the stable step of the plain surface)
     }
     if (fabsf(Hh) > 1e-9f) w.ghz = -(G * (IMG_W * 0.5f) + I) / Hh;   // where the plane meets the sky
+    if (w.mode == W_OCEAN && w.od) {
+        // Swells on the water's own surface: distance across the plane (in px as seen up close), rolling
+        // toward the near edge — so far swells are closer together, smaller and line up with the grid.
+        float* vv = w.pay ? (float*)al(gn * 4) : nullptr;
+        if (vv) {
+            float vshore = -1e9f;
+            for (int l = 0; l < w.nlines; ++l)               // a shore line, if drawn, is where they land
+                for (int k = 0; k < w.line[l].n; ++k) {
+                    const float sx = w.line[l].x[k], sy = w.line[l].y[k], ww = G * sx + Hh * sy + I;
+                    if (fabsf(ww) > 1e-9f) { const float v = (D * sx + E * sy + F) / ww; if (v > vshore) vshore = v; }
+                }
+            float vmin = 1e9f;
+            for (int j = 0; j < w.gh; ++j)
+                for (int i = 0; i < w.gw; ++i) {
+                    const int k = j * w.gw + i;
+                    const float sx = w.bx + (i - 1) * WCELL + WCELL * 0.5f, sy = w.by + (j - 1) * WCELL + WCELL * 0.5f;
+                    const float ww = G * sx + Hh * sy + I;
+                    vv[k] = fabsf(ww) > 1e-9f ? (D * sx + E * sy + F) / ww : 1e9f;
+                    if (w.cin[k] && vv[k] < vmin) vmin = vv[k];
+                    // toward the near edge: −(screen direction of +v)
+                    float u = fabsf(ww) > 1e-9f ? (A * sx + B * sy + C) / ww : 0.0f, x0, y0, x1, y1;
+                    water_hmap(H, u, vv[k], x0, y0); water_hmap(H, u, vv[k] + 1e-3f, x1, y1);
+                    float dx = x0 - x1, dy = y0 - y1, l = sqrtf(dx * dx + dy * dy);
+                    if (l > 1e-9f) { w.onx[k] = dx / l; w.ony[k] = dy / l; }
+                }
+            const float v0 = vshore > -1e8f ? vshore : vmin;
+            for (int k = 0; k < gn; ++k) {
+                float d = (vv[k] - v0) * kref;                // px of surface, as they'd measure up close
+                w.od[k] = d > 0 ? d : 0;
+            }
+            free(vv);
+            w.oworld = true;
+        }
+    }
     return true;
 }
 
@@ -481,6 +518,7 @@ inline void water_poke(Water& w, float x, float y, float amt, int r) {
 inline bool water_contains(const Water& w, int x, int y) { return w.edge && mask_get(w.mask, x, y); }
 
 static constexpr float W_SLOSH_PX = 7.0f;       // how far the body of water leans at a full tilt
+static constexpr float W_OCEAN_FEEL = 0.15f;    // an ocean barely feels the Core2's tilts and shakes
 static constexpr float W_RIP_K = 0.035f;        // surface slope → pixel shift
 static constexpr float W_AMB_PX = 0.9f;         // ambient wave height (px, close up)
 static constexpr float W_RIVER_PX = 14.0f;      // river flow (px/s) at speed 1
@@ -498,7 +536,8 @@ inline void water_step(Water& w, float dt, const float dn[3], const float jolt[3
     w.t += dt;
     // The body of water leans toward the real down and overshoots a little; its swings throw waves
     // off the banks.
-    const float sl = wprm(w, WP_SLOSH);
+    // (An ocean is too big to slosh in a frame: it only just feels them.)
+    const float sl = wprm(w, WP_SLOSH) * (w.mode == W_OCEAN ? W_OCEAN_FEEL : 1.0f);
     const float tx = sl * W_SLOSH_PX * dn[0], ty = sl * W_SLOSH_PX * (dn[1] - 1.0f) * 0.6f;
     const float ax = (tx - w.sx) * 10.0f - w.svx * 1.6f, ay = (ty - w.sy) * 10.0f - w.svy * 1.6f;
     const float kx = ax * dt, ky = ay * dt;
@@ -507,7 +546,8 @@ inline void water_step(Water& w, float dt, const float dn[3], const float jolt[3
     const float kick = 9.0f * sl;
     if (fabsf(kx) + fabsf(ky) > 1e-4f)
         for (int k = 0; k < gn; ++k)
-            if (w.cnx[k] | w.cny[k]) w.h1[k] += kick * (kx * w.cnx[k] + ky * w.cny[k]);
+            if (w.cnx[k] | w.cny[k])                  // (far banks throw smaller waves)
+                w.h1[k] += kick * (w.pax ? sqrtf(2.0f * w.pax[k]) : 1.0f) * (kx * w.cnx[k] + ky * w.cny[k]);
     // Shakes: chop where you'd least expect it.
     const float rip = wprm(w, WP_RIPPLE);
     const float jm = sqrtf(jolt[0] * jolt[0] + jolt[1] * jolt[1] + jolt[2] * jolt[2]);
@@ -515,7 +555,7 @@ inline void water_step(Water& w, float dt, const float dn[3], const float jolt[3
         int np = (int)(jm * 6.0f * sl) + 1;
         for (int i = 0; i < np; ++i) {
             float px = w.bx + wrandf(w) * w.bw, py = w.by + wrandf(w) * w.bh;
-            water_poke(w, px, py, 45.0f * jm * rip, 1);
+            water_poke(w, px, py, 45.0f * jm * rip * (w.mode == W_OCEAN ? 0.4f : 1.0f), 1);
         }
     }
     // Rain.
@@ -670,7 +710,8 @@ inline void water_render(const Water& w, const uint16_t* src, bool src_swapped, 
             if (ocean) { rA[i] = w.od[ka] * gy0 + w.od[kb] * fy; rB[i] = w.onx[ka] * gy0 + w.onx[kb] * fy; rC[i] = w.ony[ka] * gy0 + w.ony[kb] * fy; }
             else if (river) { rA[i] = w.fx[ka] * gy0 + w.fx[kb] * fy; rB[i] = w.fy[ka] * gy0 + w.fy[kb] * fy; }
         }
-        const float lam = ospc * (p > 0.3f ? p : 0.3f), inv_lam = 1.0f / lam, half_lam = lam * 0.5f, oA = oA0 * p;
+        const float lam = w.oworld ? ospc : ospc * (p > 0.3f ? p : 0.3f);   // (on the surface: one spacing)
+        const float inv_lam = 1.0f / lam, half_lam = lam * 0.5f, oA = oA0 * p;
         const uint8_t* er = w.edge + ry * w.bw - w.bx;
         const uint8_t* ds = w.dsafe + ry * w.bw - w.bx;
         const uint16_t* srow = src + y * IMG_W;

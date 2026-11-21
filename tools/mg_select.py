@@ -390,7 +390,8 @@ def snap(img, rough, band=8, F=None, engine="auto"):
     else the built-in fit (the same maths the Core2 runs)."""
     if engine in ("auto", "grabcut"):
         g = grabcut(img, rough)
-        if g is not None:
+        # collapsed (nothing inside stands apart from its surroundings): fit the drawn outline instead
+        if g is not None and g.sum() * 5 >= (np.asarray(rough, bool) & ~bars(img)).sum():
             return g
     return snap_builtin(img, rough, band, F)
 
@@ -434,12 +435,23 @@ def snap_builtin(img, rough, band=8, F=None):
 
 
 # ---- applying to a mask ------------------------------------------------------------------------------
-def apply(mask, sel, add=True, trim=1):
+def apply(mask, sel, add=True, trim=1, seeds=None):
     """Add (or remove) a selection. Enclosed small gaps are filled. trim=1: an added area keeps its
     outer pixel off whatever isn't already in the mask (water stays off the bank) and a removed area
     takes one extra; 0: exact; −1: an added area takes its edge pixels too (a depth plane carries its
-    own rim, so no ghost halo is left behind when it slides). Returns pixels changed."""
+    own rim, so no ghost halo is left behind when it slides). Returns pixels changed.
+    Removing with `seeds` (what was tapped / stroked): only the selected pieces under them go - holding
+    on a stray blob takes that blob off, not everything of a similar colour nearby."""
     t = sel.copy()
+    if not add and seeds is not None:
+        hit = t & mask & np.asarray(seeds, bool)
+        if hit.any():
+            avail, keep = t & mask, np.zeros_like(t)
+            for yy, xx in zip(*np.nonzero(hit)):
+                if avail[yy, xx]:
+                    for r, a0, b0 in _flood(avail, int(xx), int(yy))[2]:
+                        keep[r, a0:b0 + 1] = True
+            t = keep
     avail = ~t
     start = np.zeros_like(t)                          # gaps are looked for from next to the selection
     start[1:-1, 1:-1] = avail[1:-1, 1:-1] & (t[1:-1, :-2] | t[:-2, 1:-1])
