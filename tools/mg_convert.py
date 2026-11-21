@@ -15,7 +15,7 @@ Index format (matches firmware):
     file2.mg
     ...
 
-Requires:  pip install pillow numpy
+Requires:  pip install pillow numpy   (optional: opencv-python — best Shape fit in the lab)
 Run:       python mg_convert.py
 """
 

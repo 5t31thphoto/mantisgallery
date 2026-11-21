@@ -759,5 +759,5 @@ void loop() {
     }
 
     jig::play_tick(millis(), !btn_b_holding);
-    delay(6);
+    delay(jig::animating() ? 1 : 6);   // don't sleep frames away while something is moving
 }

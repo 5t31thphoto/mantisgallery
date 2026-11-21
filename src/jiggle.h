@@ -22,7 +22,9 @@ void clear_zones();
 int  zone_count();
 
 void play_tick(uint32_t now_ms, bool may_draw);  // IMU → springs → redraw moving zones
-bool poke(int x, int y);                     // tap on a zone: give it a shove. true if a zone was hit
+bool poke(int x, int y);
+int water_count();                             // water regions on this photo
+bool animating();                              // water, or a zone in motion: keep the loop tight                     // tap on a zone: give it a shove. true if a zone was hit
 
 void editor_open();
 bool editor_is_open();
