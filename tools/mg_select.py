@@ -385,6 +385,42 @@ def grabcut(img, rough, iters=5):
     return out
 
 
+def cut(img, keep, avoid=None, prior=None, reach=24, iters=6):
+    """Cut it out from your strokes: `keep` (painted on it) is surely it, `avoid` (painted on what it
+    isn't - the face next to the hair, the sky behind) surely not; `prior` (what's already selected) and
+    a band `reach` px round the strokes are maybe-it; farther than that, not. GrabCut learns the two
+    sides' colours from that and finds the edge between them. Only pieces touching a keep stroke stay.
+    Without OpenCV: the built-in snap of the strokes' area. Returns a bool mask."""
+    keep = np.asarray(keep, bool)
+    avoid = np.zeros_like(keep) if avoid is None else np.asarray(avoid, bool) & ~keep
+    prior = np.zeros_like(keep) if prior is None else np.asarray(prior, bool)
+    if not keep.any():
+        return prior & ~avoid
+    try:
+        import cv2
+    except ImportError:
+        return snap_builtin(img, grow_mask(keep | prior, 4) & ~avoid) | keep
+    from scipy.ndimage import distance_transform_edt, label
+    near = distance_transform_edt(~(keep | prior)) <= reach
+    m = np.full(keep.shape, cv2.GC_BGD, np.uint8)
+    m[near] = cv2.GC_PR_BGD
+    m[prior | (distance_transform_edt(~keep) <= 3)] = cv2.GC_PR_FGD
+    m[avoid] = cv2.GC_BGD
+    m[keep] = cv2.GC_FGD
+    m[bars(img)] = cv2.GC_BGD
+    bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+    bgr = np.ascontiguousarray(np.asarray(img)[..., 2::-1])
+    try:
+        cv2.grabCut(bgr, m, None, bgd, fgd, iters, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return (keep | prior) & ~avoid
+    sel = (m == cv2.GC_FGD) | (m == cv2.GC_PR_FGD)
+    lab, n = label(sel)
+    ids = np.unique(lab[keep & sel]); ids = ids[ids > 0]
+    out = np.isin(lab, ids) | keep
+    return out & ~avoid
+
+
 def snap(img, rough, band=8, F=None, engine="auto"):
     """A rough shape → the object inside it. engine "auto": GrabCut when OpenCV is installed (the lab),
     else the built-in fit (the same maths the Core2 runs)."""

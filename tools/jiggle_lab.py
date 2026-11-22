@@ -25,7 +25,7 @@ except ImportError:  # editing still works; the live preview needs numpy
 # ---- constants (keep in step with jiggle_core.h) -----------------------------------------------
 IMG_W, IMG_H = 320, 240
 MAX_ZONES = 4
-R_MIN, R_MAX, R_DEFAULT = 10.0, 150.0, 45.0
+R_MIN, R_MAX, R_DEFAULT = 6.0, 150.0, 45.0
 BBOX_K, MARGIN, PLATEAU = 1.13, 1.25, 0.55
 TIP_R, TIP_FADE = 0.15, 2.0
 TIP_U, TIP_W = 0.0, -0.50

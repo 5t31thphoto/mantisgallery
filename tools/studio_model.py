@@ -139,11 +139,26 @@ class Studio:
                     self.par.prm["ground"] = 0.0
                 return
 
+    def par_with_sways(self):
+        """The depth planes as they move: each figure carries its hair / cloth / pendants (the ones on it,
+        or - none named - the figure they overlap most), so nothing of her is left behind when she slides."""
+        par = self.par.copy()
+        for sw in self.sways:
+            if sw.mask is None or not sw.mask.any():
+                continue
+            idx = [i for i, p in enumerate(par.planes) if sw.on and p.name == sw.on]
+            if not idx:
+                ov = [((p.mask & S.grow_mask(sw.mask, 2)).sum() if p.mask is not None else 0) for p in par.planes]
+                idx = [int(np.argmax(ov))] if ov and max(ov) > 0 else []
+            for i in idx:
+                par.planes[i].mask = par.planes[i].mask | sw.mask
+        return par
+
     def jig_text(self):
         """The .jig as it will be saved."""
         for w in self.ed.waters:                    # the water lies on the ground: its perspective
             w.grid = None if not self.par.grid else [tuple(p) for p in self.par.grid]
-        txt = J.format_jig(self.ed.zones, self.ed.waters, self.par, self.ed.hangs)
+        txt = J.format_jig(self.ed.zones, self.ed.waters, self.par_with_sways(), self.ed.hangs)
         body = self.body_mask()
         plates = None
         ok = [s for s in self.sways if s.ok()]
@@ -154,7 +169,13 @@ class Studio:
                 plates = [((lambda p: (p.plate, p.fill_hole))(next(it))) if s.ok() else None for s in self.sways]
             except Exception:
                 plates = None                            # (the Core2 makes its own)
-        lines = SW.format_lines(self.sways, body if body.any() and self.sways else None, plates)
+        out_sw = []
+        for sw in self.sways:                            # (a skirt's hips: as lined up, else fitted - the Core2 needs them)
+            if sw.kind == "cloth" and len(sw.arm) != SW.HIP_POINTS and sw.mask is not None and sw.mask.any():
+                sw = sw.copy(); sw.arm = SW.fit_hips(sw.mask, SW.rest_body(body, [x.mask for x in self.sways]) if body.any() else None,
+                                                     sw.guides[0] if sw.guides else None)
+            out_sw.append(sw)
+        lines = SW.format_lines(out_sw, body if body.any() and self.sways else None, plates)
         if lines:
             txt += "\n".join(lines) + "\n"
         return txt
@@ -408,6 +429,29 @@ class Studio:
         self._smart = {"marks": marks.copy(), "before": before, "add": add, "step": 0, "grown": g, "key": self.active}
         return int((before ^ m).sum())
 
+    def cut(self, keep, avoid=None, add=True):
+        """Cut out: strokes on it (keep) and on what it isn't (avoid); what's selected already counts as
+        maybe-it. The result replaces the layer's mask where the strokes reach (add=False: it's removed)."""
+        m = self.mask()
+        keep = np.asarray(keep, bool)
+        if m is None or self.image is None or not keep.any():
+            return 0
+        self.push_undo()
+        before = m.copy()
+        sel = S.cut(self.image, keep, avoid)           # (decided from the strokes alone: all of them, every time)
+        if add:                                        # near the strokes it's what the cut says; farther, what
+            from scipy.ndimage import distance_transform_edt   # was there stays (brushed bits elsewhere)
+            near = distance_transform_edt(~keep) <= 24
+            keep_rest = m & ~near
+            m[:] = False                               # (small gaps filled, and a figure takes its rim, as the
+            S.apply(m, sel, True, self._trim())        # other tools do)
+            m |= keep_rest
+        else:
+            m &= ~sel
+        self._commit(m, before)
+        self._smart = None
+        return int((before ^ m).sum())
+
     def smart_step(self, d):
         """Tighter (−1) / looser (+1): the last smart pick, a smaller or bigger version."""
         st = self._smart
@@ -626,6 +670,43 @@ class Studio:
         else:
             sw.guides = [[pts[0]]]
         return True
+
+    def suggest_locks(self):
+        """Hair: lock strokes traced for you (each fall of it, rooted at the neck). Replaces the strokes."""
+        L = self.layer()
+        if L.kind != "sway" or L.obj.kind != "hair" or not L.obj.mask.any():
+            return 0
+        self.push_undo()
+        B = self.body_mask()
+        L.obj.guides = SW.suggest_locks(L.obj.mask, B if B.any() else None)
+        return len(L.obj.guides)
+
+    def hips(self):
+        """The active skirt's hip outline: as lined up, else fitted (shown for you to drag into place)."""
+        L = self.layer()
+        if L.kind != "sway" or L.obj.kind != "cloth" or L.obj.mask is None or not L.obj.mask.any():
+            return []
+        if len(L.obj.arm) == SW.HIP_POINTS:
+            return L.obj.arm
+        B = self.body_mask()
+        return SW.fit_hips(L.obj.mask, SW.rest_body(B, [s.mask for s in self.sways]) if B.any() else None,
+                           L.obj.guides[0] if L.obj.guides else None)
+
+    def set_hip(self, i, x, y, start=True):
+        L = self.layer()
+        pts = list(self.hips())
+        if not pts:
+            return
+        if start:
+            self.push_undo()
+        pts[i] = (float(x), float(y))
+        L.obj.arm = pts
+
+    def fit_hips(self):
+        L = self.layer()
+        if L.kind == "sway" and L.obj.kind == "cloth":
+            self.push_undo()
+            L.obj.arm = []
 
     def undo_guide(self):
         """The last lock / fold / pin off."""
@@ -943,9 +1024,8 @@ class Studio:
     # ---- preview ---------------------------------------------------------------------------------------
     def sim(self, with_sways=True):
         body = self.body_mask()
-        par = self.par if self.par.any() else None
+        par = self.par_with_sways() if self.par.any() else None
         if par is not None:
-            par = par.copy()
             for i, p in enumerate(par.planes):          # (depths as the Core2 will compute them)
                 if p.mask is not None and p.mask.any():
                     p.depth = self.figure_depth(i)

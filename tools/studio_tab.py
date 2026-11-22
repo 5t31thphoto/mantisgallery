@@ -51,7 +51,8 @@ TEAL, LIME, YEL, PLUM, RED = "#007373", "#b4ff00", "#ffe000", "#5d005d", "#ff707
 FONT, FONT_B, FONT_S = ("Segoe UI", 10), ("Segoe UI", 10, "bold"), ("Segoe UI", 9)
 SETTINGS = Path.home() / ".mantis_studio.json"
 
-TOOLS = (("smart", "Smart", "W"), ("brush", "Brush", "B"), ("erase", "Erase", "E"), ("lasso", "Lasso", "L"))
+TOOLS = (("cut", "Cut out", "C"), ("smart", "Smart", "W"), ("brush", "Brush", "B"), ("erase", "Erase", "E"), ("lasso", "Lasso", "L"))
+MASK_TOOLS = tuple(t for t, _, _ in TOOLS)
 HANDLES = {  # the active layer's own handle tools: (tool, label, key)
     "ground": [("grid", "Grid corners", "G")],
     "figure": [("feet", "Feet line", "F")],
@@ -83,13 +84,68 @@ def save_settings(d):
         pass
 
 
+class Tabs(tk.Frame):
+    """Sub-tabs as in the design: a row of flat buttons, the chosen one underlined in lime. Answers the bits
+    of ttk.Notebook the tab uses (select / index / the changed event)."""
+
+    def __init__(self, master):
+        super().__init__(master, bg=BG)
+        self.bar = tk.Frame(self, bg=BG)
+        self.bar.pack(fill="x")
+        self.body = tk.Frame(self, bg=BG)
+        self.body.pack(fill="both", expand=True)
+        self.pages, self.btns, self.lines, self.cur, self._cb = [], [], [], 0, []
+
+    def add(self, frame, text=""):
+        i = len(self.pages)
+        col = tk.Frame(self.bar, bg=BG)
+        col.pack(side="left", fill="x", expand=True, padx=1)
+        b = tk.Button(col, text=text, command=lambda: self.select(i), relief="flat", bd=0, pady=6,
+                      font=("Segoe UI", 9, "bold"), cursor="hand2")
+        b.pack(fill="x")
+        ln = tk.Frame(col, height=2, bg="#333")
+        ln.pack(fill="x")
+        self.pages.append(frame); self.btns.append(b); self.lines.append(ln)
+        self._paint()
+
+    def _paint(self):
+        for j, (b, ln) in enumerate(zip(self.btns, self.lines)):
+            on = j == self.cur
+            b.configure(bg=PANEL2 if on else BG, fg=FG if on else MUTED, activebackground=PANEL2, activeforeground=FG)
+            ln.configure(bg=LIME if on else "#333")
+        for j, f in enumerate(self.pages):
+            if j == self.cur:
+                f.pack(fill="both", expand=True)
+            else:
+                f.pack_forget()
+
+    def select(self, i=None):
+        if i is None:
+            return self.cur
+        if i != self.cur:
+            self.cur = i
+            self._paint()
+            for cb in self._cb:
+                cb(None)
+        return self.cur
+
+    def index(self, what):
+        return int(what)
+
+    def bind(self, seq, fn, add=None):
+        if seq == "<<NotebookTabChanged>>":
+            self._cb.append(fn)
+        else:
+            super().bind(seq, fn, add)
+
+
 class StudioTab(tk.Frame):
     def __init__(self, master, root=None):
         super().__init__(master, bg=BG)
         self.root = root or self.winfo_toplevel()
         self.st = SM.Studio()
         self.zoom = 2
-        self.tool = "smart"
+        self.tool = "cut"
         self.sub = tk.BooleanVar(value=False)          # Subtract mode
         self.brush_r = 6
         self.protect_v = tk.BooleanVar(value=True)
@@ -111,6 +167,8 @@ class StudioTab(tk.Frame):
         self._last_tick = time.perf_counter()
         self._pts = []                                 # lasso / line / stroke points in progress
         self._marks = None                             # smart stroke in progress
+        self._cut = None                               # Cut out: the active layer's keep / not strokes so far
+        self._last_xy = None
         self._drag = None
         self._alt = False
         self._photo = None
@@ -189,7 +247,7 @@ class StudioTab(tk.Frame):
         top = tk.Frame(self, bg=BG)
         top.pack(fill="x", padx=8, pady=(8, 4))
         self._btn(top, "Open .mg…", self.open_dialog, "teal").pack(side="left")
-        self._btn(top, "Save", self.save, "plum").pack(side="left", padx=4)
+        self._btn(top, "Save to SD", self.save, "plum").pack(side="left", padx=4)
         self._btn(top, "Revert", self.revert).pack(side="left")
         mb = tk.Menubutton(top, text="Masks ▾", bg=TEAL, fg=FG, activebackground=TEAL, relief="flat", font=FONT_S, padx=8, pady=3)
         mm = tk.Menu(mb, tearoff=0, bg=PANEL, fg=FG, activebackground=TEAL)
@@ -302,27 +360,21 @@ class StudioTab(tk.Frame):
         st = tk.Frame(mid, bg="#101010", highlightbackground=LIME, highlightthickness=1)
         st.pack(fill="x")
         self.status_lbl = tk.Label(st, textvariable=self.status, fg=FG, bg="#101010", font=FONT, anchor="w",
-                                   justify="left", wraplength=J.IMG_W * 2 + 120)
+                                   justify="left", wraplength=J.IMG_W * 2)
         self.status_lbl.pack(fill="x", padx=8, pady=5)
-        self.hint_lbl = tk.Label(mid, text="", fg=MUTED, bg=BG, font=FONT_S, anchor="w", justify="left")
+        self.hint_lbl = tk.Label(mid, text="", fg=MUTED, bg=BG, font=FONT_S, anchor="w", justify="left",
+                                 wraplength=J.IMG_W * 2)
         self.hint_lbl.pack(fill="x")
 
     def _build_right(self, body):
         right = tk.Frame(body, bg=BG, width=400)
         right.pack(side="right", fill="y")
         right.pack_propagate(False)
-        sty = ttk.Style(self)
-        try:
-            sty.configure("Studio.TNotebook", background=BG, borderwidth=0)
-            sty.configure("Studio.TNotebook.Tab", background=PANEL2, foreground=MUTED, padding=(12, 5))
-            sty.map("Studio.TNotebook.Tab", background=[("selected", TEAL)], foreground=[("selected", FG)])
-        except tk.TclError:
-            pass
-        self.nb = ttk.Notebook(right, style="Studio.TNotebook")
+        self.nb = Tabs(right)
         self.nb.pack(fill="both", expand=True)
         self.tabs = {}
         for name in SUBTABS:
-            f = tk.Frame(self.nb, bg=BG)
+            f = tk.Frame(self.nb.body, bg=BG)
             self.nb.add(f, text=name)
             self.tabs[name] = self._scrolled(f)
         self.nb.bind("<<NotebookTabChanged>>", self._tab_changed)
@@ -402,9 +454,12 @@ class StudioTab(tk.Frame):
                 self._slider(f1, "Depth", 0, 1, 0.01, lambda: fig.depth, lambda v: self.st.set_depth(v),
                              "0 = as far as the sky (stays put), 1 = nearest (slides most). Compare with the Depth tab's list.")
             f2 = self._section(self.scene_box, "HOW TO SELECT IT")
-            self._label(f2, "1  Smart: click it (or drag over it).\n2  Grabbed too much? Alt-click it (or − Subtract).\n"
-                            "3  Refine edges — snaps to its outline.\n4  Brush / Erase for the rest;  [ ]  brush size.\n"
-                            "5  Feet line: drag where it touches the ground.", FG, bg=PANEL).pack(fill="x")
+            self._label(f2, "1  Cut out: paint a few strokes on her (head to feet, the arms).\n"
+                            "2  Alt-paint (or − Subtract) on what she isn't, where it touches her:\n"
+                            "    the background by her sides, the ground between her feet.\n"
+                            "3  Every stroke re-cuts. Her hair and clothes count as her.\n"
+                            "4  A thin outline left behind when she slides? Grow 1 px.\n"
+                            "5  Feet line: drag where she touches the ground.", FG, bg=PANEL).pack(fill="x")
 
     def _clear_feet(self):
         L = self.st.layer()
@@ -669,6 +724,14 @@ class StudioTab(tk.Frame):
         self._label(f, what + ("" if ng else f" — use the {tool[1]} tool ({tool[2]})"), LIME if ng else YEL, bg=PANEL).pack(fill="x", pady=(6, 0))
         row = tk.Frame(f, bg=PANEL); row.pack(fill="x", pady=(4, 0))
         self._btn(row, f"{tool[1]} tool  {tool[2]}", lambda: self.set_tool("guide")).pack(side="left")
+        if sw.kind == "hair":
+            self._btn(row, "Suggest locks", lambda: self._do(self.st.suggest_locks), "teal").pack(side="left", padx=4)
+        if sw.kind == "cloth":
+            hr = tk.Frame(f, bg=PANEL); hr.pack(fill="x", pady=(6, 0))
+            self._label(hr, "Her hips under it: " + ("lined up ✓" if len(sw.arm) == SW.HIP_POINTS else "fitted — check it"),
+                        LIME if len(sw.arm) == SW.HIP_POINTS else YEL, bg=PANEL).pack(side="left")
+            self._btn(hr, "Hips tool  H", lambda: self.set_tool("hips")).pack(side="left", padx=4)
+            self._btn(hr, "Re-fit", lambda: self._do(self.st.fit_hips)).pack(side="left")
         if ng:
             self._btn(row, "Remove last", lambda: self._do(self.st.undo_guide)).pack(side="left", padx=4)
             self._btn(row, "Clear", lambda: self._do(self.st.clear_guides)).pack(side="left", padx=4)
@@ -681,40 +744,97 @@ class StudioTab(tk.Frame):
 
     def _sway_help(self, parent):
         f = self._section(parent, "THE THREE KINDS")
-        self._label(f, "Hair lock — select the lock (any select tool), then Lock stroke: drag from where it's tied to "
-                       "its tip. One stroke per lock.\nCloth — select the skirt / curtain, then Waistband: click its two "
-                       "ends; the pleats are found from the folds.\nPendant — select it, then Pin: click where it "
-                       "hangs from. It swings on real gravity.", FG, bg=PANEL, wraplength=340).pack(fill="x")
+        self._label(f, "Hair — Cut out the hair (paint on it; Alt-paint on her face and the background), then "
+                       "Suggest locks, or draw each lock with Lock stroke: from the neck's height (where it leaves "
+                       "her head) to its tip. Hair above that lies on her head and stays.\nCloth — Cut out the skirt "
+                       "(Alt-paint her arms, legs and the ground), then Waistband: click its two ends, then Hips: drag "
+                       "the pink outline onto her hips and legs (the skirt won't swing in through it). Optional: click "
+                       "the fold lines.\nPendant — Cut it out, then Pin: click where it hangs from.\nHair and cloth "
+                       "move with the figure they rest on.", FG, bg=PANEL, wraplength=340).pack(fill="x")
 
     # ---- preview bar -------------------------------------------------------------------------------------
     def _build_preview_bar(self):
         bar = tk.Frame(self, bg=PANEL, highlightbackground="#333", highlightthickness=1)
         bar.pack(fill="x", padx=8, pady=(4, 8))
-        r1 = tk.Frame(bar, bg=PANEL); r1.pack(fill="x", padx=6, pady=(5, 2))
-        self.prev_cb = tk.Checkbutton(r1, text="▶ Live preview", variable=self.preview, bg=PANEL, fg=LIME, selectcolor="#333",
-                                      activebackground=PANEL, font=FONT_B, command=self._preview_toggled, highlightthickness=0)
-        self.prev_cb.pack(side="left")
+        r1 = tk.Frame(bar, bg=PANEL); r1.pack(fill="x", padx=8, pady=(6, 2))
+        self.prev_btn = self._btn(r1, "▶ Live preview", self._toggle_preview, font=FONT_B)
+        self.prev_btn.pack(side="left", padx=(0, 6))
         for kind, label in J.MOTIONS:
-            self._btn(r1, label, lambda k=kind: self.start_motion(k), padx=5).pack(side="left", padx=1)
-        r2 = tk.Frame(bar, bg=PANEL); r2.pack(fill="x", padx=6, pady=(0, 5))
-        self._label(r2, "Hold the Core2:  turned").pack(side="left")
-        tk.Scale(r2, from_=-180, to=180, orient="horizontal", variable=self.tilt, showvalue=True, length=140, font=FONT_S,
-                 bg=PANEL, fg=FG, troughcolor="#3a3a3a", highlightthickness=0).pack(side="left")
-        self._label(r2, "°  leaned").pack(side="left")
-        tk.Scale(r2, from_=-90, to=90, orient="horizontal", variable=self.lean, showvalue=True, length=110, font=FONT_S,
-                 bg=PANEL, fg=FG, troughcolor="#3a3a3a", highlightthickness=0).pack(side="left")
-        self._label(r2, "°").pack(side="left")
-        self._btn(r2, "Upright", lambda: (self.tilt.set(0), self.lean.set(0)), padx=5).pack(side="left", padx=4)
-        self._check(r2, "Dance", self.dance, self._dance_toggled).pack(side="left", padx=(8, 0))
+            self._btn(r1, label, lambda k=kind: self.start_motion(k), padx=6).pack(side="left", padx=1)
+        self._btn(r1, "● Record…", self.record_preview, "plum").pack(side="right")
+        r2 = tk.Frame(bar, bg=PANEL); r2.pack(fill="x", padx=8, pady=(2, 6))
+        self._label(r2, "Hold the Core2:  turned", bg=PANEL).pack(side="left")
+        tk.Scale(r2, from_=-180, to=180, orient="horizontal", variable=self.tilt, showvalue=False, length=150,
+                 bg=PANEL, troughcolor="#3a3a3a", highlightthickness=0, sliderrelief="flat", bd=0,
+                 command=lambda v: self.tilt_lbl.configure(text=f"{float(v):+.0f}°")).pack(side="left", padx=4)
+        self.tilt_lbl = self._label(r2, "0°", LIME, bg=PANEL, width=5)
+        self.tilt_lbl.pack(side="left")
+        self._label(r2, "leaned", bg=PANEL).pack(side="left", padx=(6, 0))
+        tk.Scale(r2, from_=-90, to=90, orient="horizontal", variable=self.lean, showvalue=False, length=110,
+                 bg=PANEL, troughcolor="#3a3a3a", highlightthickness=0, sliderrelief="flat", bd=0,
+                 command=lambda v: self.lean_lbl.configure(text=f"{float(v):+.0f}°")).pack(side="left", padx=4)
+        self.lean_lbl = self._label(r2, "0°", LIME, bg=PANEL, width=5)
+        self.lean_lbl.pack(side="left")
+        self._btn(r2, "Upright", lambda: (self.tilt.set(0), self.lean.set(0), self.tilt_lbl.configure(text="0°"),
+                                          self.lean_lbl.configure(text="0°")), padx=6).pack(side="left", padx=6)
+        self.dance_btn = self._btn(r2, "Dance", lambda: (self.dance.set(not self.dance.get()), self._dance_toggled(),
+                                                         self._paint_preview_bar()), padx=6)
+        self.dance_btn.pack(side="left", padx=(10, 2))
         tk.Spinbox(r2, from_=60, to=200, increment=1, textvariable=self.bpm, width=4, bg=PANEL2, fg=FG,
-                   buttonbackground="#333", font=FONT_S).pack(side="left")
-        self._label(r2, "BPM   Speed").pack(side="left", padx=(2, 2))
+                   buttonbackground="#333", font=FONT_S, relief="flat").pack(side="left")
+        self._label(r2, "BPM", bg=PANEL).pack(side="left", padx=(2, 10))
+        self._label(r2, "Speed", bg=PANEL).pack(side="left", padx=(0, 2))
+        self.speed_btns = {}
         for v, l in (("1", "1×"), ("0.5", "½×"), ("0.25", "¼×")):
-            tk.Radiobutton(r2, text=l, variable=self.slowmo, value=v, bg=PANEL, fg=FG, selectcolor="#333", font=FONT_S,
-                           activebackground=PANEL).pack(side="left")
-        self._label(r2, "   Show:").pack(side="left")
+            b = self._btn(r2, l, lambda v=v: (self.slowmo.set(v), self._paint_preview_bar()), padx=6)
+            b.pack(side="left", padx=1)
+            self.speed_btns[v] = b
+        self._label(r2, "Show:", bg=PANEL).pack(side="left", padx=(10, 2))
+        self.show_btns = {}
         for text, var in (("Layers", self.show_layers), ("Handles", self.show_handles), ("Depth map", self.show_depth)):
-            self._check(r2, text, var, self._render).pack(side="left")
+            b = self._btn(r2, text, lambda var=var: (var.set(not var.get()), self._paint_preview_bar(), self._render()), padx=6)
+            b.pack(side="left", padx=1)
+            self.show_btns[text] = (b, var)
+        self._paint_preview_bar()
+
+    def _paint_preview_bar(self):
+        def paint(b, on):
+            b.configure(bg=LIME if on else PANEL2, fg="#000" if on else FG)
+        paint(self.prev_btn, self.preview.get())
+        paint(self.dance_btn, self.dance.get())
+        for v, b in self.speed_btns.items():
+            paint(b, self.slowmo.get() == v)
+        for b, var in self.show_btns.values():
+            paint(b, var.get())
+
+    def _toggle_preview(self):
+        self.preview.set(not self.preview.get())
+        self._preview_toggled()
+        self._paint_preview_bar()
+
+    def record_preview(self):
+        """Save the preview, played through a set of motions, as a GIF or MP4 (to look at, or share)."""
+        if self.st.image is None:
+            return
+        path = filedialog.asksaveasfilename(parent=self, title="Record the preview", defaultextension=".gif",
+                                            filetypes=[("Animated GIF", "*.gif"), ("MP4 video", "*.mp4")],
+                                            initialfile=(Path(self.st.ed.mg_path).stem if self.st.ed.mg_path else "preview") + "_preview.gif")
+        if not path:
+            return
+        self._hint("Recording the preview (tilt, sway, shake, walk, dance)… it takes a little while.")
+        st = self.st
+
+        def work():
+            try:
+                import mg_preview as MP
+                sim = st.sim()
+                fr = list(MP.frames(sim, seconds=17.0, fps=15))
+                MP.write(path, fr, fps=15)
+                msg = f"Saved {len(fr)} frames: {path}"
+            except Exception as ex:                          # (shown, never raised on the Tk thread)
+                msg = f"Couldn't record: {ex}"
+            self._job_done = lambda: self._hint(msg)
+        threading.Thread(target=work, daemon=True).start()
 
     # ================================================================================== state → widgets
     def _hint(self, text):
@@ -791,7 +911,7 @@ class StudioTab(tk.Frame):
             return [("line", "Shore line" if L.obj.mode == J.W_OCEAN else "Flow line", "S")]
         if L.kind == "sway":
             t = HANDLES_SWAY[L.obj.kind]
-            return [("guide", t[1], t[2])]
+            return [("guide", t[1], t[2])] + ([("hips", "Hips", "H")] if L.obj.kind == "cloth" else [])
         return HANDLES.get(L.kind, [])
 
     def _refresh_summary(self):
@@ -824,10 +944,12 @@ class StudioTab(tk.Frame):
         prot = [M.name for M in self.st.layers() if M.kind == "figure" and M.key != L.key and self.st.protect.get(M.name, True)]
         ptxt = (f"  Protected (never painted): {', '.join(prot)}." if prot and L.kind in ("figure", "water") else "")
         t = self.tool
-        if t in ("smart", "brush", "erase", "lasso") and L.has_mask:
+        if t in MASK_TOOLS and L.has_mask:
             sub = self.sub.get() or self._alt or t == "erase"
-            verb = "SUBTRACT from" if sub else "ADD to"
-            how = {"smart": "click it, or drag over a sample. Alt-click removes.",
+            verb = ("NOT-stroke for" if sub else "KEEP-stroke for") if t == "cut" else ("SUBTRACT from" if sub else "ADD to")
+            how = {"cut": "paint a stroke ON it; Alt-paint (or Subtract) on what it ISN'T — the face, sky, ground. "
+                          "Each stroke refines the cut.",
+                   "smart": "click it, or drag over a sample. Alt-click removes.",
                    "brush": f"paint (size {self.brush_r}; [ ] to change).", "erase": f"paint it away (size {self.brush_r}).",
                    "lasso": "click around it, double-click or Enter to finish."}[t]
             self.status.set(f"{dict((a, b) for a, b, _ in TOOLS)[t]} · {verb} “{name}” ({kind}) — {how}{ptxt}")
@@ -843,6 +965,11 @@ class StudioTab(tk.Frame):
             what = "shore" if L.kind == "water" and L.obj.mode == J.W_OCEAN else "flow"
             self.status.set(f"{what.title()} line on “{name}” — click along the {what}, double-click or Enter to finish. "
                             + ("Waves run to it." if what == "shore" else "The river runs along it, first point upstream."))
+        elif t == "hips" and L.kind == "sway":
+            self.status.set(f"Hips under “{name}” — drag the pink points onto her: waist, widest hip, each leg's two "
+                            "edges at the hem, between the legs. The skirt can't swing in through it; behind the "
+                            "skirt inside it you see skirt or leg, outside it the scene. The white dashed area round the "
+                            "point between the legs never shows skin: a white polka-dot bikini bottom shows there.")
         elif t == "guide" and L.kind == "sway":
             self.status.set({"hair": f"Lock stroke on “{name}” — drag from where the lock is tied to its tip. Each stroke = one lock.",
                              "cloth": (f"Folds on “{name}” — click on each fold line to split the pleats there (optional)."
@@ -988,13 +1115,13 @@ class StudioTab(tk.Frame):
                                       initialvalue=self.st.unique_name(names[what])) or names[what]
         if what == "figure":
             key = self.st.add_figure(name)
-            self.tool = "smart"
+            self.tool = "cut"
         elif what == "water":
             key = self.st.add_water(name, J.W_STILL)
-            self.tool = "smart"
+            self.tool = "cut"
         else:
             key = self.st.add_sway(what, name)
-            self.tool = "smart"
+            self.tool = "cut"
         if key is None:
             messagebox.showinfo("Full", "That's the most of that kind the Core2 can play.", parent=self)
             return
@@ -1007,8 +1134,8 @@ class StudioTab(tk.Frame):
             L = self.st.layer()
             hs = [h[0] for h in self._handles(L)]
             if L.has_mask:
-                if self.tool not in ("smart", "brush", "erase", "lasso") + tuple(hs):
-                    self.tool = "smart"
+                if self.tool not in MASK_TOOLS + tuple(hs):
+                    self.tool = "cut"
             else:
                 self.tool = hs[0] if hs else "smart"
             self.st.ed.armed = -1
@@ -1040,7 +1167,7 @@ class StudioTab(tk.Frame):
             if M is not None:
                 self.st.set_active(M.key)
                 hs = [h[0] for h in self._handles(M)]
-                self.tool = "smart" if M.has_mask else (hs[0] if hs else "smart")
+                self.tool = "cut" if M.has_mask else (hs[0] if hs else "smart")
                 break
         self._refresh_all()
 
@@ -1067,7 +1194,7 @@ class StudioTab(tk.Frame):
 
     def set_tool(self, t):
         L = self.st.layer()
-        if t in ("smart", "brush", "erase", "lasso") and not L.has_mask:
+        if t in MASK_TOOLS and not L.has_mask:
             return
         if t == "grid" and not self.st.par.grid:
             self.st.grid_default()
@@ -1116,7 +1243,8 @@ class StudioTab(tk.Frame):
     def set_zoom(self, z):
         self.zoom = z
         self.canvas.configure(width=J.IMG_W * z, height=J.IMG_H * z)
-        self.status_lbl.configure(wraplength=J.IMG_W * z + 120)
+        self.status_lbl.configure(wraplength=max(560, J.IMG_W * z))
+        self.hint_lbl.configure(wraplength=max(560, J.IMG_W * z))
         self._img_item = None
         self.canvas.delete("all")
         self._refresh_all()
@@ -1182,6 +1310,15 @@ class StudioTab(tk.Frame):
             self._pts.append((x, y))
             self._render()
             return
+        if t == "hips" and L.kind == "sway" and L.obj.kind == "cloth":
+            pts = self.st.hips()
+            if pts:
+                i = min(range(len(pts)), key=lambda i: (pts[i][0] - x) ** 2 + (pts[i][1] - y) ** 2)
+                if (pts[i][0] - x) ** 2 + (pts[i][1] - y) ** 2 <= (14 / self.zoom * 2) ** 2:
+                    self.st.set_hip(i, x, y, True)
+                    self._drag = ("hip", i)
+                    self._changed(soft=True)
+            return
         if t == "guide" and L.kind == "sway":
             if L.obj.kind == "hair":
                 self._pts = [(x, y)]
@@ -1205,9 +1342,20 @@ class StudioTab(tk.Frame):
         if not L.has_mask:
             return
         sub = self._subtracting(e)
+        if t == "cut":                                  # a stroke on it (keep) or on what it isn't (not)
+            c = self._cut
+            if c is None or c["key"] != L.key:
+                c = self._cut = {"key": L.key, "keep": np.zeros((J.IMG_H, J.IMG_W), bool), "not": np.zeros((J.IMG_H, J.IMG_W), bool)}
+            self._marks = np.zeros((J.IMG_H, J.IMG_W), bool)
+            J.mask_brush(self._marks, int(x), int(y), 1, True)
+            self._last_xy = (x, y)
+            self._drag = ("cut", sub)
+            self._render()
+            return
         if t == "smart":
             self._marks = np.zeros((J.IMG_H, J.IMG_W), bool)
             J.mask_brush(self._marks, int(x), int(y), 2, True)
+            self._last_xy = (x, y)
             self._drag = ("smart", sub)
             self._render()
         elif t in ("brush", "erase"):
@@ -1233,11 +1381,19 @@ class StudioTab(tk.Frame):
         elif k == "feet":
             self.st.set_feet(x, y, False)
             self._changed(soft=True)
+        elif k == "hip":
+            self.st.set_hip(self._drag[1], x, y, False)
+            self._changed(soft=True)
         elif k == "stroke":
             self._pts.append((x, y))
             self._render()
-        elif k == "smart":
-            J.mask_brush(self._marks, int(x), int(y), 2, True)
+        elif k in ("smart", "cut"):                    # (a stroke, not dots: fast drags skip pixels)
+            r = 2 if k == "smart" else (2 if self._drag[1] else 1)
+            lx, ly = self._last_xy or (x, y)
+            n = int(max(abs(x - lx), abs(y - ly))) + 1
+            for i in range(n + 1):
+                J.mask_brush(self._marks, int(lx + (x - lx) * i / n), int(ly + (y - ly) * i / n), r, True)
+            self._last_xy = (x, y)
             self._render()
         elif k == "paint":
             self.st.brush(x, y, self.brush_r, erase=self._drag[1], start=False)
@@ -1247,7 +1403,18 @@ class StudioTab(tk.Frame):
         if not self._drag:
             return
         k = self._drag[0]
-        if k == "smart":
+        if k == "cut":
+            c = self._cut
+            c["not" if self._drag[1] else "keep"] |= self._marks
+            c["keep"] &= ~c["not"]
+            self._marks = None
+            if c["keep"].any():
+                n = self.st.cut(c["keep"], c["not"] if c["not"].any() else None)
+                self._hint(f"Cut out: {n} px changed.  Paint more on it, or Alt / Subtract-paint on what it isn't "
+                           "(the face next to hair, the ground between feet) — every stroke refines the same cut.")
+            else:
+                self._hint("Now paint a stroke ON it (the not-strokes only say what it isn't).")
+        elif k == "smart":
             n = self.st.smart(self._marks, add=not self._drag[1])
             self._marks = None
             self._hint(f"{'Removed' if self._drag[1] else 'Added'} {n} px.  Tighter / Looser step it; Refine edges snaps it."
@@ -1313,7 +1480,7 @@ class StudioTab(tk.Frame):
 
     def _key_tool(self, t):
         L = self.st.layer()
-        if t in ("smart", "brush", "erase", "lasso"):
+        if t in MASK_TOOLS:
             self.set_tool(t)
         elif t in [h[0] for h in self._handles(L)]:
             self.set_tool(t)
@@ -1367,6 +1534,8 @@ class StudioTab(tk.Frame):
         self._hint("Hair / cloth / pendants are in the preview.")
 
     def _preview_toggled(self):
+        if hasattr(self, "prev_btn"):
+            self._paint_preview_bar()
         if self.preview.get():
             self._restart_sim()
         else:
@@ -1458,8 +1627,13 @@ class StudioTab(tk.Frame):
                     continue
                 a = 0.45 if L.key == self.st.active else 0.18
                 img[m] = (img[m] * (1 - a) + np.array(_hex(self.st.color(L))) * a).astype(np.uint8)
+        c = self._cut
+        if c is not None and c["key"] == self.st.active and not self.preview.get() and self.tool == "cut":
+            img[c["keep"]] = _hex(LIME)
+            img[c["not"]] = (255, 70, 70)
         if self._marks is not None:
-            img[self._marks] = (255, 230, 0)
+            red = self._drag is not None and self._drag[0] == "cut" and self._drag[1]
+            img[self._marks] = (255, 70, 70) if red else ((180, 255, 0) if self.tool == "cut" else (255, 230, 0))
         return img
 
     def _render(self):
@@ -1507,9 +1681,10 @@ class StudioTab(tk.Frame):
         k, c = self.zoom, self.canvas
         y0, y1 = hz
         if -20 < (y0 + y1) / 2 < J.IMG_H + 20:
-            c.create_line(0, y0 * k, J.IMG_W * k, y1 * k, fill=YEL, dash=(6, 4), width=1 if dim else 2, tags="ov")
-            if not dim:
-                self._tag(6, y0 * k - 12, "HORIZON — where the ground grid meets the sky", YEL)
+            c.create_line(0, y0 * k, J.IMG_W * k, y1 * k, fill=YEL, dash=(6, 4), width=1, tags="ov")
+            L = self.st.layer()
+            if not dim and (L.kind in ("ground", "sky") or self.tool == "grid"):
+                self._tag(J.IMG_W * k - 6, y1 * k - 10, "horizon", YEL, anchor="e")
 
     def _draw_handles(self):
         c, k, st = self.canvas, self.zoom, self.st
@@ -1540,38 +1715,48 @@ class StudioTab(tk.Frame):
                 c.create_line((fx - 18) * k, fy * k, (fx + 18) * k, fy * k, fill=YEL, width=3, tags="ov")
                 if on:
                     self._tag((fx + 20) * k, fy * k, "feet line ◆", YEL)
-            if M.key not in st.hidden:
-                self._tag(xs.max() * k + 6, ys.min() * k + 8, f"{M.name}" + ("  (active)" if on else ""), col)
-        for M in st.layers():                               # other masks: their names
-            if M.kind in ("water", "sway") and M.mask is not None and M.mask.any() and M.key not in st.hidden:
-                ys, xs = np.nonzero(M.mask)
-                i = len(ys) // 2
-                self._tag(xs[i] * k, ys[i] * k, M.name + ("  (active)" if M.key == st.active else ""), st.color(M))
+            if on and M.key not in st.hidden:
+                self._tag(xs.max() * k + 6, ys.min() * k + 8, f"{M.name} · Figure", col)
+        A = st.layer()                                      # the active water / sway: its name
+        if A.kind in ("water", "sway") and A.mask is not None and A.mask.any() and A.key not in st.hidden:
+            ys, xs = np.nonzero(A.mask)
+            self._tag(xs.max() * k + 6, ys.min() * k + 8, f"{A.name} · {SM.KIND_LABEL[A.kind]}", st.color(A))
         for M in st.layers():                               # water lines
             if M.kind == "water" and M.obj.lines and M.obj.mode != J.W_STILL:
                 for ln in M.obj.lines:
                     if len(ln) >= 2:
                         pts = [v * k for p in ln for v in p]
                         c.create_line(*pts, fill="#ffffff", width=3, tags="ov")
-                        what = "SHORE LINE — waves break here" if M.obj.mode == J.W_OCEAN else "FLOW LINE — runs this way"
-                        self._tag(ln[-1][0] * k + 6, ln[-1][1] * k, what, "#ffffff")
+                        if M.key == st.active:
+                            self._tag(ln[-1][0] * k + 6, ln[-1][1] * k, "shore" if M.obj.mode == J.W_OCEAN else "flow", "#ffffff")
                         if M.obj.mode == J.W_RIVER:
                             (ax, ay), (bx, by) = ln[-2], ln[-1]
                             c.create_line(ax * k, ay * k, bx * k, by * k, fill="#ffffff", width=3, arrow="last", tags="ov")
-        for M in st.layers():                               # sway guides
-            if M.kind != "sway":
+        if L.kind == "sway" and L.obj.kind == "cloth" and (self.tool == "hips" or L.key == st.active):
+            pts = st.hips()                                 # her hips under the skirt
+            if pts:
+                on = self.tool == "hips"
+                flat = [v * k for p in pts for v in p]
+                c.create_line(*flat, *flat[:2], fill="#ff6fae" if on else "#a0587a", width=2 if on else 1, dash=() if on else (3, 3), tags="ov")
+                if on:
+                    q = SW.bikini_poly(pts)                 # (safety: never skin here - a white bikini bottom)
+                    fq = [v * k for p in q for v in p]
+                    c.create_line(*fq, *fq[:2], fill="#ffffff", dash=(2, 2), width=1, tags="ov")
+                    for i, (x, y) in enumerate(pts):
+                        c.create_oval(x * k - 5, y * k - 5, x * k + 5, y * k + 5, fill="#000", outline="#ff6fae", width=2, tags="ov")
+        for M in st.layers():                               # sway guides (the active one's)
+            if M.kind != "sway" or M.key != st.active:
                 continue
             for gl in M.obj.guides:
                 if M.obj.kind == "pendant":
                     x, y = gl[0]
                     c.create_oval(x * k - 6, y * k - 6, x * k + 6, y * k + 6, outline=YEL, width=2, tags="ov")
-                    self._tag(x * k + 9, y * k, "pin", YEL)
+                    pass
                 elif len(gl) >= 2:
                     pts = [v * k for p in gl for v in p]
                     c.create_line(*pts, fill=YEL, width=2, arrow="last" if M.obj.kind == "hair" else "none", tags="ov")
                     c.create_oval(gl[0][0] * k - 4, gl[0][1] * k - 4, gl[0][0] * k + 4, gl[0][1] * k + 4, fill=YEL, outline="#000", tags="ov")
-                    if M.key == st.active:
-                        self._tag(gl[0][0] * k + 8, gl[0][1] * k - 8, "root ● stays" if M.obj.kind == "hair" else "waistband", YEL)
+
         for i, z in enumerate(st.ed.zones):                 # jiggle zones
             col = LIME
             sel = L.kind == "jiggle" and L.index == i
@@ -1588,7 +1773,8 @@ class StudioTab(tk.Frame):
                 tx, ty = z.tip_xy()
                 rr = max(3.0, z.tip_radius() * z.r) * k
                 c.create_oval(tx * k - rr, ty * k - rr, tx * k + rr, ty * k + rr, outline=YEL if sel else col, width=1, tags="ov")
-            self._tag(z.cx * k, (z.cy - z.r) * k - 10, SM.Layer("jiggle", i, z).name, col, anchor="center")
+            if sel:
+                self._tag(z.cx * k, (z.cy - z.r) * k - 10, SM.Layer("jiggle", i, z).name, col, anchor="center")
         if self._pts:                                       # lasso / line / stroke in progress
             pts = [v * k for p in self._pts for v in p]
             if len(pts) >= 4:

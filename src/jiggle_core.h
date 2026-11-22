@@ -35,7 +35,7 @@ enum Material : uint8_t { MAT_SOFT = 0, MAT_NATURAL = 1, MAT_FIRM = 2, MAT_COUNT
 static constexpr int   IMG_W = 320;
 static constexpr int   IMG_H = 240;
 static constexpr int   MAX_ZONES = 4;
-static constexpr float R_MIN = 10.0f;
+static constexpr float R_MIN = 6.0f;
 static constexpr float R_MAX = 150.0f;
 static constexpr float R_DEFAULT = 45.0f;
 static constexpr float BBOX_K = 1.13f;     // every shape fits inside radius 1.12 (local units)

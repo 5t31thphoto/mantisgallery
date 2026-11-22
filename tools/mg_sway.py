@@ -32,12 +32,23 @@ import numpy as np
 W, H = 320, 240
 SWAY_MAX = 4
 GUIDE_MAX = 6
+GUIDE_PTS = 16
+# The hips under a skirt: an outline you line up with her. Points, in order round it:
+#   0 waist L · 1 hip L · 2 left leg outer (at the hem) · 3 left leg inner · 4 between the legs ·
+#   5 right leg inner · 6 right leg outer · 7 hip R · 8 waist R
+HIP_POINTS = 9
+HIP_NAMES = ("waist", "hip", "leg", "leg", "crotch", "leg", "leg", "hip", "waist")
 SR_MAX = 9                           # rods (cloth: fold lines, ≤ 8 panels)
 KINDS = ("hair", "cloth", "pendant")
 DT = 1.0 / 120.0
 BEND_MAX = math.radians(55)         # a joint bends at most this far past its bend in the photo
 ON_BODY_REVEAL = 0.3                # lying on the body: it moves at most this × its half width (the fill there is a guess)
-FREE_SWING = math.radians(40)       # hanging free: at most about this far round from its pin
+BIND_MAX = 12.0                     # hair farther than this from every lock isn't carried (it stays)
+EXT_MAX = 6.0                       # a lock's strip runs at most this far past its tip
+FREE_SWING = math.radians(30)       # hanging free: at most about this far round from its pin
+CLOTH_HOLD = 0.1                    # a skirt holds its shape by gravity: its pull to the photo's pose scales with
+                                    # how much of gravity still points down the picture (fabric's own stiffness: this floor)
+CLOTH_SWING = math.pi               # a skirt: no limit - turned upside down it falls right up (only her hips stop it)
 G_PX = 1500.0                       # gravity, px/s² (a 60 px lock swings about once in 1.25 s)
 #          key       label                          lo   hi   default
 SPARAMS = [("swing", "Swing", 0.0, 2.5, 1.0),
@@ -46,8 +57,8 @@ SPARAMS = [("swing", "Swing", 0.0, 2.5, 1.0),
            ("pleat", "Pleat depth (cloth)", 1.0, 2.5, 1.5)]
 SDEF = {p[0]: p[4] for p in SPARAMS}
 KIND = {  # damping 1/s, jolt lag px/s² per g, breeze px/s², gain on the change in "down", friction on the body
-    "hair": dict(c=2.0, j=900.0, wind=110.0, gain=0.9, mu=0.3),
-    "cloth": dict(c=3.2, j=650.0, wind=70.0, gain=0.6, mu=0.2),
+    "hair": dict(c=4.5, j=500.0, wind=110.0, gain=0.9, mu=0.3),
+    "cloth": dict(c=3.4, j=450.0, wind=70.0, gain=1.0, mu=0.0),
     "pendant": dict(c=0.9, j=1100.0, wind=15.0, gain=1.0, mu=0.0),
 }
 
@@ -60,13 +71,14 @@ class Sway:
     prm: dict = field(default_factory=dict)
     name: str = ""                          # the Studio's layer name
     on: str = ""                            # the figure it rests on / collides with (its layer name)
+    arm: list = field(default_factory=list)  # cloth: her hips under it, lined up by you (HIP_POINTS points; [] = fitted)
 
     def get(self, k):
         return self.prm.get(k, SDEF[k])
 
     def copy(self):
         return Sway(self.kind, None if self.mask is None else self.mask.copy(), [list(g) for g in self.guides], dict(self.prm),
-                    self.name, self.on)
+                    self.name, self.on, [tuple(p) for p in self.arm])
 
     def ok(self):
         if self.mask is None or self.mask.sum() < 12 or not self.guides:
@@ -103,6 +115,272 @@ def body_sdf(body):
     out = edt(body)            # outside: distance to the body
     ins = edt(~body)           # inside: distance to the outside
     return np.where(body, -ins + 0.5, out - 0.5).astype(np.float32)
+
+
+def neck_row(body, hair=None):
+    """The row of the neck: the narrowest the figure gets between the top of its head and the
+    shoulders (the widest row in its upper part). Hair is counted as not figure. None if unclear."""
+    if body is None:
+        return None
+    b = np.asarray(body, bool) & ~(np.asarray(hair, bool) if hair is not None else False)
+    rows = np.nonzero(b.any(1))[0]
+    if len(rows) < 20:
+        return None
+    top, bot = rows.min(), rows.max()
+    h = bot - top
+    wd = np.array([b[y].sum() for y in range(top, bot + 1)], float)
+    up = int(h * 0.45)
+    if up < 8:
+        return None
+    sh = int(np.argmax(wd[:up]))                         # the shoulders: widest in the upper part
+    if sh < 4:
+        return None
+    head = wd[:sh]
+    hw = head[: max(2, sh // 3)].max()                  # how wide the head is
+    for i in range(max(2, sh // 3), sh):                 # the neck: where it's narrowest under the head
+        if wd[i] <= 0.8 * hw and wd[i] == head[max(2, sh // 3):sh].min():
+            return int(top + i)
+    return int(top + max(2, sh // 3) + int(np.argmin(head[max(2, sh // 3):sh])))
+
+
+def suggest_locks(mask, body=None, spacing=10.0):
+    """Lock strokes for a hair selection, root → tip, the way you'd draw them: the hair is split into its
+    separate falls (left of the face, right of it, behind…); each gets one lock per ~`spacing` px of its
+    width, traced up from its lowest point through the middle of its strand, row by row. body: the
+    figure it's on - a lock starts at the neck's height (where hair leaves the head and hangs; above
+    that it lies on the head and stays put)."""
+    from scipy.ndimage import label
+    m = np.asarray(mask, bool)
+    neck = neck_row(body, m)
+    lab, n = label(m)
+    locks = []
+    for c in range(1, n + 1):
+        part = lab == c
+        if part.sum() < 30:
+            continue
+        ys, xs = np.nonzero(part)
+        y0, y1 = ys.min(), ys.max()
+        if y1 - y0 < 8:
+            continue
+        # the strand's width a third of the way up from its tips: how many locks it gets
+        yb = int(y1 - (y1 - y0) * 0.33)
+        row = np.nonzero(part[yb])[0]
+        w = (row.max() - row.min() + 1) if len(row) else 4
+        k = int(max(1, min(GUIDE_MAX - len(locks), round(w / spacing))))
+        if k <= 0:
+            break
+        lo, hi = (row.min(), row.max()) if len(row) else (xs.min(), xs.max())
+        for j in range(k):
+            fx = lo + (hi - lo) * (j + 0.5) / k
+            # from the tips up: start at the lowest pixel of the strand near fx
+            col = [y for y in range(y1, y0 - 1, -1) if part[y, int(round(fx))]]
+            yy = col[0] if col else y1
+            x = fx; pts = [(x, float(yy))]
+            off = (fx - (lo + hi) / 2) / max(1.0, (hi - lo) / 2)      # where across the strand (−1..1)
+            for y in range(yy - 1, y0 - 1, -1):
+                r = np.nonzero(part[y])[0]
+                if not len(r):
+                    break
+                # the run nearest x, and the same place across it
+                runs = np.split(r, np.nonzero(np.diff(r) > 1)[0] + 1)
+                run = min(runs, key=lambda q: min(abs(q[0] - x), abs(q[-1] - x)))
+                a, b = run[0], run[-1]
+                if abs((a + b) / 2 - x) > 6 and not (a <= x <= b):
+                    break
+                nx = (a + b) / 2 + off * (b - a) / 2 * 0.8
+                x = x + max(-1.5, min(1.5, nx - x))
+                pts.append((x, float(y)))
+            pts = pts[::-1]
+            if neck is not None:                         # it hangs from where it leaves the head: the neck's
+                pts = [p for p in pts if p[1] >= neck] or pts[-2:]   # height (above that it lies on the head and stays)
+            if len(pts) < 4:
+                continue
+            step = max(1, len(pts) // 12)
+            pl = pts[::step]
+            if pl[-1] != pts[-1]:
+                pl.append(pts[-1])
+            locks.append([(round(px, 1), round(py, 1)) for px, py in pl[:GUIDE_PTS]])
+            if len(locks) >= GUIDE_MAX:
+                return locks
+    return locks
+
+
+def fit_hips(skirt, body=None, waist=None):
+    """The hips' outline fitted to a skirt (and her legs under its hem): a start for you to line up.
+    Points as HIP_POINTS says."""
+    sk = np.asarray(skirt, bool)
+    ys = np.nonzero(sk.any(1))[0]
+    if not len(ys):
+        return []
+    top, bot = int(ys.min()), int(ys.max())
+    if waist is not None and len(waist) >= 2:                 # (the waistband you set: its two ends)
+        (wa, ty_a), (wb, ty_b) = sorted([tuple(waist[0]), tuple(waist[1])])
+        top = int(round(min(ty_a, ty_b)))
+    else:
+        r0 = np.nonzero(sk[top:top + max(2, (bot - top) // 10)].any(0))[0]
+        wa, wb = float(r0.min()), float(r0.max())
+    xa, xb = np.nonzero(sk.any(0))[0][[0, -1]]
+    bd = np.asarray(body, bool) if body is not None else np.zeros_like(sk)
+    legs = bd & ~sk
+    cols = np.zeros(W, bool)
+    for y in range(bot + 1, min(H, bot + 8)):
+        cols[max(0, xa - 2):min(W, xb + 3)] |= legs[y, max(0, xa - 2):min(W, xb + 3)]
+    runs = np.split(np.nonzero(cols)[0], np.nonzero(np.diff(np.nonzero(cols)[0]) > 1)[0] + 1) if cols.any() else []
+    runs = sorted([r for r in runs if len(r) >= 2], key=len)[-2:]
+    runs = sorted(runs, key=lambda r: r[0])
+    c, w = (wa + wb) / 2, wb - wa
+    if len(runs) == 2:
+        lo, li, ri, ro = float(runs[0][0]), float(runs[0][-1]), float(runs[1][0]), float(runs[1][-1])
+    elif len(runs) == 1:
+        lo, ro = float(runs[0][0]), float(runs[0][-1])
+        li = ri = (lo + ro) / 2
+    else:
+        lo, ro = c - w * 0.4, c + w * 0.4
+        li, ri = c - w * 0.05, c + w * 0.05
+    # body proportions: the hip line about 0.4 waist-widths under the waist, the point between the legs
+    # about 0.85 (well above the hem of anything knee-length)
+    yh = min(top + w * 0.4, top + (bot - top) * 0.45)
+    hl, hr = min(wa, lo) - w * 0.06, max(wb, ro) + w * 0.06
+    yc = min(top + w * 0.85, bot - 2.0)
+    return [(wa, float(top)), (hl, yh), (lo, float(bot)), (li, float(bot)), ((li + ri) / 2, yc),
+            (ri, float(bot)), (ro, float(bot)), (hr, yh), (wb, float(top))]
+
+
+def bikini_zone(pts):
+    """Safety: the bikini area of the hips' outline - round the point between the legs (node 4), from a
+    little above it down past it, as wide as the gap between the legs and a bit more. Wherever a skirt
+    swinging away would show skin there, it shows a white bikini bottom instead (with pink polka dots).
+    Returns (H, W) bool."""
+    from PIL import Image, ImageDraw
+    m = Image.new("L", (W, H), 0)
+    if len(pts) == HIP_POINTS:
+        q = bikini_poly(pts)
+        ImageDraw.Draw(m).polygon(q, fill=1)
+    return np.asarray(m, bool)
+
+
+def bikini_poly(pts):
+    """A bikini bottom on the hips' outline: its top edge low across the hips (at the hip line, the
+    full width of the outline there), the sides curving in like leg openings, down to a narrow panel
+    just past the point between the legs (node 4)."""
+    (w0x, w0y), (h0x, h0y), (l0x, l0y), (lix, liy), (cx, cy), (rix, riy), (r0x, r0y), (h1x, h1y), (w1x, w1y) = pts
+    hy = (h0y + h1y) / 2
+    ty = hy + 0.1 * max(2.0, cy - hy)                  # its top: just under the hip line
+    def side(ax, ay, bx, by):                          # the outline's x at height ty, along a side
+        return ax + (bx - ax) * ((ty - ay) / (by - ay) if by != ay else 0.0)
+    xl = side(h0x, h0y, l0x, l0y) + 1.0
+    xr = side(h1x, h1y, r0x, r0y) - 1.0
+    gap = max(3.0, rix - lix)
+    by = cy + 0.5                                      # down to the point between the legs
+    wb = min(gap * 0.3 + 1.0, 3.0)                     # the narrow panel there
+    left, right = [], []
+    for k in range(6):                                 # leg openings: steep at first, then in
+        t = k / 5
+        y = ty + (by - ty) * t
+        f = (1 - t) ** 1.6
+        left.append((cx - wb - (cx - wb - xl) * f, y))
+        right.append((cx + wb + (xr - cx - wb) * f, y))
+    return left + right[::-1]
+
+
+def bikini_color(x, y):
+    """White, with small pink polka dots on a 6 px grid."""
+    gx, gy = (x % 6) - 2.5, (y % 6) - 2.5
+    return (255.0, 150.0, 190.0) if gx * gx + gy * gy <= 2.0 else (238.0, 238.0, 238.0)
+
+
+def hips_mask(pts):
+    """Her body under the skirt: the hips' outline filled (and the legs straight down from it)."""
+    from PIL import Image, ImageDraw
+    m = Image.new("L", (W, H), 0)
+    if len(pts) == HIP_POINTS:
+        ImageDraw.Draw(m).polygon([(float(x), float(y)) for x, y in pts], fill=1)
+    return np.asarray(m, bool)
+
+
+def is_skin(px):
+    """Skin-coloured (YCbCr box, Chai & Ngan 1999), for (..., 3) RGB float."""
+    px = np.asarray(px, np.float32)
+    r, g, b = px[..., 0], px[..., 1], px[..., 2]
+    cr = 128 + 0.5 * r - 0.4187 * g - 0.0813 * b
+    cb = 128 - 0.1687 * r - 0.3313 * g + 0.5 * b
+    return (cr >= 136) & (cr <= 173) & (cb >= 77) & (cb <= 124) & (r > g) & (r > b + 10)
+
+
+def skin_tone(photo, legs, body, above=None):
+    """Her skin colour: the skin-coloured pixels of her arms, shoulders and face (above `above`, the
+    skirt's top: never the ground a loose mask took in), else of her legs, else a default."""
+    img = np.asarray(photo, np.float32)
+    cands = []
+    if body is not None and body.any():
+        b = np.asarray(body, bool).copy()
+        if above is not None:
+            b[int(above):] = False
+        cands.append(b)
+    if legs is not None:
+        cands.append(np.asarray(legs, bool))
+    for m in cands:
+        if m.any():
+            px = img[m]
+            px = px[is_skin(px)]
+            if len(px) >= 12:
+                return np.median(px, 0)
+    return np.array([224.0, 172.0, 140.0], np.float32)
+
+
+def cloth_fill(photo, hole, forbid, skirt=None, body=None, hips=None):
+    """Behind a skirt, as it really is behind one (object permanence) - so it can swing, fly or fall
+    right up (turned upside down) and what shows is always true:
+    - inside the hips' outline (lined up by you): her body. Her legs and thighs in her own skin, each
+      column carried up from her leg just under the hem (else her skin tone), rounded off darker toward
+      the outline; across her pelvis a white bikini bottom with pink polka dots (safety - always).
+    - beside her, inside the skirt's swing: the scene behind her (filled from the scene, never from her).
+    - the soft rings just outside the skirt: whatever is right next to them (leg, hand, scene)."""
+    img = np.asarray(photo, np.float32)
+    from scipy.ndimage import distance_transform_edt
+    hole = np.asarray(hole, bool)
+    _, (ny, nx) = distance_transform_edt(hole, return_indices=True)
+    out = img[ny, nx].copy()                                 # (the rings: what's right next to them)
+    if skirt is None or not skirt.any():
+        return out
+    sk = np.asarray(skirt, bool)
+    bd = np.asarray(body, bool) if body is not None else np.zeros_like(sk)
+    ys = np.nonzero(sk.any(1))[0]
+    top, bot = int(ys.min()), int(ys.max())
+    legs = bd & ~sk & ~hole
+    pts = hips if hips and len(hips) == HIP_POINTS else fit_hips(sk, bd)
+    inside = hips_mask(pts)
+    scene = hole & ~inside
+    rows = np.zeros_like(sk); rows[top:bot + 1] = True
+    scene &= rows & sk.any(0)[None, :]
+    if scene.any():                                          # beside her, inside its swing: the scene
+        filled = inpaint_em(img, scene, forbid=np.asarray(forbid, bool) | bd | inside | sk)
+        out[scene] = filled[scene]
+    under_hem = legs.copy(); under_hem[:bot + 1] = False; under_hem[min(H, bot + 12):] = False
+    tone = skin_tone(img, under_hem, bd, above=top)
+    inner = distance_transform_edt(inside)                   # (rounded: darker toward her outline)
+    biki = bikini_zone(pts)
+    bases = np.tile(tone, (W, 1)).astype(np.float32)
+    for x in range(W):                                       # each column: her leg's own shade under the hem
+        col = np.nonzero(inside[:, x] & hole[:, x])[0]
+        if len(col):
+            under = np.nonzero(legs[col.max() + 1:min(H, col.max() + 6), x])[0]
+            if len(under) and is_skin(img[col.max() + 1 + under[0], x]):
+                bases[x] = img[col.max() + 1 + under[0], x] * 0.6 + tone * 0.4
+    k = np.ones(7) / 7                                       # (smoothed across: skin, not stripes)
+    bases = np.stack([np.convolve(np.pad(bases[:, c], 3, mode="edge"), k, "valid") for c in range(3)], 1)
+    for x in range(W):
+        col = np.nonzero(inside[:, x] & hole[:, x])[0]
+        if not len(col):
+            continue
+        base = bases[x]
+        for y in col:
+            if biki[y, x]:
+                out[y, x] = bikini_color(x, y)
+                continue
+            d = inner[y, x]
+            out[y, x] = base * (0.82 if d < 1.5 else (0.92 if d < 3 else 1.0))
+    return out
 
 
 def rest_body(body, masks):
@@ -298,6 +576,9 @@ class SwaySim:
         self.body = body if body is not None else (self.sdf < 0 if self.sdf is not None else None)
         self.t = 0.0; self.acc = 0.0; self.awake = True; self.fade = 0.0
         {"hair": self._prep_hair, "cloth": self._prep_cloth, "pendant": self._prep_pendant}[sw.kind]()
+        if sw.kind == "cloth":                          # her hips under it: lined up by you, else fitted
+            self.arm = sw.arm if len(sw.arm) == HIP_POINTS else fit_hips(sw.mask, self.body, sw.guides[0] if sw.guides else None)
+            self.hipm, self.hipl, self.hipr = self.hips_rows(self.arm)
         if sw.kind != "pendant":                        # only what its rest mesh covers can move (or be uncovered)
             cov = np.full((H, W), -1, np.int32)
             for D, S_, oid, _, _ in self._mesh():
@@ -315,6 +596,8 @@ class SwaySim:
                 given = np.where(have[..., None], np.asarray(pimg, np.float32), self.photo)
         if given is not None:
             self.plate = given
+        elif sw.kind == "cloth":
+            self.plate = cloth_fill(self.photo, self.hole, fb, self.moving, self.body, self.arm)
         elif self.body is not None:                       # behind what lies on her is her; behind what hangs free is the scene
             onb = self.hole & self.body
             plate = inpaint_em(self.photo, self.hole & ~self.body, forbid=fb | self.body)
@@ -353,6 +636,7 @@ class SwaySim:
             self.rods.append(resample(g, max(4.0, L / 9), 12))
         dist = np.stack([bind(xs, ys, r)[0] for r in self.rods])
         own = dist.argmin(0)
+        own[dist.min(0) > BIND_MAX] = -1                   # (too far from every lock: it stays)
         self.owner = np.full((H, W), -1, np.int32)
         self.bs = np.zeros((H, W), np.float32); self.bd = np.zeros((H, W), np.float32)
         self.hw = []
@@ -374,7 +658,7 @@ class SwaySim:
                     pos, neg = Dm[near][Dm[near] > 0], -Dm[near][Dm[near] < 0]
                     lw[i] = max(2.0, float(np.percentile(pos, 95)) + 2.5) if len(pos) else 2.0
                     rw[i] = max(2.0, float(np.percentile(neg, 95)) + 2.5) if len(neg) else 2.0
-            ext = max(0.0, float(Sm.max() - cum[-1]) + 2.5) if len(Sm) else 2.5
+            ext = min(EXT_MAX, max(0.0, float(Sm.max() - cum[-1]) + 2.5)) if len(Sm) else 2.5
             self.hw.append((lw, rw, ext))
         self.moving = moving
         self.hole = grow1(grow1(grow1(moving)))
@@ -393,6 +677,16 @@ class SwaySim:
             self.cap.append(np.where(self.on_body[k], np.minimum(onb, free), free))
 
     # .. cloth: guides from the waistband at the fold lines, pleat panels between them
+    def hips_rows(self, pts):
+        """Per row: the hips' left and right edge (−1 where none) - what the skirt's edges can't go inside."""
+        hm = hips_mask(pts)
+        hl = np.full(H, -1.0); hr = np.full(H, -1.0)
+        for y in range(H):
+            r = np.nonzero(hm[y])[0]
+            if len(r):
+                hl[y], hr[y] = r.min(), r.max()
+        return hm, hl, hr
+
     def _prep_cloth(self):
         m = self.s.mask
         (ax, ay), (bx, by) = self.s.guides[0][:2]
@@ -455,7 +749,7 @@ class SwaySim:
         self.hole = grow1(grow1(grow1(moving)))
         self.rest_sdf = [np.array([sdf_at(self.sdf, *p)[0] for p in r]) if self.sdf is not None else None for r in self.rods]
         self.on_body = [(rs <= 1.0) if rs is not None else np.zeros(len(r), bool) for rs, r in zip(self.rest_sdf, self.rods)]
-        self.cap = [np.array(ts) * 2.0 * math.sin(FREE_SWING / 2) + 1e-3 for _ in self.rods]
+        self.cap = [np.array(ts) * 2.0 * math.sin(CLOTH_SWING / 2) + 1e-3 for _ in self.rods]
         # round the body: each row's axis, radius (its edges ~70° round) and each fold line's angle
         e = np.array([ex, ey]); self.cyl = [None]
         for j in range(1, nr + 1):
@@ -538,7 +832,7 @@ class SwaySim:
             if v < 1.0:                         # into the body: back out along the gradient
                 x[i, 0] += (1.0 - v) * gx; x[i, 1] += (1.0 - v) * gy
 
-    def _rods_step(self, fx, fy, wind, damp_k):
+    def _rods_step(self, fx, fy, wind, damp_k, hold=1.0):
         K, h = self.K, DT
         damp = 1.0 - K["c"] * damp_k * h
         stiff = self.s.get("stiff")
@@ -552,10 +846,10 @@ class SwaySim:
             wdir = e if cloth else (-(r[-1] - r[0])[1], (r[-1] - r[0])[0])
             wl = math.hypot(*wdir) or 1.0
             wk = np.linspace(0.3, 1.0, n)[:, None] * wind * np.array([wdir[0] / wl, wdir[1] / wl])
-            a = np.array([fx, fy]) + kn[:, None] * (r - x) + wk
+            a = np.array([fx, fy]) + (hold * kn)[:, None] * (r - x) + wk
             on = self.on_body[k]
             if K["mu"] > 0 and on.any():      # lying on the body: rubbing on it takes some of the push and slows it
-                ext = a - kn[:, None] * (r - x)
+                ext = a - (hold * kn)[:, None] * (r - x)
                 a[on] -= ext[on] * min(0.8, 1.5 * K["mu"])
                 xp[on] += (x[on] - xp[on]) * min(0.9, 8.0 * K["mu"] * h)
             new = x + (x - xp) * damp + a * h * h
@@ -573,12 +867,13 @@ class SwaySim:
                     v = r[i] - r[i - 1]
                     tgt = x[i - 1] + np.array([v[0] * cs - v[1] * sn, v[0] * sn + v[1] * cs])
                     x[i] += (tgt - x[i]) * (0.35 * stiff)
-            self._collide(k, x)
+            if not cloth:                                  # (a skirt hangs round her: it swings in front of
+                self._collide(k, x)                        # her legs, it doesn't collide with them)
             # follow the leader: every link exactly its length, from the root down - and no joint bends
             # more than BEND_MAX past its bend in the photo (a lock folds, but doesn't flip over itself)
             for i in range(1, len(x)):
                 d = x[i] - x[i - 1]; l = math.hypot(*d) or 1e-6
-                if i >= 2:
+                if i >= 2 and not cloth:               # (fabric has no bend limit: it folds right over)
                     pc = x[i - 1] - x[i - 2]; pr = r[i - 1] - r[i - 2]; rr = r[i] - r[i - 1]
                     rest_b = math.atan2(pr[0] * rr[1] - pr[1] * rr[0], pr[0] * rr[0] + pr[1] * rr[1])
                     now_b = math.atan2(pc[0] * d[1] - pc[1] * d[0], pc[0] * d[0] + pc[1] * d[1])
@@ -586,7 +881,9 @@ class SwaySim:
                     if abs(db) > BEND_MAX:
                         ang = math.atan2(pc[1], pc[0]) + rest_b + math.copysign(BEND_MAX, db)
                         d = np.array([math.cos(ang), math.sin(ang)]) * l
-                x[i] = x[i - 1] + d * (ln[i - 1] / l)
+                # fabric: a link never stretches but can foreshorten - a fold turning toward you or away
+                # (upside down the hem comes up in front of her, over the waist); hair keeps its exact length
+                x[i] = x[i - 1] + d * (min(1.0, ln[i - 1] / l) if cloth else ln[i - 1] / l)
             # what the fill can't make up limits how far it goes: lying on the body (nothing true to show
             # behind it), a node may leave its spot by a fraction of the lock's width; hanging free in
             # front of the scene, the swing is only capped at a wide angle
@@ -597,6 +894,23 @@ class SwaySim:
                 x[over] = r[over] + dd[over] * (cap[over] / dm[over])[:, None]
         if cloth:
             self._panels()
+            self._hips_collide()
+
+    def _hips_collide(self):
+        """The skirt's two edges can't swing in through her hips / thighs: an edge that hangs outside her
+        hip line in the photo stays outside it (the far side of a swing hugs her)."""
+        if not hasattr(self, "hipl"):
+            return
+        for k, side in ((0, -1), (len(self.x) - 1, 1)):
+            x, r = self.x[k], self.rest[k]
+            for j in range(1, len(x)):
+                yr, yc = int(round(r[j][1])), int(round(x[j][1]))
+                if not (0 <= yr < H and 0 <= yc < H):
+                    continue
+                if side < 0 and self.hipl[yr] >= 0 and r[j][0] <= self.hipl[yr] + 0.5 and self.hipl[yc] >= 0:
+                    x[j][0] = min(x[j][0], self.hipl[yc])
+                if side > 0 and self.hipr[yr] >= 0 and r[j][0] >= self.hipr[yr] - 0.5 and self.hipr[yc] >= 0:
+                    x[j][0] = max(x[j][0], self.hipr[yc])
 
     def _panels(self):
         """Pleats: neighbouring guides can't open past the panel's flat width or close past the fabric's
@@ -620,6 +934,16 @@ class SwaySim:
                 want = c + R * math.sin(psi[k] + th)
                 cur = float(x[j] @ e)
                 x[j] += (want - cur) * 0.5 * e
+        # one sheet: neighbouring fold lines move together (each pulled toward its neighbours' displacement)
+        # (the row as a whole keeps its shift: only how it's shared out between the folds evens up)
+        n = len(self.x)
+        for _ in range(2):
+            for j in range(1, len(self.x[0])):
+                d = [x[j] - r[j] for x, r in zip(self.x, self.rest)]
+                nd = [d[0]] + [d[k] + 0.5 * ((d[k - 1] + d[k + 1]) * 0.5 - d[k]) for k in range(1, n - 1)] + [d[-1]]
+                fix = (sum(d) - sum(nd)) / n
+                for k in range(n):
+                    self.x[k][j] = self.rest[k][j] + nd[k] + fix
         for k in range(len(self.x) - 1):
             A, B = self.x[k], self.x[k + 1]
             for j in range(1, len(A)):
@@ -671,8 +995,15 @@ class SwaySim:
             else:
                 g = sw * K["gain"]
                 fx = g * (G_PX * dn[0] - K["j"] * jolt[0])
-                fy = g * (G_PX * (dn[1] - m) - K["j"] * jolt[1])
-                self._rods_step(fx, fy, wind, damp_k)
+                hold = 1.0
+                if self.s.kind == "cloth":
+                    # the photo's pose is held up by her (waist, hips) only while gravity points down the
+                    # picture: that part of gravity is carried; the rest (sideways, upside down) pulls it
+                    hold = max(CLOTH_HOLD, dn[1])
+                    fy = g * (G_PX * min(0.0, dn[1]) - K["j"] * jolt[1])
+                else:
+                    fy = g * (G_PX * (dn[1] - m) - K["j"] * jolt[1])
+                self._rods_step(fx, fy, wind, damp_k, hold)
         if self.s.kind == "pendant":
             disp = abs(self.th) * self.tlen; vel = abs(self.th - self.thp) * self.tlen
         else:
@@ -932,6 +1263,8 @@ def format_lines(sways, body=None, plates=None):
         out.append(f"sway {sw.kind}" + (" " + kv if kv else "") + nm + on)
         for g in sw.guides[:GUIDE_MAX]:
             out.append("sguide " + " ".join(f"{int(round(x))},{int(round(y))}" for x, y in g[:16]))
+        if sw.kind == "cloth" and len(sw.arm) == HIP_POINTS:
+            out.append("sarm " + " ".join(f"{int(round(x))},{int(round(y))}" for x, y in sw.arm))
         out += _rows(sw.mask, "srow")
         if plates is not None and plates[i] is not None:
             img, hole = plates[i]
@@ -971,6 +1304,13 @@ def parse_lines(lines):
                     except ValueError:
                         pass
             cur = Sway(tok[1], np.zeros((H, W), bool), [], prm, nm, on); sways.append(cur); plates.append(None); tgt = "sway"
+        elif tok[0] == "sarm" and cur is not None and tgt == "sway":
+            try:
+                pts = [tuple(float(v) for v in p.split(",")) for p in tok[1:]]
+                if len(pts) == HIP_POINTS:
+                    cur.arm = pts
+            except ValueError:
+                pass
         elif tok[0] == "sguide" and cur is not None and tgt == "sway":
             try:
                 cur.guides.append([tuple(float(v) for v in p.split(",")) for p in tok[1:]])

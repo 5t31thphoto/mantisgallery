@@ -27,6 +27,7 @@
 #include "jiggle_grabcut.h"
 #include "jiggle_parallax.h"
 #include "jiggle_sway.h"
+#include <new>
 #include <SD.h>
 #if defined(ESP_PLATFORM)
 #include <freertos/FreeRTOS.h>
@@ -115,7 +116,7 @@ bool g_shown[MAX_ZONES];                 // screen currently shows this zone dis
 Water    g_wat[WATER_MAX];               // water regions
 int      g_nw = 0;
 uint32_t g_last_water = 0;
-Sway     g_sway[SWAY_MAX];               // hair, cloth, pendants
+Sway*    g_sway = nullptr;               // hair, cloth, pendants (SWAY_MAX of them, in PSRAM: begin())
 int      g_ns = 0;
 uint32_t g_last_sway = 0;
 uint8_t* g_body = nullptr;               // what they rest on (the Studio's "body" lines; else the depth figures)
@@ -1198,7 +1199,8 @@ float    e_pprm[PP_COUNT];
 bool     e_pgrid = false;               // the ground grid (Grid tool in depth mode)
 float    e_gq[8];
 const float DEPTHS[] = {0.15f, 0.3f, 0.5f, 0.7f, 0.9f};
-Sway     e_s[SWAY_MAX];                  // working copies of hair / cloth / pendants (masks and guides)
+Sway*    e_s = nullptr;                  // working copies of hair / cloth / pendants (PSRAM: begin())
+Sway*    e_sdflt = nullptr;              // (the dimmed guides one gets when none are drawn)
 int      e_ns = 0, e_si = -1;
 bool     e_smode = false;                // editing hanging things
 bool     e_stroke = false;               // a hair lock being drawn (root → tip, in e_px / e_py)
@@ -1573,7 +1575,8 @@ void e_tint_sways(M5Canvas& c) {
     }
     const Sway* h = e_sway();
     if (!h) return;
-    static Sway d;                                      // (none drawn yet: the ones it will get, dimmed)
+    if (!e_sdflt) return;
+    Sway& d = *e_sdflt;                                 // (none drawn yet: the ones it will get, dimmed)
     d = Sway();
     const Sway* g = h;
     bool dflt = false;
@@ -1975,6 +1978,20 @@ void e_close(bool save) {
             plane_copy_def(g_par.pl[g_par.n], e_p[k], water_alloc);
             ++g_par.n;
         }
+        for (int i = 0; i < g_ns; ++i) {                  // each figure carries its hair / cloth (nothing of her left behind)
+            const Sway& sw = g_sway[i];
+            if (!sw.mask || g_par.n == 0) continue;
+            int best = -1, bo = 0;
+            for (int k = 0; k < g_par.n; ++k) {
+                const Plane& pl = g_par.pl[k];
+                if (!pl.mask) continue;
+                if (sw.on[0] && strncmp(sw.on, pl.name, sizeof(pl.name)) == 0) { best = k; break; }
+                int o = 0;
+                for (int b = 0; b < MASK_BYTES; ++b) o += __builtin_popcount(pl.mask[b] & sw.mask[b]);
+                if (!sw.on[0] && o > bo) { bo = o; best = k; }
+            }
+            if (best >= 0) for (int b = 0; b < MASK_BYTES; ++b) g_par.pl[best].mask[b] |= sw.mask[b];
+        }
         prepare_sways();                                  // (they rest on the figures: after the planes)
         prepare_waters();
         save_zones();
@@ -2336,6 +2353,14 @@ void e_scale_button(Btn& b, uint32_t& next, int dir, uint32_t now) {
 // Public API
 // ================================================================================================
 bool begin() {
+    if (!g_sway) {                                     // (hair / cloth / pendants: ~7 KB each - PSRAM, not DRAM)
+        g_sway = (Sway*)alloc_psram(sizeof(Sway) * SWAY_MAX);
+        e_s = (Sway*)alloc_psram(sizeof(Sway) * SWAY_MAX);
+        e_sdflt = (Sway*)alloc_psram(sizeof(Sway));
+        if (!g_sway || !e_s || !e_sdflt) return false;
+        for (int i = 0; i < SWAY_MAX; ++i) { new (&g_sway[i]) Sway(); new (&e_s[i]) Sway(); }
+        new (e_sdflt) Sway();
+    }
     g_img.setColorDepth(16);
     g_img.setPsram(true);
     g_scratch.setColorDepth(16);

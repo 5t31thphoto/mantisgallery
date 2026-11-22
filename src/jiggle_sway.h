@@ -36,15 +36,19 @@ constexpr float SW_DT = 1.0f / 120.0f;
 constexpr float SW_G = 1500.0f;             // gravity, px/s²
 constexpr float SW_BEND = 0.95993109f;      // 55°
 constexpr float SW_ON_BODY = 0.3f;
-constexpr float SW_FREE = 0.6981317f;       // 40°
+constexpr float SW_FREE = 0.5235988f;       // 30°
+constexpr float SW_CLOTH_HOLD = 0.1f;        // a skirt holds its pose by gravity: its pull to the photo pose scales with how much gravity points down the picture
+constexpr float SW_CLOTH_FREE = 3.1415927f; // a skirt: no limit (upside down it falls right up; her hips stop it)
+constexpr float SW_BIND_MAX = 12.0f;        // hair farther than this from every lock isn't carried (it stays)
+constexpr float SW_EXT_MAX = 6.0f;          // a lock's strip runs at most this far past its tip
 
 enum SwayKind : uint8_t { SK_HAIR = 0, SK_CLOTH, SK_PENDANT, SK_COUNT };
 enum SParam : uint8_t { SP_SWING = 0, SP_BREEZE, SP_STIFF, SP_PLEAT, SP_COUNT };
 struct SwayKindInfo { const char* key; const char* label; float c, j, wind, gain, mu; };
 inline const SwayKindInfo& sway_kind_info(uint8_t k) {
     static const SwayKindInfo t[SK_COUNT] = {
-        {"hair", "Hair", 2.0f, 900.0f, 110.0f, 0.9f, 0.3f},
-        {"cloth", "Cloth", 3.2f, 650.0f, 70.0f, 0.6f, 0.2f},
+        {"hair", "Hair", 4.5f, 500.0f, 110.0f, 0.9f, 0.3f},
+        {"cloth", "Cloth", 3.4f, 450.0f, 70.0f, 1.0f, 0.0f},
         {"pendant", "Pendant", 0.9f, 1100.0f, 15.0f, 1.0f, 0.0f},
     };
     return t[k < SK_COUNT ? k : 0];
@@ -70,6 +74,10 @@ struct Sway {
     float    gx[SG_MAX][SG_PTS], gy[SG_MAX][SG_PTS];
     char     name[16] = {0}, on[16] = {0};    // the Studio's name; the figure it rests on
     int16_t  lax = -1, lay = -1, lbx = -1, lby = -1;   // (an older file's "hang" pin: its guides are made from it)
+    int      narm = 0;                        // cloth: her hips under it (the Studio's outline: kept, saved)
+    int16_t  armx[9] = {0}, army[9] = {0};
+    int16_t* hipl = nullptr;                  // runtime: per row, the hips' left / right edge (−1 none)
+    int16_t* hipr = nullptr;
     uint16_t* pdef = nullptr;                 // the Studio's fill (full frame, native RGB565) + which pixels it has
     uint8_t* pdef_has = nullptr;
     bool     pdef_ok = false;                 // (still matches the mask: saved back)
@@ -104,9 +112,10 @@ struct Sway {
 };
 
 inline void sway_free_runtime(Sway& s) {
-    void* bufs[] = {s.own, s.hole, s.alpha, s.plate, s.photo, s.texd, s.c8, s.t8};
+    void* bufs[] = {s.own, s.hole, s.alpha, s.plate, s.photo, s.texd, s.c8, s.t8, s.hipl, s.hipr};
     for (void* b : bufs) if (b) free(b);
     s.own = nullptr; s.hole = nullptr; s.alpha = nullptr; s.plate = s.photo = s.texd = nullptr; s.c8 = s.t8 = nullptr;
+    s.hipl = s.hipr = nullptr;
     s.ready = false;
 }
 inline void sway_free(Sway& s) {
@@ -126,6 +135,7 @@ inline void sway_copy_def(Sway& d, const Sway& s, void* (*alloc)(size_t)) {
     sway_free(d);
     d = Sway();
     d.kind = s.kind; memcpy(d.prm, s.prm, sizeof(d.prm));
+    d.narm = s.narm; memcpy(d.armx, s.armx, sizeof(d.armx)); memcpy(d.army, s.army, sizeof(d.army));
     d.ng = s.ng; memcpy(d.gn, s.gn, sizeof(d.gn)); memcpy(d.gx, s.gx, sizeof(d.gx)); memcpy(d.gy, s.gy, sizeof(d.gy));
     memcpy(d.name, s.name, sizeof(d.name)); memcpy(d.on, s.on, sizeof(d.on));
     if (s.mask && sway_ensure_mask(d, alloc)) memcpy(d.mask, s.mask, MASK_BYTES);
@@ -455,6 +465,7 @@ inline void sw_prep_hair(Sway& s, std::vector<int>& px_, std::vector<int>& py_) 
             sw_bind((float)px_[p], (float)py_[p], s.rx[k], s.ry[k], s.nn[k], d, Sk, Dk);
             if (d < best) { best = d; owner[p] = (int8_t)k; S[p] = Sk; D[p] = Dk; }
         }
+        if (best > SW_BIND_MAX) owner[p] = -1;            // (too far from every lock: it stays)
     }
     for (int p = 0; p < np; ++p) {                     // past the root: it moves
         if (owner[p] < 0 || S[p] <= 0.5f) continue;
@@ -487,7 +498,7 @@ inline void sw_prep_hair(Sway& s, std::vector<int>& px_, std::vector<int>& py_) 
             };
             s.lw[k][i] = p95(pos); s.rwd[k][i] = p95(neg);
         }
-        s.ext[k] = smax > -1e8f ? std::max(0.0f, smax - cum[n - 1] + 2.5f) : 2.5f;
+        s.ext[k] = smax > -1e8f ? std::min(SW_EXT_MAX, std::max(0.0f, smax - cum[n - 1] + 2.5f)) : 2.5f;
     }
 }
 
@@ -666,6 +677,36 @@ inline void sw_fill(Sway& s, const uint8_t* body, const uint8_t* fb, int16_t* nx
     }
 }
 
+// Safety: the bikini area of a skirt's hip outline (mg_sway.bikini_poly) - round the point between the
+// legs. Where the fill behind a swinging skirt would show skin there, a white bikini bottom with pink
+// polka dots shows instead.
+constexpr int SW_BIKINI_N = 12;
+inline bool sw_bikini_poly(const Sway& s, float* qx, float* qy) {   // (mg_sway.bikini_poly; SW_BIKINI_N points)
+    if (s.narm != 9) return false;
+    const float h0x = s.armx[1], h0y = s.army[1], l0x = s.armx[2], l0y = s.army[2], lix = s.armx[3];
+    const float cx = s.armx[4], cy = s.army[4], rix = s.armx[5], r0x = s.armx[6], r0y = s.army[6], h1x = s.armx[7], h1y = s.army[7];
+    const float hy = (h0y + h1y) / 2, ty = hy + 0.1f * std::max(2.0f, cy - hy);
+    auto side = [&](float ax, float ay, float bx, float by) { return ax + (bx - ax) * (by != ay ? (ty - ay) / (by - ay) : 0.0f); };
+    const float xl = side(h0x, h0y, l0x, l0y) + 1.0f, xr = side(h1x, h1y, r0x, r0y) - 1.0f;
+    const float gap = std::max(3.0f, rix - lix), by = cy + 0.5f, wb = std::min(gap * 0.3f + 1.0f, 3.0f);
+    for (int k = 0; k < 6; ++k) {
+        const float t = k / 5.0f, y = ty + (by - ty) * t, f = powf(1 - t, 1.6f);
+        qx[k] = cx - wb - (cx - wb - xl) * f; qy[k] = y;
+        qx[SW_BIKINI_N - 1 - k] = cx + wb + (xr - cx - wb) * f; qy[SW_BIKINI_N - 1 - k] = y;
+    }
+    return true;
+}
+inline bool sw_in_poly(const float* qx, const float* qy, int n, float x, float y) {
+    bool in = false;
+    for (int a = 0, b = n - 1; a < n; b = a++)
+        if ((qy[a] > y) != (qy[b] > y) && x < qx[a] + (y - qy[a]) * (qx[b] - qx[a]) / (qy[b] - qy[a])) in = !in;
+    return in;
+}
+inline uint16_t sw_bikini_color(int x, int y) {
+    const float gx = (x % 6) - 2.5f, gy = (y % 6) - 2.5f;
+    return gx * gx + gy * gy <= 2.0f ? sw_pack(255, 150, 190) : sw_pack(238, 238, 238);
+}
+
 // Edge alpha and carried colour (mg_sway.matte): the outline pixel and two rings past it split
 // c = a·H + (1 − a)·B, H = nearest solid pixel of it, B = what's behind (the plate).
 inline void sw_matte(Sway& s, const uint8_t* moving, int16_t* nx, int16_t* ny, uint8_t* tmp, int32_t* d2, int16_t* tx, int16_t* ty) {
@@ -778,6 +819,15 @@ inline bool sway_prepare(Sway& s, const uint16_t* photo, bool psw, const uint8_t
         if (s.pdef_ok && s.pdef && s.pdef_has && bget_(s.pdef_has, Y * IMG_W + X)) s.plate[i] = s.pdef[Y * IMG_W + X];
     }
     sw_fill(s, body, fb, nx, ny, tmp);
+    if (s.kind == SK_CLOTH) {                           // (its own fill: never skin in the bikini area)
+        float qx[SW_BIKINI_N], qy[SW_BIKINI_N];
+        if (sw_bikini_poly(s, qx, qy))
+            for (int i = 0; i < N; ++i) {
+                const int X = s.rx0 + i % s.rw, Y = s.ry0 + i / s.rw;
+                if (!s.hole[i] || (s.pdef_ok && s.pdef_has && bget_(s.pdef_has, Y * IMG_W + X))) continue;
+                if (sw_in_poly(qx, qy, SW_BIKINI_N, X + 0.5f, Y + 0.5f)) s.plate[i] = sw_bikini_color(X, Y);
+            }
+    }
     sw_matte(s, moving, nx, ny, tmp, d2, tx, ty);
     if (s.kind != SK_PENDANT) {                         // the rings past it belong to its nearest lock / panel
         uint8_t* seed = tmp;
@@ -805,7 +855,7 @@ inline bool sway_prepare(Sway& s, const uint16_t* photo, bool psw, const uint8_t
             s.rsdf[k][i] = sdf ? sdf_at(sdf, s.rx[k][i], s.ry[k][i]) : 1e9f;
             s.onb[k][i] = sdf && s.rsdf[k][i] <= 1.0f;
             const float fr = 2.0f * cum * sinf(SW_FREE / 2) + 1e-3f;
-            if (s.kind == SK_CLOTH) s.cap[k][i] = (s.tmax * i / (n - 1)) * 2.0f * sinf(SW_FREE / 2) + 1e-3f;
+            if (s.kind == SK_CLOTH) s.cap[k][i] = (s.tmax * i / (n - 1)) * 2.0f * sinf(SW_CLOTH_FREE / 2) + 1e-3f;
             else {
                 const float onb = std::max(2.0f, SW_ON_BODY * (s.lw[k][i] + s.rwd[k][i]) * 0.5f);
                 s.cap[k][i] = s.onb[k][i] ? std::min(onb, fr) : fr;
@@ -832,6 +882,23 @@ inline bool sway_prepare(Sway& s, const uint16_t* photo, bool psw, const uint8_t
     for (int i = 0; i < N; ++i) {                      // 8-bit colour of the photo and the matted edge, for drawing
         sw_unpack(s.photo[i], s.c8[3 * i], s.c8[3 * i + 1], s.c8[3 * i + 2]);
         sw_unpack(s.texd[i], s.t8[3 * i], s.t8[3 * i + 1], s.t8[3 * i + 2]);
+    }
+    if (s.kind == SK_CLOTH && s.narm == 9) {             // her hips: each row's edges (even-odd scanline of the outline)
+        s.hipl = (int16_t*)alloc(IMG_H * 2); s.hipr = (int16_t*)alloc(IMG_H * 2);
+        if (s.hipl && s.hipr)
+            for (int y = 0; y < IMG_H; ++y) {
+                float lo = 1e9f, hi = -1e9f;
+                const float yc = y + 0.5f;
+                for (int a = 0; a < 9; ++a) {
+                    const int b = (a + 1) % 9;
+                    const float ya = s.army[a], yb2 = s.army[b];
+                    if ((ya <= yc) == (yb2 <= yc)) continue;
+                    const float xx = s.armx[a] + (yc - ya) * (s.armx[b] - s.armx[a]) / (yb2 - ya);
+                    lo = std::min(lo, xx); hi = std::max(hi, xx);
+                }
+                s.hipl[y] = lo <= hi ? (int16_t)lroundf(lo) : (int16_t)-1;
+                s.hipr[y] = lo <= hi ? (int16_t)lroundf(hi) : (int16_t)-1;
+            }
     }
     s.t = s.acc = s.fade = 0; s.disp = 0; s.awake = true; s.drawn = false;
     s.lx0 = s.rx0; s.ly0 = s.ry0; s.lx1 = s.rx0 + s.rw; s.ly1 = s.ry0 + s.rh;
@@ -872,6 +939,18 @@ inline void sw_panels(Sway& s) {
             s.x[k][j] += (want - cur) * 0.5f * ex; s.y[k][j] += (want - cur) * 0.5f * ey;
         }
     }
+    for (int it = 0; it < 2; ++it)                      // one sheet: neighbouring fold lines move together
+        for (int j = 1; j < nrow; ++j) {
+            float dx[SR_MAX], dy[SR_MAX];
+            for (int k = 0; k < s.nr; ++k) { dx[k] = s.x[k][j] - s.rx[k][j]; dy[k] = s.y[k][j] - s.ry[k][j]; }
+            float nx_[SR_MAX], ny_[SR_MAX], sx = 0, sy = 0;   // (the row keeps its shift: only its sharing-out evens up)
+            for (int k = 0; k < s.nr; ++k) {
+                nx_[k] = dx[k]; ny_[k] = dy[k];
+                if (k > 0 && k < s.nr - 1) { nx_[k] += 0.5f * ((dx[k - 1] + dx[k + 1]) * 0.5f - dx[k]); ny_[k] += 0.5f * ((dy[k - 1] + dy[k + 1]) * 0.5f - dy[k]); }
+                sx += dx[k] - nx_[k]; sy += dy[k] - ny_[k];
+            }
+            for (int k = 0; k < s.nr; ++k) { s.x[k][j] = s.rx[k][j] + nx_[k] + sx / s.nr; s.y[k][j] = s.ry[k][j] + ny_[k] + sy / s.nr; }
+        }
     for (int k = 0; k < s.nr - 1; ++k)                  // pleats: open no wider than flat, close no tighter than the fabric
         for (int j = 1; j < nrow; ++j) {
             const float w = (s.x[k + 1][j] - s.x[k][j]) * ex + (s.y[k + 1][j] - s.y[k][j]) * ey;
@@ -881,7 +960,21 @@ inline void sw_panels(Sway& s) {
             s.x[k][j] -= corr * ex; s.y[k][j] -= corr * ey; s.x[k + 1][j] += corr * ex; s.y[k + 1][j] += corr * ey;
         }
 }
-inline void sw_rods(Sway& s, float fx, float fy, float wind, float damp_k, const int16_t* sdf) {
+// The skirt's two edges can't swing in through her hips / thighs (an edge outside her hip line in the
+// photo stays outside it).
+inline void sw_hips(Sway& s) {
+    if (!s.hipl || !s.hipr) return;
+    for (int side = 0; side < 2; ++side) {
+        const int k = side ? s.nr - 1 : 0;
+        for (int j = 1; j < s.nn[k]; ++j) {
+            const int yr = (int)lroundf(s.ry[k][j]), yc = (int)lroundf(s.y[k][j]);
+            if (yr < 0 || yr >= IMG_H || yc < 0 || yc >= IMG_H) continue;
+            if (!side && s.hipl[yr] >= 0 && s.rx[k][j] <= s.hipl[yr] + 0.5f && s.hipl[yc] >= 0) s.x[k][j] = std::min(s.x[k][j], (float)s.hipl[yc]);
+            if (side && s.hipr[yr] >= 0 && s.rx[k][j] >= s.hipr[yr] - 0.5f && s.hipr[yc] >= 0) s.x[k][j] = std::max(s.x[k][j], (float)s.hipr[yc]);
+        }
+    }
+}
+inline void sw_rods(Sway& s, float fx, float fy, float wind, float damp_k, const int16_t* sdf, float hold) {
     const SwayKindInfo& K = sway_kind_info(s.kind);
     const float h = SW_DT, damp = 1.0f - K.c * damp_k * h, stiff = s.prm[SP_STIFF];
     const bool cloth = s.kind == SK_CLOTH;
@@ -893,10 +986,11 @@ inline void sw_rods(Sway& s, float fx, float fy, float wind, float damp_k, const
         float wl = sqrtf(wdx * wdx + wdy * wdy); if (wl < 1e-9f) wl = 1;
         for (int i = 0; i < n; ++i) {
             const float wk = (0.3f + 0.7f * i / (n - 1)) * wind;
-            float ax = fx + s.kn[k][i] * (s.rx[k][i] - s.x[k][i]) + wk * wdx / wl;
-            float ay = fy + s.kn[k][i] * (s.ry[k][i] - s.y[k][i]) + wk * wdy / wl;
+            const float kn = hold * s.kn[k][i];
+            float ax = fx + kn * (s.rx[k][i] - s.x[k][i]) + wk * wdx / wl;
+            float ay = fy + kn * (s.ry[k][i] - s.y[k][i]) + wk * wdy / wl;
             if (K.mu > 0 && s.onb[k][i]) {               // lying on the body: rubbing on it takes some push, slows it
-                const float ex_ = ax - s.kn[k][i] * (s.rx[k][i] - s.x[k][i]), ey_ = ay - s.kn[k][i] * (s.ry[k][i] - s.y[k][i]);
+                const float ex_ = ax - kn * (s.rx[k][i] - s.x[k][i]), ey_ = ay - kn * (s.ry[k][i] - s.y[k][i]);
                 const float m = std::min(0.8f, 1.5f * K.mu);
                 ax -= ex_ * m; ay -= ey_ * m;
                 const float v = std::min(0.9f, 8.0f * K.mu * h);
@@ -919,11 +1013,11 @@ inline void sw_rods(Sway& s, float fx, float fy, float wind, float damp_k, const
                 X[i] += (X[i - 1] + vx * cs - vy * sn - X[i]) * (0.35f * stiff);
                 Y[i] += (Y[i - 1] + vx * sn + vy * cs - Y[i]) * (0.35f * stiff);
             }
-        sw_collide(s, k, sdf);
+        if (!cloth) sw_collide(s, k, sdf);              // (a skirt swings in front of her legs: no collision)
         for (int i = 1; i < n; ++i) {                    // follow the leader, and no joint bends past BEND_MAX of its photo bend
             float dx = X[i] - X[i - 1], dy = Y[i] - Y[i - 1], l = sqrtf(dx * dx + dy * dy);
             if (l < 1e-6f) l = 1e-6f;
-            if (i >= 2) {
+            if (i >= 2 && !cloth) {                      // (fabric has no bend limit: it folds right over)
                 const float pcx = X[i - 1] - X[i - 2], pcy = Y[i - 1] - Y[i - 2], prx = RX[i - 1] - RX[i - 2], pry = RY[i - 1] - RY[i - 2];
                 const float rrx = RX[i] - RX[i - 1], rry = RY[i] - RY[i - 1];
                 const float rest_b = atan2f(prx * rry - pry * rrx, prx * rrx + pry * rry);
@@ -935,14 +1029,17 @@ inline void sw_rods(Sway& s, float fx, float fy, float wind, float damp_k, const
                     dx = cosf(ang) * l; dy = sinf(ang) * l;
                 }
             }
-            X[i] = X[i - 1] + dx * (s.len[k][i] / l); Y[i] = Y[i - 1] + dy * (s.len[k][i] / l);
+            // fabric: a link never stretches, but it can foreshorten - a fold turning toward you or away
+            // (upside down the hem comes up in front of her, over the waist); hair keeps its exact length
+            const float f = cloth ? std::min(1.0f, s.len[k][i] / l) : s.len[k][i] / l;
+            X[i] = X[i - 1] + dx * f; Y[i] = Y[i - 1] + dy * f;
         }
         for (int i = 0; i < n; ++i) {                    // what the fill can't make true limits how far it goes
             const float ddx = X[i] - RX[i], ddy = Y[i] - RY[i], dm = sqrtf(ddx * ddx + ddy * ddy);
             if (dm > s.cap[k][i]) { X[i] = RX[i] + ddx * s.cap[k][i] / dm; Y[i] = RY[i] + ddy * s.cap[k][i] / dm; }
         }
     }
-    if (cloth) sw_panels(s);
+    if (cloth) { sw_panels(s); sw_hips(s); }
 }
 inline void sw_pend(Sway& s, float fx, float fy, float wind, float damp_k, const float dn[3], const int16_t* sdf) {
     const float h = SW_DT, c = cosf(s.th), sn = sinf(s.th);
@@ -975,7 +1072,12 @@ inline bool sway_step(Sway& s, float dt, const float dn[3], const float jolt[3],
         if (s.kind == SK_PENDANT) sw_pend(s, -sw * K.j * jolt[0], -sw * K.j * jolt[1], wind, damp_k, dn, sdf);
         else {
             const float g = sw * K.gain;
-            sw_rods(s, g * (SW_G * dn[0] - K.j * jolt[0]), g * (SW_G * (dn[1] - m) - K.j * jolt[1]), wind, damp_k, sdf);
+            // a skirt: the photo's pose is held up by her only while gravity points down the picture -
+            // that part is carried; the rest (sideways, upside down) pulls it
+            const bool cl = s.kind == SK_CLOTH;
+            const float gy = cl ? SW_G * std::min(0.0f, dn[1]) : SW_G * (dn[1] - m);
+            sw_rods(s, g * (SW_G * dn[0] - K.j * jolt[0]), g * (gy - K.j * jolt[1]), wind, damp_k, sdf,
+                    cl ? std::max(SW_CLOTH_HOLD, dn[1]) : 1.0f);
         }
     }
     float disp = 0, vel = 0;
@@ -1228,6 +1330,14 @@ inline bool parse_sway_line(char* line, Sway* ss, int& ns, int& cur, uint8_t*& b
         return true;
     }
     if (strcmp(kind, "hrow") == 0) strcpy(kind, "srow");
+    if (strcmp(kind, "sarm") == 0) {
+        if (cur < 0) return true;
+        Sway& s = ss[cur];
+        int k = 0, x, y;
+        while (k < 9 && sscanf(rest, " %d,%d%n", &x, &y, &n) == 2) { rest += n; s.armx[k] = (int16_t)x; s.army[k] = (int16_t)y; ++k; }
+        s.narm = k == 9 ? 9 : 0;
+        return true;
+    }
     if (strcmp(kind, "sguide") == 0) {
         if (cur < 0) return true;
         Sway& s = ss[cur];
@@ -1282,6 +1392,11 @@ inline void save_sways(F& f, const Sway* ss, int ns, const uint8_t* body) {
         for (int g = 0; g < s.ng; ++g) {
             f.printf("sguide");
             for (int k = 0; k < s.gn[g]; ++k) f.printf(" %d,%d", (int)lroundf(s.gx[g][k]), (int)lroundf(s.gy[g][k]));
+            f.printf("\n");
+        }
+        if (s.kind == SK_CLOTH && s.narm == 9) {
+            f.printf("sarm");
+            for (int k = 0; k < 9; ++k) f.printf(" %d,%d", s.armx[k], s.army[k]);
             f.printf("\n");
         }
         save_mask_rows(f, s.mask, "srow");
