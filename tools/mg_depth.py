@@ -47,9 +47,10 @@ class Plane:
     ramp: tuple | None = None               # (ax, ay, bx, by, depth_b): depth runs from `depth` at A to depth_b at B
     feet: tuple | None = None               # (x, y): where it meets the ground (the feet line); else its lowest row
     name: str = ""                          # the Studio's layer name
+    fixed: bool = False                     # depth set by hand (not from where it meets the ground)
 
     def copy(self):
-        return Plane(self.depth, None if self.mask is None else self.mask.copy(), self.ramp, self.feet, self.name)
+        return Plane(self.depth, None if self.mask is None else self.mask.copy(), self.ramp, self.feet, self.name, self.fixed)
 
     def depth_at(self, X, Y):
         if not self.ramp:
@@ -109,7 +110,7 @@ class Parallax:
             return
         c0, cx, cy = gr
         for p in self.planes:
-            if p.mask is None or not p.mask.any():
+            if p.mask is None or not p.mask.any() or p.fixed:
                 continue
             if p.feet is not None:
                 xb, yb = p.feet
@@ -155,6 +156,8 @@ def parse_lines(lines):
                         p.feet = (int(a[0]), int(a[1]))
                     elif k == "name":
                         p.name = v.replace("_", " ")[:15]
+                    elif k == "fixed":
+                        p.fixed = v not in ("0", "")
                 except (ValueError, IndexError):
                     pass
             P.planes.append(p)
@@ -201,6 +204,8 @@ def format_lines(P):
             line += f" ramp={int(ax)},{int(ay)},{int(bx)},{int(by)},{db:.3g}"
         if p.feet is not None:
             line += f" feet={int(p.feet[0])},{int(p.feet[1])}"
+        if p.fixed:
+            line += " fixed=1"
         if p.name:
             line += " name=" + p.name.replace(" ", "_")[:15]
         out.append(line)

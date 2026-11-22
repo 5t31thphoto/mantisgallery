@@ -26,7 +26,7 @@
 #include "jiggle_select.h"
 #include "jiggle_grabcut.h"
 #include "jiggle_parallax.h"
-#include "jiggle_hang.h"
+#include "jiggle_sway.h"
 #include <SD.h>
 #if defined(ESP_PLATFORM)
 #include <freertos/FreeRTOS.h>
@@ -72,6 +72,7 @@ constexpr uint32_t FRAME_MS = 16;        // redraw cap (~60 fps); big zones are 
 constexpr bool     MIC_DANCE = true;      // dance to music heard by the microphone (when switched on: swipe up)
 constexpr float    DANCE_GAIN = 0.35f;    // beat nudge strength (×zone's own dance setting): subtle, additive
 constexpr float    DANCE_ROOM = 0.5f;     // no kick while a zone is already this far out (of its travel)
+constexpr float    DANCE_SWAY_ROOM = 3.0f;  // nor while hair / cloth / a pendant is this many px out
 constexpr uint32_t MIC_SR = 16000;
 constexpr size_t   MIC_N = 320;           // 20 ms chunks
 constexpr float    MIC_LEAD = 0.03f;      // beat lead for audio (spring swing − recording latency)
@@ -84,13 +85,13 @@ constexpr size_t STRIP_PIX = (size_t)STRIP_ROWS * IMG_W;
 
 // ---- Editor layout -----------------------------------------------------------------------------
 constexpr int ROW_H = 30;                // each toolbar row
-constexpr int TB1_N = 8;                 // Round · Half · Tear · Water · Depth · Hang · Grid · Cancel
+constexpr int TB1_N = 8;                 // Round · Half · Tear · Water · Depth · Sway · Grid · Cancel
 constexpr int TB1_WATER = 3;
 constexpr int TB1_DEPTH = 4;
-constexpr int TB1_HANG = 5;
+constexpr int TB1_SWAY = 5;
 constexpr int TB1_GRID = 6;
-constexpr int TB2G_N = 4;                // grid: turn · turn · reset · on/off
-constexpr int TB2H_N = 5;                // hang: Tool · Item · Kind · Swing · Del
+constexpr int TB2G_N = 5;                // grid: turn · turn · reset · on/off · the ground slides
+constexpr int TB2S_N = 5;                // sway: Tool · Item · Kind · Swing · Del
 constexpr int TB2D_N = 5;                // depth: Tool · Plane · Depth · Drift · Del
 constexpr int TB2W_N = 5;                // water: Tool · Mode · Rain · Region · Del
 constexpr int TB2_N = 4;                 // Rot · Feel · Tip · Del   (only while a zone is selected)
@@ -114,9 +115,12 @@ bool g_shown[MAX_ZONES];                 // screen currently shows this zone dis
 Water    g_wat[WATER_MAX];               // water regions
 int      g_nw = 0;
 uint32_t g_last_water = 0;
-Hang     g_hang[HANG_MAX];               // hanging things (hair, cloth, charms)
-int      g_nh = 0;
-uint32_t g_last_hang = 0;
+Sway     g_sway[SWAY_MAX];               // hair, cloth, pendants
+int      g_ns = 0;
+uint32_t g_last_sway = 0;
+uint8_t* g_body = nullptr;               // what they rest on (the Studio's "body" lines; else the depth figures)
+bool     g_body_saved = false;           // (it came from the file: written back)
+int16_t* g_sdf = nullptr;                // its signed distance (×8), for collisions
 Parallax g_par;                          // depth planes (none = no parallax)
 uint16_t* g_anim = nullptr;              // parallax with zones: the content with the zones drawn in
 bool      g_anim_sw = true;
@@ -149,6 +153,7 @@ bool     g_init = false;
 float    g_w = 0, g_alpha = 0;           // twist rate (rad/s, clockwise) and its change (rad/s²)
 float    g_dn_slow[3] = {0, 1, 0};       // real down, slowly averaged (gravity swing = down − this)
 float    g_echo = 0;                     // echo strength 0..1
+float    g_sway_damp = 1.0f;             // hair / cloth / pendants: their damping while the echo plays
 float    g_hold[MAX_ZONES][3];           // targets a resting zone is holding
 uint32_t g_last_us = 0;
 uint32_t g_last_draw = 0;
@@ -222,15 +227,54 @@ void prepare_waters() {
     for (int i = 0; i < g_n; ++i) zone_off_water(g_z[i]);
     layer_sync();
 }
-void clear_hangs() {
-    for (int i = 0; i < g_nh; ++i) hang_free(g_hang[i]);
-    g_nh = 0;
+void clear_sways() {
+    for (int i = 0; i < g_ns; ++i) sway_free(g_sway[i]);
+    g_ns = 0;
+    if (g_body) { free(g_body); g_body = nullptr; }
+    if (g_sdf) { free(g_sdf); g_sdf = nullptr; }
+    g_body_saved = false;
 }
-void prepare_hangs() {                                 // (before prepare_waters: that builds the layer)
-    for (int i = 0; i < g_nh; ++i) hang_prepare(g_hang[i], (const uint16_t*)g_img.getBuffer(), g_swapped, water_alloc);
+// Build hair / cloth / pendants: what they rest on (the body less them, plus their parts that lie on
+// it - mg_sway.rest_body), its distance field, then each one. (Before prepare_waters: that builds the layer.)
+void prepare_sways() {
+    if (g_sdf) { free(g_sdf); g_sdf = nullptr; }
+    for (int i = 0; i < g_ns; ++i) sway_free_runtime(g_sway[i]);
+    if (g_ns == 0) return;
+    for (int i = 0; i < g_ns; ++i) sway_default_guides(g_sway[i]);
+    uint8_t* body = (uint8_t*)water_alloc(MASK_BYTES);
+    int16_t* nx = (int16_t*)water_alloc((size_t)IMG_W * IMG_H * 2);
+    int16_t* ny = (int16_t*)water_alloc((size_t)IMG_W * IMG_H * 2);
+    uint8_t* forbid = (uint8_t*)water_alloc(MASK_BYTES);
+    bool anyb = false;
+    if (body) {
+        memset(body, 0, MASK_BYTES);
+        if (g_body) memcpy(body, g_body, MASK_BYTES);
+        else for (int k = 0; k < g_par.n; ++k)          // (no body lines: the depth figures)
+            if (g_par.pl[k].mask) for (int b = 0; b < MASK_BYTES; ++b) body[b] |= g_par.pl[k].mask[b];
+        for (int b = 0; b < MASK_BYTES && !anyb; ++b) anyb = body[b] != 0;
+    }
+    if (anyb && nx && ny) {
+        const uint8_t* ms[SWAY_MAX];
+        for (int i = 0; i < g_ns; ++i) ms[i] = g_sway[i].mask;
+        sway_rest_body(body, ms, g_ns, nx, ny);
+        g_sdf = sway_body_sdf(body, water_alloc);
+    }
+    if (nx) free(nx);
+    if (ny) free(ny);
+    const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
+    for (int i = 0; i < g_ns; ++i) {
+        if (forbid) {                                   // (never filled from one another)
+            memset(forbid, 0, MASK_BYTES);
+            for (int j = 0; j < g_ns; ++j) if (j != i && g_sway[j].mask) for (int b = 0; b < MASK_BYTES; ++b) forbid[b] |= g_sway[j].mask[b];
+        }
+        const bool ok = sway_prepare(g_sway[i], photo, g_swapped, anyb ? body : nullptr, g_sdf, forbid, water_alloc);
+        Serial.printf("jig: %s %d %s\n", sway_kind_info(g_sway[i].kind).label, i + 1, ok ? "ready" : "not ready (no memory, or nothing selected)");
+    }
+    if (forbid) free(forbid);
+    if (body) free(body);
 }
-bool any_hang_def() {
-    for (int i = 0; i < g_nh; ++i) if (hang_count(g_hang[i]) >= 12) return true;
+bool any_sway_def() {
+    for (int i = 0; i < g_ns; ++i) if (sway_count(g_sway[i]) >= 12) return true;
     return false;
 }
 
@@ -382,7 +426,7 @@ void layer_sync() {
     }
     bool live = false;
     for (int i = 0; i < g_nw; ++i) live |= g_wat[i].edge != nullptr;
-    for (int i = 0; i < g_nh; ++i) live |= g_hang[i].ready;          // (hangs draw into it too)
+    for (int i = 0; i < g_ns; ++i) live |= g_sway[i].ready;          // (hair / cloth / pendants draw into it too)
     if (!live) { g_layer = nullptr; return; }
     if (g_src_fast) { g_layer = g_src_fast; g_layer_sw = true; return; }
     g_layer = (uint16_t*)g_scratch.getBuffer();
@@ -397,9 +441,27 @@ bool any_water(const Water* ws, int nw) {
 }
 
 bool any_plane(const Parallax& P);
+// Lines this firmware doesn't play yet (the Studio's swaying hair / cloth, anything newer) are kept as
+// they were and written back on save, so editing on the Core2 never loses them.
+char*  g_keep = nullptr;
+size_t g_keep_len = 0, g_keep_cap = 0;
+void keep_line(const char* ln) {
+    const size_t n = strlen(ln);
+    if (g_keep_len + n + 2 > g_keep_cap) {
+        size_t cap = g_keep_cap * 2 > g_keep_len + n + 4096 ? g_keep_cap * 2 : g_keep_len + n + 4096;
+        char* p = (char*)alloc_psram(cap);
+        if (!p) return;
+        if (g_keep) { memcpy(p, g_keep, g_keep_len); free(g_keep); }
+        g_keep = p; g_keep_cap = cap;
+    }
+    memcpy(g_keep + g_keep_len, ln, n);
+    g_keep_len += n;
+    g_keep[g_keep_len++] = '\n';
+}
+
 void save_zones() {
     if (!g_jig_path[0]) return;
-    if (g_n == 0 && !any_water(g_wat, g_nw) && !any_plane(g_par) && !any_hang_def()) {
+    if (g_n == 0 && !any_water(g_wat, g_nw) && !any_plane(g_par) && !any_sway_def() && g_keep_len == 0) {
         if (SD.exists(g_jig_path)) SD.remove(g_jig_path);
         return;
     }
@@ -418,7 +480,8 @@ void save_zones() {
     }
     save_waters(f, g_wat, g_nw);                     // after the zones: older firmware reads those and stops
     save_parallax(f, g_par);
-    save_hangs(f, g_hang, g_nh);
+    save_sways(f, g_sway, g_ns, g_body_saved ? g_body : nullptr);
+    if (g_keep_len) f.write((const uint8_t*)g_keep, g_keep_len);
     f.close();
     Serial.printf("jig: saved %d zone(s), %d water -> %s\n", g_n, g_nw, g_jig_path);
 }
@@ -532,6 +595,12 @@ struct WaterJob { const Water* w; const uint16_t* photo; bool psw; };
 void water_rows(void* c, int lane, int y0, int y1) {
     WaterJob& j = *(WaterJob*)c;
     water_render(*j.w, j.photo, j.psw, g_layer, g_layer_sw, 0, y0, IMG_W, y1, lane);
+}
+
+struct SwayJob { const Sway* s; const SwDraw* d; };
+void sway_rows(void* c, int lane, int y0, int y1) {
+    SwayJob& j = *(SwayJob*)c;
+    sway_draw_rows(*j.s, *j.d, g_layer, g_layer_sw, y0, y1);
 }
 
 // Content rects for parallax: where the content changed this frame (picture coordinates).
@@ -684,11 +753,11 @@ void water_push() {
     M5.Display.endWrite();
 }
 
-// The water frame in progress: 1 = rendering into the layer, 2 = the hanging things over it, 3 = sending.
+// The water frame in progress: 1 = rendering into the layer, 2 = hair / cloth / pendants over it, 3 = sending.
 struct WaterJobState { uint8_t phase = 0; int wi = 0, y = -1, nd = 0; int which[8]; bool par = false; };
 WaterJobState g_wj;
-int hang_update(bool water_moved, int* which);
-void hang_push(const int* which, int nd);
+int sway_update(bool water_moved, int* which);
+void sway_push(const int* which, int nd);
 // Advance it until done (true) or this tick's time is up (false).
 bool water_job() {
     const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
@@ -705,8 +774,8 @@ bool water_job() {
     }
     if (g_wj.phase == 2 && g_wj.par) { g_wj.phase = 0; return true; }   // (depth: the rest is its content step)
     if (g_wj.phase == 2) {
-        g_wj.nd = g_nh > 0 ? hang_update(true, g_wj.which) : 0;
-        if (g_wj.nd) g_last_hang = millis();
+        g_wj.nd = g_ns > 0 ? sway_update(true, g_wj.which) : 0;
+        if (g_wj.nd) g_last_sway = millis();
         g_wj.phase = 3; g_wj.wi = 0; g_wj.y = -1;
     }
     int cur = 0;
@@ -738,75 +807,118 @@ bool water_job() {
     if (inflight) M5.Display.waitDMA();
     M5.Display.endWrite();
     if (g_wj.phase != 4) return false;
-    if (g_wj.nd) hang_push(g_wj.which, g_wj.nd);
+    if (g_wj.nd) sway_push(g_wj.which, g_wj.nd);
     g_wj.phase = 0;
     return true;
 }
 
-// ---- hanging things --------------------------------------------------------------------------------
+// ---- hair, cloth, pendants ---------------------------------------------------------------------------
 bool regions_meet(int ax0, int ay0, int ax1, int ay1, int bx0, int by0, int bx1, int by1) {
     return !(ax0 >= bx1 || bx0 >= ax1 || ay0 >= by1 || by0 >= ay1);
 }
-// Which hangs to redraw this frame: moving, settling (one last frame at rest), or over water that moved.
-bool hang_due(int i, bool water_moved) {
-    const Hang& h = g_hang[i];
+// Which to redraw this frame: moving, settling (one last frame at rest), or over water that moved.
+bool sway_due(int i, bool water_moved) {
+    const Sway& h = g_sway[i];
     if (!h.ready) return false;
     if (h.awake || !h.drawn) return true;
     if (water_moved)
         for (int k = 0; k < g_nw; ++k)
-            if (g_wat[k].edge && regions_meet(h.x0, h.y0, h.x1, h.y1, g_wat[k].bx, g_wat[k].by, g_wat[k].bx + g_wat[k].bw, g_wat[k].by + g_wat[k].bh))
+            if (g_wat[k].edge && regions_meet(h.lx0, h.ly0, h.lx1, h.ly1, g_wat[k].bx, g_wat[k].by, g_wat[k].bx + g_wat[k].bw, g_wat[k].by + g_wat[k].bh))
                 return true;
     return false;
 }
-// Into the layer: each due hang's region back to the photo (and its water), then every hang drawn.
+// Into the layer: each due one's region back to the photo (and its water), then every one there drawn.
 // Returns how many regions were redrawn (their indices in `which`).
-int hang_update(bool water_moved, int* which) {
-    if (!g_layer || g_nh == 0) return 0;
-    int nd = 0;
-    for (int i = 0; i < g_nh; ++i) if (hang_due(i, water_moved)) which[nd++] = i;
-    if (!nd) return 0;
+// The redraw in progress (the depth frame draws it a slice at a time; elsewhere at once): each due
+// one's rect back to the photo, then every one there drawn - all from meshes posed at its start.
+struct SwayRedraw { bool on = false; bool wm = false; int nd = 0, which[SWAY_MAX]; int tn = 0, touch[SWAY_MAX]; int k = 0, y = -1; };
+SwayRedraw g_sj;
+SwDraw* g_sdraw[SWAY_MAX] = {nullptr};
+void sway_redraw_start(bool water_moved) {
+    g_sj = SwayRedraw();
+    if (!g_layer || g_ns == 0) return;
+    for (int i = 0; i < g_ns; ++i) if (sway_due(i, water_moved)) g_sj.which[g_sj.nd++] = i;
+    if (!g_sj.nd) return;
+    for (int i = 0; i < g_ns; ++i)
+        if (!g_sdraw[i]) { g_sdraw[i] = (SwDraw*)water_alloc(sizeof(SwDraw)); if (!g_sdraw[i]) { g_sj.nd = 0; return; } }
+    for (int i = 0; i < g_ns; ++i) sway_draw_prep(g_sway[i], *g_sdraw[i]);   // (the pose it draws, fixed now)
+    for (int k = 0; k < g_sj.nd; ++k) sway_dirty_d(g_sway[g_sj.which[k]], *g_sdraw[g_sj.which[k]]);   // (what it drew last time and now)
     const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
-    for (int k = 0; k < nd; ++k) {
-        const Hang& h = g_hang[which[k]];
-        for (int y = h.y0; y < h.y1; ++y) {
-            const uint16_t* sr = photo + y * IMG_W + h.x0;
-            uint16_t* d = g_layer + y * IMG_W + h.x0;
-            if (g_layer_sw == g_swapped) memcpy(d, sr, (size_t)(h.x1 - h.x0) * 2);
-            else for (int x = 0; x < h.x1 - h.x0; ++x) d[x] = bswap16(sr[x]);
+    for (int k = 0; k < g_sj.nd; ++k) {
+        const Sway& h = g_sway[g_sj.which[k]];
+        // Back to the photo - except on the water, which was just drawn afresh this frame (water_moved:
+        // it always is when the water moves; without water nothing is skipped).
+        for (int y = h.uy0; y < h.uy1; ++y) {
+            const uint16_t* sr = photo + y * IMG_W + h.ux0;
+            uint16_t* d = g_layer + y * IMG_W + h.ux0;
+            const int n = h.ux1 - h.ux0;
+            if (!water_moved) {
+                if (g_layer_sw == g_swapped) memcpy(d, sr, (size_t)n * 2);
+                else for (int x = 0; x < n; ++x) d[x] = bswap16(sr[x]);
+                continue;
+            }
+            for (int x = 0; x < n; ++x) {
+                bool wet = false;
+                for (int w = 0; w < g_nw && !wet; ++w) wet = g_wat[w].edge && mask_get(g_wat[w].mask, h.ux0 + x, y);
+                if (!wet) d[x] = g_layer_sw == g_swapped ? sr[x] : bswap16(sr[x]);
+            }
         }
-        for (int w = 0; w < g_nw; ++w)
-            if (g_wat[w].edge) water_render(g_wat[w], photo, g_swapped, g_layer, g_layer_sw, h.x0, h.y0, h.x1, h.y1, 0);
     }
-    for (int i = 0; i < g_nh; ++i) {                  // (a resting hang draws itself exactly as the photo)
+    for (int i = g_ns - 1; i >= 0; --i) {             // (one at rest draws itself exactly as the photo; the first on top)
         bool touched = false;
-        for (int k = 0; k < nd; ++k) {
-            const Hang& a = g_hang[which[k]];
-            touched |= regions_meet(a.x0, a.y0, a.x1, a.y1, g_hang[i].x0, g_hang[i].y0, g_hang[i].x1, g_hang[i].y1);
+        for (int k = 0; k < g_sj.nd; ++k) {
+            const Sway& a = g_sway[g_sj.which[k]];
+            touched |= regions_meet(a.ux0, a.uy0, a.ux1, a.uy1, g_sway[i].x0, g_sway[i].y0, g_sway[i].x1, g_sway[i].y1);
         }
-        if (touched) hang_render(g_hang[i], g_layer, g_layer_sw);
+        if (touched) g_sj.touch[g_sj.tn++] = i;
     }
-    for (int k = 0; k < nd; ++k) g_hang[which[k]].drawn = !g_hang[which[k]].awake;
-    return nd;
+    g_sj.on = true;
+}
+// Draw on (both cores, 24 rows at a time); budget: stop when this tick's time is up. True when done.
+bool sway_redraw_run(bool budget) {
+    while (g_sj.on && g_sj.k < g_sj.tn) {
+        const int i = g_sj.touch[g_sj.k];
+        const Sway& s = g_sway[i];
+        if (g_sj.y < 0) g_sj.y = s.y0;
+        if (g_sj.y >= s.y1) { ++g_sj.k; g_sj.y = -1; continue; }
+        if (budget && over_budget()) return false;
+        const int ye = g_sj.y + 24 < s.y1 ? g_sj.y + 24 : s.y1;
+        SwayJob job{&s, g_sdraw[i]};
+        par_rows(sway_rows, &job, g_sj.y, ye);
+        g_sj.y = ye;
+    }
+    if (g_sj.on)
+        for (int k = 0; k < g_sj.nd; ++k) g_sway[g_sj.which[k]].drawn = !g_sway[g_sj.which[k]].awake;
+    g_sj.on = false;
+    return true;
+}
+// All at once. Returns how many regions were redrawn (their indices in `which`).
+int sway_update(bool water_moved, int* which) {
+    sway_redraw_start(water_moved);
+    sway_redraw_run(false);
+    for (int k = 0; k < g_sj.nd; ++k) which[k] = g_sj.which[k];
+    return g_sj.nd;
 }
 // Send the redrawn regions to the screen.
-void hang_push(const int* which, int nd) {
+void sway_push(const int* which, int nd) {
     int cur = 0;
     bool inflight = false;
     M5.Display.startWrite();
     for (int k = 0; k < nd; ++k) {
-        const Hang& h = g_hang[which[k]];
-        const int ow = h.x1 - h.x0;
-        for (int y = h.y0; y < h.y1; y += STRIP_ROWS) {
-            const int ye = y + STRIP_ROWS < h.y1 ? y + STRIP_ROWS : h.y1;
+        const Sway& h = g_sway[which[k]];
+        const int ow = h.ux1 - h.ux0;
+        if (ow <= 0) continue;
+        for (int y = h.uy0; y < h.uy1; y += STRIP_ROWS) {
+            const int ye = y + STRIP_ROWS < h.uy1 ? y + STRIP_ROWS : h.uy1;
             uint16_t* out = g_strip[cur];
             if (inflight && USE_DMA && g_dma) { M5.Display.waitDMA(); inflight = false; }
             for (int yy = y; yy < ye; ++yy) {
-                const uint16_t* row = g_layer + yy * IMG_W + h.x0;
+                const uint16_t* row = g_layer + yy * IMG_W + h.ux0;
                 uint16_t* o = out + (yy - y) * ow;
                 if (g_layer_sw) memcpy(o, row, (size_t)ow * 2);
                 else for (int x = 0; x < ow; ++x) o[x] = bswap16(row[x]);
             }
-            push_strip(h.x0, y, ow, ye - y, out, inflight);
+            push_strip(h.ux0, y, ow, ye - y, out, inflight);
             cur ^= 1;
         }
     }
@@ -866,10 +978,18 @@ void par_rows_job(void* c, int lane, int y0, int y1) {
 
 
 // One parallax frame: step the view, update the content (water, zones), redraw what changed.
+void par_content_step(uint32_t now, bool moved, bool zones_any, bool water_done);
 void par_tick(uint32_t now, float dt, bool may_draw, bool zones_any) {
     const bool moved = parallax_step(g_par, dt, PAR_GX_S * g_gyro_xy[0], PAR_GY_S * g_gyro_xy[1], M5.Imu.isEnabled());
     g_par_moving = moved || g_par.prm[PP_AMBIENT] > 0.0f || g_pj.on;
     if (g_pj.on) { if (may_draw) par_push(now); return; }       // finish the frame in progress first
+    static bool s_water_done = false, s_moved = false, s_zones = false;   // (carried while hair / cloth draw over ticks)
+    if (g_sj.on) {                                     // hair / cloth / pendants being drawn: on with that
+        s_moved |= moved; s_zones |= zones_any;
+        if (!may_draw || !sway_redraw_run(true)) return;
+        par_content_step(now, s_moved, s_zones, s_water_done);
+        return;
+    }
     bool water_done = false;
     if (g_wj.phase == 0) {
         if (!may_draw || now - g_last_draw < FRAME_MS) return;
@@ -879,6 +999,16 @@ void par_tick(uint32_t now, float dt, bool may_draw, bool zones_any) {
         if (!may_draw || !water_job()) return;
         water_done = true;
     }
+    if (g_ns > 0) {                                    // hair / cloth / pendants into the layer: a slice at a time
+        s_water_done = water_done; s_moved = moved; s_zones = zones_any;
+        sway_redraw_start(g_nw > 0);
+        if (!sway_redraw_run(true)) return;
+    } else g_sj = SwayRedraw();
+    par_content_step(now, moved, zones_any, water_done);
+}
+
+// The rest of starting a depth frame, once the water and hair / cloth are drawn into the layer.
+void par_content_step(uint32_t now, bool moved, bool zones_any, bool water_done) {
     DirtyRects content;
     if (water_done) {                                  // (and the content buffer)
         for (int i = 0; i < g_nw; ++i) {
@@ -899,21 +1029,20 @@ void par_tick(uint32_t now, float dt, bool may_draw, bool zones_any) {
             }
         }
     }
-    {                                                  // hanging things: into the layer and the content
-        int which[HANG_MAX];
-        const int nd = hang_update(g_nw > 0, which);
+    {                                                  // hair / cloth / pendants (drawn into the layer): into the content
+        const int nd = g_sj.nd;
         for (int k = 0; k < nd; ++k) {
-            const Hang& h = g_hang[which[k]];
+            const Sway& h = g_sway[g_sj.which[k]];
             if (g_anim)
-                for (int y = h.y0; y < h.y1; ++y) {
-                    const uint16_t* sr = g_layer + y * IMG_W + h.x0;
-                    uint16_t* d = g_anim + y * IMG_W + h.x0;
-                    if (g_anim_sw == g_layer_sw) memcpy(d, sr, (size_t)(h.x1 - h.x0) * 2);
-                    else for (int x = 0; x < h.x1 - h.x0; ++x) d[x] = bswap16(sr[x]);
+                for (int y = h.uy0; y < h.uy1; ++y) {
+                    const uint16_t* sr = g_layer + y * IMG_W + h.ux0;
+                    uint16_t* d = g_anim + y * IMG_W + h.ux0;
+                    if (g_anim_sw == g_layer_sw) memcpy(d, sr, (size_t)(h.ux1 - h.ux0) * 2);
+                    else for (int x = 0; x < h.ux1 - h.ux0; ++x) d[x] = bswap16(sr[x]);
                 }
-            content.add(h.x0, h.y0, h.x1, h.y1);
+            content.add(h.ux0, h.uy0, h.ux1, h.uy1);
             for (int z = 0; z < g_n; ++z)
-                if (g_z[z].wmap && regions_meet(g_z[z].bx, g_z[z].by, g_z[z].bx + g_z[z].bw, g_z[z].by + g_z[z].bh, h.x0, h.y0, h.x1, h.y1))
+                if (g_z[z].wmap && regions_meet(g_z[z].bx, g_z[z].by, g_z[z].bx + g_z[z].bw, g_z[z].by + g_z[z].bh, h.ux0, h.uy0, h.ux1, h.uy1))
                     g_shown[z] = true, zones_any = true;
         }
     }
@@ -1017,11 +1146,12 @@ void rest_all() {
         g_shown[i] = false;
         g_hold[i][0] = g_hold[i][1] = g_hold[i][2] = 0;
     }
-    for (int i = 0; i < g_nh; ++i) {                   // hanging things: home, and drawn once more
-        Hang& h = g_hang[i];
+    for (int i = 0; i < g_ns; ++i) {                   // hair / cloth / pendants: home, and drawn once more
+        Sway& h = g_sway[i];
         if (!h.ready) continue;
-        for (int k = 0; k < h.nrows * h.nc; ++k) { h.x[k][0] = h.xp[k][0] = h.rest[k][0]; h.x[k][1] = h.xp[k][1] = h.rest[k][1]; }
-        h.th = h.thp = 0; h.fade = 0; h.drawn = false;
+        for (int k = 0; k < h.nr; ++k)
+            for (int j = 0; j < h.nn[k]; ++j) { h.x[k][j] = h.xp[k][j] = h.rx[k][j]; h.y[k][j] = h.yp[k][j] = h.ry[k][j]; }
+        h.th = h.thp = 0; h.fade = 0; h.disp = 0; h.drawn = false;
     }
 }
 
@@ -1031,11 +1161,10 @@ void kick_all() {
         g_z[i].vs += 0.4f * g_z[i].w1;
         g_z[i].awake = true;
     }
-    for (int i = 0; i < g_nh; ++i) {                   // and a flick of each hanging thing
-        Hang& h = g_hang[i];
+    for (int i = 0; i < g_ns; ++i) {                   // and a small swing of each hair / cloth / pendant
+        Sway& h = g_sway[i];
         if (!h.ready) continue;
-        const int k = (h.nrows - 1) * h.nc + h.nc / 2;
-        hang_poke(h, h.x[k][0], h.x[k][1], 0.8f);
+        sway_kick(h, 0.8f, (i & 1) ? -1 : 1);
         h.drawn = false;
     }
 }
@@ -1069,12 +1198,12 @@ float    e_pprm[PP_COUNT];
 bool     e_pgrid = false;               // the ground grid (Grid tool in depth mode)
 float    e_gq[8];
 const float DEPTHS[] = {0.15f, 0.3f, 0.5f, 0.7f, 0.9f};
-Hang     e_h[HANG_MAX];                  // working copies of the hanging things (masks included)
-int      e_nh = 0, e_hi = -1;
-bool     e_hmode = false;                // editing hanging things
-int      e_pinned = 0;                   // Pin taps placed (0: next tap is A, 1: next is B)
+Sway     e_s[SWAY_MAX];                  // working copies of hair / cloth / pendants (masks and guides)
+int      e_ns = 0, e_si = -1;
+bool     e_smode = false;                // editing hanging things
+bool     e_stroke = false;               // a hair lock being drawn (root → tip, in e_px / e_py)
 bool e_gmode = false;                         // fitting the ground grid (shared by water and depth)
-bool e_mm() { return e_wmode || e_dmode || e_hmode || e_gmode; }   // editing a mask (water area, depth plane, hanging thing)
+bool e_mm() { return e_wmode || e_dmode || e_smode || e_gmode; }   // editing a mask (water area, depth plane, hanging thing)
 uint8_t  e_wtool = WT_BRUSH;
 int      e_brush = 8;                    // brush radius (px)
 // Smart selection: what you tapped / stroked, the mask before it (so A/C can step the edge), a result
@@ -1095,7 +1224,7 @@ float g_out_u[SHAPE_COUNT][OUTLINE_PTS], g_out_w[SHAPE_COUNT][OUTLINE_PTS];
 bool  g_out_init = false;
 
 void toast(const char* msg);
-int bar_bottom() { return (e_active >= 0 || e_wmode || e_dmode || e_hmode || e_gmode) ? 2 * ROW_H : ROW_H; }
+int bar_bottom() { return (e_active >= 0 || e_wmode || e_dmode || e_smode || e_gmode) ? 2 * ROW_H : ROW_H; }
 // The bars sit at the top, or (a tap on the hint line moves them) just above the footer, so what's
 // under them can be edited too - hair is usually right at the top.
 bool e_low = false;
@@ -1110,7 +1239,11 @@ int vis_bot() { return e_low ? hint_y() : IMG_H - FOOT_H; }
 const char* wtool_label(uint8_t t) {
     if (t == WT_SMART) return "Smart";
     if (t == WT_GRID) return "Grid";
-    if (t == WT_LINE && e_hmode) return "Pin";
+    if (t == WT_LINE && e_smode) {                     // the guide tool, per kind
+        const Sway* h = (e_si >= 0 && e_si < e_ns) ? &e_s[e_si] : nullptr;
+        if (!h || h->kind == SK_HAIR) return "Locks";
+        return h->kind == SK_CLOTH ? (h->ng == 0 || h->gn[0] < 2 ? "Waist" : "Folds") : "Pin";
+    }
     return t == WT_ERASE ? "Erase" : (t == WT_POLY ? "Shape" : (t == WT_LINE ? (e_wi >= 0 && e_w[e_wi].mode == W_OCEAN ? "Shore" : "Flow") : "Paint"));
 }
 
@@ -1144,30 +1277,19 @@ void e_dab(int x, int y) {
 // ---- smart selection -----------------------------------------------------------------------------
 void e_draw();
 Plane* e_plane() { return (e_pi >= 0 && e_pi < e_np) ? &e_p[e_pi] : nullptr; }
-Hang* e_hang() { return (e_hi >= 0 && e_hi < e_nh) ? &e_h[e_hi] : nullptr; }
-bool e_new_hang() {
-    if (e_nh >= HANG_MAX) return false;
-    Hang& h = e_h[e_nh];
-    hang_free(h);
-    h = Hang();
-    h.ax = h.ay = h.bx = h.by = -1;                // (no pin yet: it hangs from its top)
-    if (!hang_ensure_mask(h, water_alloc)) return false;
-    e_hi = e_nh++;
-    e_pinned = 0;
+Sway* e_sway() { return (e_si >= 0 && e_si < e_ns) ? &e_s[e_si] : nullptr; }
+bool e_new_sway() {
+    if (e_ns >= SWAY_MAX) return false;
+    Sway& h = e_s[e_ns];
+    sway_free(h);
+    h = Sway();
+    if (!sway_ensure_mask(h, water_alloc)) return false;
+    e_si = e_ns++;
     return true;
-}
-// Where it hangs from when no Pin was set: the middle of its top row.
-void hang_default_pin(Hang& h) {
-    if (h.ax >= 0 || !h.mask) return;
-    for (int y = 0; y < IMG_H; ++y) {
-        int a = -1, b = -1;
-        for (int x = 0; x < IMG_W; ++x) if (mask_get(h.mask, x, y)) { if (a < 0) a = x; b = x; }
-        if (a >= 0) { h.ax = (int16_t)a; h.bx = (int16_t)b; h.ay = h.by = (int16_t)y; return; }
-    }
 }
 uint8_t* e_cur_mask() {
     if (e_dmode) { Plane* p = e_plane(); return p ? p->mask : nullptr; }
-    if (e_hmode) { Hang* h = e_hang(); return h ? h->mask : nullptr; }
+    if (e_smode) { Sway* h = e_sway(); return h ? h->mask : nullptr; }
     Water* w = e_water(); return w ? w->mask : nullptr;
 }
 // ---- the ground grid: fitted by eye to the ground (Grid button). Depth planes stand on it and the water
@@ -1315,7 +1437,7 @@ void e_smart_run() {
     if (!m || !e_smart_mem()) return;
     memcpy(m, e_before, MASK_BYTES);
     SelGrow g = sel_grow((const uint16_t*)g_img.getBuffer(), g_swapped, e_marks, e_gstep, e_selbuf, water_alloc);
-    int n = sel_apply(m, e_selbuf, e_gadd, (e_dmode || e_hmode) ? -1 : 1, water_alloc, e_marks);   // water keeps off the bank; planes / hangs take their rim
+    int n = sel_apply(m, e_selbuf, e_gadd, (e_dmode || e_smode) ? -1 : 1, water_alloc, e_marks);   // water keeps off the bank; planes / hangs take their rim
     e_glevels = g.levels; e_gidx = g.index; e_glive = g.levels > 0;
     char msg[48];
     if (!n) snprintf(msg, sizeof(msg), e_gadd ? "Already in - try another spot" : "Nothing to remove there");
@@ -1364,14 +1486,15 @@ void e_finish() {
             mask_poly(e_marks, e_px, e_py, e_pn, true);
             if (!sel_grabcut((const uint16_t*)g_img.getBuffer(), g_swapped, e_marks, e_selbuf, water_alloc))   // GrabCut
                 sel_snap((const uint16_t*)g_img.getBuffer(), g_swapped, e_marks, 8, e_selbuf, water_alloc);      // (low memory)
-            sel_apply(m, e_selbuf, true, (e_dmode || e_hmode) ? -1 : 1, water_alloc);
+            sel_apply(m, e_selbuf, true, (e_dmode || e_smode) ? -1 : 1, water_alloc);
         } else {
             mask_poly(m, e_px, e_py, e_pn, true);
         }
         e_pn = 0; e_glive = false;
         toast("Fitted - Smart/Paint/Erase to touch up");
-    } else if (e_wtool == WT_LINE && e_hmode) {
-        toast("Pinned - tap again to move it");
+    } else if (e_wtool == WT_LINE && e_smode) {
+        const Sway* h = e_sway();
+        toast(!h || h->ng == 0 ? "No guides: it gets the dimmed ones" : "Guides kept - B saves");
     } else if (e_wtool == WT_LINE && w) {
         if (e_pn < 2) { toast("Tap 2+ points along the water"); return; }
         if (w->nlines >= WLINE_MAX) { toast("3 lines max - A removes the last"); return; }
@@ -1385,9 +1508,13 @@ void e_finish() {
 }
 
 void e_undo_point() {
-    if (e_hmode && e_wtool == WT_LINE) {               // Pin: clear it (it hangs from its top again)
-        Hang* h = e_hang();
-        if (h) { h->ax = h->ay = h->bx = h->by = -1; e_pinned = 0; toast("Pin cleared - it hangs from its top"); e_dirty = true; }
+    if (e_smode && e_wtool == WT_LINE) {               // guides: the last lock / fold / pin off
+        Sway* h = e_sway();
+        if (!h || h->ng == 0) { toast("No guides yet"); return; }
+        if (h->kind == SK_CLOTH && h->ng == 1 && h->gn[0] == 2) h->gn[0] = 1;   // (the waistband's second end)
+        else { --h->ng; h->gn[h->ng] = 0; }
+        toast(h->kind == SK_HAIR ? "Removed the last lock" : (h->kind == SK_CLOTH ? "Removed the last mark" : "Pin cleared"));
+        e_dirty = true;
         return;
     }
     Water* w = e_water();
@@ -1429,13 +1556,14 @@ void e_tint_planes(M5Canvas& c) {
     }
 }
 
-void e_tint_hangs(M5Canvas& c) {
+// Hair / cloth / pendants: their selection tinted, and the guides of the one being edited.
+void e_tint_sways(M5Canvas& c) {
+    if (!e_smode) return;
     uint16_t* buf = (uint16_t*)c.getBuffer();
-    for (int k = 0; k < e_nh; ++k) {
-        const uint8_t* m = e_h[k].mask;
+    for (int k = 0; k < e_ns; ++k) {
+        const uint8_t* m = e_s[k].mask;
         if (!m) continue;
-        const bool act = e_hmode && k == e_hi;
-        if (!e_hmode) continue;
+        const bool act = k == e_si;
         for (int i = 0; i < IMG_W * IMG_H; ++i) {
             if (!((m[i >> 3] >> (i & 7)) & 1)) continue;
             uint16_t px = g_swapped ? bswap16(buf[i]) : buf[i];
@@ -1443,22 +1571,51 @@ void e_tint_hangs(M5Canvas& c) {
             buf[i] = g_swapped ? bswap16(px) : px;
         }
     }
-    const Hang* h = e_hang();
-    if (!e_hmode || !h || h->ax < 0) return;
-    c.drawWideLine(h->ax, h->ay, h->bx, h->by, 3.0f, C_BLACK);
-    c.drawWideLine(h->ax, h->ay, h->bx, h->by, 1.5f, C_YEL);
-    c.fillCircle(h->ax, h->ay, 3, C_YEL);
-    c.fillCircle(h->bx, h->by, 3, C_YEL);
-    if (hang_count(*h) < 12) return;                   // which way it hangs
-    const float rx = (h->ax + h->bx) * 0.5f, ry = (h->ay + h->by) * 0.5f;
-    float dx, dy;
-    hang_dir(*h, dx, dy);
-    float l = sqrtf(dx * dx + dy * dy);
-    if (l < 4) { dx = 0; dy = 1; l = 1; }
-    dx /= l; dy /= l;
-    const float ex = rx + dx * 16, ey = ry + dy * 16;
-    c.drawWideLine(rx, ry, ex, ey, 1.0f, C_YEL);
-    c.fillTriangle((int)(ex + dx * 5), (int)(ey + dy * 5), (int)(ex - dy * 3), (int)(ey + dx * 3), (int)(ex + dy * 3), (int)(ey - dx * 3), C_YEL);
+    const Sway* h = e_sway();
+    if (!h) return;
+    static Sway d;                                      // (none drawn yet: the ones it will get, dimmed)
+    d = Sway();
+    const Sway* g = h;
+    bool dflt = false;
+    if (h->ng == 0 && h->mask && sway_count(*h) >= 12) {
+        d.kind = h->kind; d.mask = h->mask;
+        sway_default_guides(d);
+        d.mask = nullptr;
+        g = &d; dflt = true;
+    }
+    const uint16_t col = dflt ? C_DIM : C_YEL;
+    for (int k = 0; k < g->ng; ++k) {
+        const int n = g->gn[k];
+        if (g->kind == SK_HAIR || (g->kind == SK_CLOTH && k == 0)) {
+            for (int i = 0; i + 1 < n; ++i) {
+                c.drawWideLine(g->gx[k][i], g->gy[k][i], g->gx[k][i + 1], g->gy[k][i + 1], 3.0f, C_BLACK);
+                c.drawWideLine(g->gx[k][i], g->gy[k][i], g->gx[k][i + 1], g->gy[k][i + 1], 1.5f, col);
+            }
+            c.fillCircle((int)g->gx[k][0], (int)g->gy[k][0], 3, col);          // the root / waistband ends
+            if (g->kind == SK_CLOTH && n > 1) c.fillCircle((int)g->gx[k][n - 1], (int)g->gy[k][n - 1], 3, col);
+            if (g->kind == SK_HAIR && n > 1) {                                   // the tip: which way it runs
+                float dx = g->gx[k][n - 1] - g->gx[k][n - 2], dy = g->gy[k][n - 1] - g->gy[k][n - 2], l = sqrtf(dx * dx + dy * dy);
+                if (l > 0.5f) {
+                    dx /= l; dy /= l;
+                    const float ex = g->gx[k][n - 1], ey = g->gy[k][n - 1];
+                    c.fillTriangle((int)(ex + dx * 5), (int)(ey + dy * 5), (int)(ex - dy * 3), (int)(ey + dx * 3), (int)(ex + dy * 3), (int)(ey - dx * 3), col);
+                }
+            }
+        } else if (g->kind == SK_CLOTH) {                                        // a fold: a short line down the cloth
+            float ex = 1, ey = 0;
+            if (g->gn[0] >= 2) { ex = g->gx[0][1] - g->gx[0][0]; ey = g->gy[0][1] - g->gy[0][0]; const float l = sqrtf(ex * ex + ey * ey); if (l > 0.5f) { ex /= l; ey /= l; } }
+            float nx = -ey, ny = ex;
+            if (ny < 0) { nx = -nx; ny = -ny; }
+            const float x0 = g->gx[k][0], y0 = g->gy[k][0];
+            c.drawWideLine(x0 - nx * 6, y0 - ny * 6, x0 + nx * 6, y0 + ny * 6, 3.0f, C_BLACK);
+            c.drawWideLine(x0 - nx * 6, y0 - ny * 6, x0 + nx * 6, y0 + ny * 6, 1.5f, col);
+        } else {                                                                 // pendant: its pin
+            c.fillCircle((int)g->gx[k][0], (int)g->gy[k][0], 4, C_BLACK);
+            c.fillCircle((int)g->gx[k][0], (int)g->gy[k][0], 3, col);
+        }
+    }
+    if (e_stroke)                                                                // the lock being drawn
+        for (int k = 1; k < e_pn; ++k) c.drawWideLine(e_px[k - 1], e_py[k - 1], e_px[k], e_py[k], 1.5f, C_LIME);
 }
 
 void e_draw_lines(M5Canvas& c) {
@@ -1542,12 +1699,17 @@ const char* context_hint() {
         default:       return "Tap around it  -  A undo  -  C fill (fitted)";
         }
     }
-    if (e_hmode) {
+    if (e_smode) {
         switch (e_wtool) {
-        case WT_BRUSH: return "Paint what hangs (hair, cloth)  -  A/C size";
+        case WT_BRUSH: return "Paint what sways (hair, cloth...)  -  A/C size";
         case WT_SMART: return "Tap or paint over it  -  hold: remove";
         case WT_ERASE: return "Erase  -  A/C size";
-        case WT_LINE:  return "Tap where it hangs from (1 or 2)  -  A clear";
+        case WT_LINE: {
+            const Sway* h = e_sway();
+            if (!h || h->kind == SK_HAIR) return "Drag each lock, root to tip  -  A undo";
+            if (h->kind == SK_PENDANT) return "Tap where it hangs from  -  A clear";
+            return (h->ng == 0 || h->gn[0] < 2) ? "Tap both ends of the waistband  -  A undo" : "Tap the folds (optional)  -  A undo";
+        }
         default:       return "Tap around it  -  A undo  -  C fill (fitted)";
         }
     }
@@ -1584,10 +1746,10 @@ void bar_button(M5Canvas& c, int row, int i, int n, bool on, bool live) {
 void e_draw() {
     M5Canvas& c = g_scratch;
     memcpy(c.getBuffer(), g_img.getBuffer(), (size_t)IMG_W * IMG_H * 2);
-    if (!e_dmode && !e_hmode) e_tint_water(c);
+    if (!e_dmode && !e_smode) e_tint_water(c);
     e_tint_planes(c);
-    e_tint_hangs(c);
-    if (!e_dmode && !e_hmode) e_draw_lines(c);
+    e_tint_sways(c);
+    if (!e_dmode && !e_smode) e_draw_lines(c);
     if (e_mm()) e_draw_grid(c);
     if (e_mm() && e_wtool == WT_SMART && t_down && e_marks) {      // the stroke being painted
         uint16_t* buf = (uint16_t*)c.getBuffer();
@@ -1626,11 +1788,11 @@ void e_draw() {
     for (int i = 0; i < TB1_N; ++i) {
         int x0 = i * IMG_W / TB1_N, x1 = (i + 1) * IMG_W / TB1_N;
         int cx = (x0 + x1) / 2, cy = by + ROW_H / 2;
-        bool on = (i < SHAPE_COUNT && e_armed == i) || (i == TB1_WATER && e_wmode) || (i == TB1_DEPTH && e_dmode) || (i == TB1_HANG && e_hmode) || (i == TB1_GRID && e_gmode);
+        bool on = (i < SHAPE_COUNT && e_armed == i) || (i == TB1_WATER && e_wmode) || (i == TB1_DEPTH && e_dmode) || (i == TB1_SWAY && e_smode) || (i == TB1_GRID && e_gmode);
         bar_button(c, 0, i, TB1_N, on, true);
-        if (i == TB1_WATER || i == TB1_DEPTH || i == TB1_HANG || i == TB1_GRID) {
+        if (i == TB1_WATER || i == TB1_DEPTH || i == TB1_SWAY || i == TB1_GRID) {
             c.setTextColor(on ? C_LIME : C_TEXT);
-            c.drawString(i == TB1_WATER ? "Water" : (i == TB1_DEPTH ? "Depth" : (i == TB1_HANG ? "Hang" : "Grid")), cx, cy);
+            c.drawString(i == TB1_WATER ? "Water" : (i == TB1_DEPTH ? "Depth" : (i == TB1_SWAY ? "Sway" : "Grid")), cx, cy);
         } else if (i < SHAPE_COUNT) {
             Zone icon;
             icon.shape = (uint8_t)i;
@@ -1647,9 +1809,10 @@ void e_draw() {
     // Row 2 (grid): turn · turn · reset · on/off
     if (e_gmode) {
         c.fillRect(0, by2, IMG_W, ROW_H, C_BG);
-        const char* lbl[TB2G_N] = {"Turn <", "Turn >", "Reset", e_pgrid ? "Grid: on" : "Grid: off"};
+        const bool mv = e_pprm[PP_GROUND] >= 0.5f;
+        const char* lbl[TB2G_N] = {"Turn <", "Turn >", "Reset", e_pgrid ? "Grid: on" : "Grid: off", mv ? "Moves: on" : "Moves: off"};
         for (int i = 0; i < TB2G_N; ++i) {
-            bar_button(c, 1, i, TB2G_N, i == 3 && e_pgrid, true);
+            bar_button(c, 1, i, TB2G_N, (i == 3 && e_pgrid) || (i == 4 && mv), true);
             c.setTextColor(C_TEXT);
             c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2G_N), by2 + ROW_H / 2);
         }
@@ -1674,33 +1837,34 @@ void e_draw() {
         const Plane* p = e_plane();
         char pl[32], dp[16];
         snprintf(pl, sizeof(pl), "Plane %d/%d", e_pi + 1, e_np);
-        if (e_pgrid) snprintf(dp, sizeof(dp), e_pprm[PP_GROUND] >= 0.5f ? "Ground: on" : "Ground: off");
-        else snprintf(dp, sizeof(dp), "Depth %.1f", p ? p->depth : 0.0f);
+        if (e_pgrid && p && !p->fixed) snprintf(dp, sizeof(dp), "On ground");
+        else snprintf(dp, sizeof(dp), "Depth %.2f", p ? p->depth : 0.0f);
         const bool drift = e_pprm[PP_AMBIENT] > 0.0f;
         const char* lbl[TB2D_N] = {wtool_label(e_wtool), pl, dp, drift ? "Drift: on" : "Drift: off", "Del"};
         for (int i = 0; i < TB2D_N; ++i) {
-            bar_button(c, 1, i, TB2D_N, (i == 3 && drift) || (i == 2 && e_pgrid && e_pprm[PP_GROUND] >= 0.5f), true);
+            bar_button(c, 1, i, TB2D_N, i == 3 && drift, true);
             c.setTextColor(C_TEXT);
             c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2D_N), by2 + ROW_H / 2);
         }
     }
-    // Row 2 (hanging things): tool · which · kind · swing · delete
-    if (e_hmode) {
+    // Row 2 (hair / cloth / pendants): tool · which · kind · swing · delete
+    if (e_smode) {
         c.fillRect(0, by2, IMG_W, ROW_H, C_BG);
-        const Hang* h = e_hang();
+        const Sway* h = e_sway();
         char it[24], sw[16];
-        snprintf(it, sizeof(it), "Item %d/%d", e_hi + 1, e_nh);
-        const float s = h ? h->prm[HP_SWING] : 1.0f;
+        if (h && h->name[0]) snprintf(it, sizeof(it), "%.9s", h->name);
+        else snprintf(it, sizeof(it), "Item %d/%d", e_si + 1, e_ns);
+        const float s = h ? h->prm[SP_SWING] : 1.0f;
         snprintf(sw, sizeof(sw), "Swing: %s", s < 0.75f ? "low" : (s < 1.3f ? "mid" : "high"));
-        const char* lbl[TB2H_N] = {wtool_label(e_wtool), it, h ? hang_kind_info(h->kind).label : "-", sw, "Del"};
-        for (int i = 0; i < TB2H_N; ++i) {
-            bar_button(c, 1, i, TB2H_N, false, true);
+        const char* lbl[TB2S_N] = {wtool_label(e_wtool), it, h ? sway_kind_info(h->kind).label : "-", sw, "Del"};
+        for (int i = 0; i < TB2S_N; ++i) {
+            bar_button(c, 1, i, TB2S_N, false, true);
             c.setTextColor(C_TEXT);
-            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2H_N), by2 + ROW_H / 2);
+            c.drawString(lbl[i], (2 * i + 1) * IMG_W / (2 * TB2S_N), by2 + ROW_H / 2);
         }
     }
     // Row 2: selected zone's options
-    if (e_active >= 0 && !e_wmode && !e_dmode && !e_hmode && !e_gmode) {
+    if (e_active >= 0 && !e_wmode && !e_dmode && !e_smode && !e_gmode) {
         const Zone& z = e_z[e_active];
         c.fillRect(0, by2, IMG_W, ROW_H, C_BG);
         char feel[16];
@@ -1736,7 +1900,7 @@ void e_draw() {
             c.drawString("bigger  C", 265, fy + FOOT_H / 2);
         } else {
             c.drawString(pts ? "A  undo" : "A  smaller", 55, fy + FOOT_H / 2);
-            c.drawString(pts ? (e_wtool == WT_POLY ? "fill  C" : "done  C") : "bigger  C", 265, fy + FOOT_H / 2);
+            if (!(pts && e_smode)) c.drawString(pts ? (e_wtool == WT_POLY ? "fill  C" : "done  C") : "bigger  C", 265, fy + FOOT_H / 2);
         }
         if (!pts && e_wtool != WT_SMART && e_wtool != WT_GRID) {                   // brush size preview
             c.drawCircle(IMG_W - 14, fy - 14, e_brush < 12 ? e_brush : 12, C_LIME);
@@ -1793,15 +1957,15 @@ void e_close(bool save) {
             if (e_pgrid) memcpy(g_wat[g_nw].gq, e_gq, sizeof(e_gq));
             ++g_nw;
         }
-        clear_hangs();
-        for (int k = 0; k < e_nh; ++k) {
-            if (hang_count(e_h[k]) < 12) continue;       // an empty one isn't kept
-            hang_default_pin(e_h[k]);
-            hang_copy_def(g_hang[g_nh], e_h[k], water_alloc);
-            ++g_nh;
+        for (int i = 0; i < g_ns; ++i) sway_free(g_sway[i]);   // (the body lines stay)
+        g_ns = 0;
+        for (int k = 0; k < e_ns; ++k) {
+            if (sway_count(e_s[k]) < 12) continue;       // an empty one isn't kept
+            if (e_s[k].kind == SK_CLOTH && e_s[k].ng > 0 && e_s[k].gn[0] < 2) e_s[k].ng = 0;   // (half a waistband: its own)
+            sway_default_guides(e_s[k]);                 // (no guides drawn: the ones shown dimmed)
+            sway_copy_def(g_sway[g_ns], e_s[k], water_alloc);
+            ++g_ns;
         }
-        prepare_hangs();
-        prepare_waters();
         parallax_free(g_par);
         g_par = Parallax();
         for (int p = 0; p < PP_COUNT; ++p) g_par.prm[p] = e_pprm[p];
@@ -1811,13 +1975,15 @@ void e_close(bool save) {
             plane_copy_def(g_par.pl[g_par.n], e_p[k], water_alloc);
             ++g_par.n;
         }
+        prepare_sways();                                  // (they rest on the figures: after the planes)
+        prepare_waters();
         save_zones();
     }
     for (int i = 0; i < e_nw; ++i) water_free(e_w[i]);
     for (int k = 0; k < e_np; ++k) plane_free(e_p[k]);
     e_np = 0; e_pi = -1; e_dmode = false;
-    for (int k = 0; k < e_nh; ++k) hang_free(e_h[k]);
-    e_nh = 0; e_hi = -1; e_hmode = false;
+    for (int k = 0; k < e_ns; ++k) sway_free(e_s[k]);
+    e_ns = 0; e_si = -1; e_smode = false;
     e_smart_free();
     e_nw = 0; e_wi = -1; e_wmode = false; e_pn = 0;
     layer_sync();                                     // the editor drew on the canvas the layer may use
@@ -1851,7 +2017,7 @@ void e_bar_tap(int x, int y, uint32_t held) {
         int i = x * TB1_N / IMG_W;
         if (i == TB1_GRID) {                          // the ground grid on / off
             e_gmode = !e_gmode;
-            e_wmode = false; e_dmode = false; e_hmode = false;
+            e_wmode = false; e_dmode = false; e_smode = false;
             e_armed = -1; e_active = -1; e_pn = 0; e_glive = false;
             if (e_gmode) {
                 e_wtool = WT_GRID;
@@ -1867,19 +2033,19 @@ void e_bar_tap(int x, int y, uint32_t held) {
             return;
         }
         if (e_gmode) { e_gmode = false; e_wtool = WT_SMART; }
-        if (i == TB1_HANG) {                          // hanging things on / off
-            e_hmode = !e_hmode;
+        if (i == TB1_SWAY) {                          // hanging things on / off
+            e_smode = !e_smode;
             e_wmode = false; e_dmode = false;
             e_armed = -1; e_active = -1; e_pn = 0; e_glive = false;
             if (e_wtool == WT_GRID) e_wtool = WT_SMART;
-            if (e_hmode && e_nh == 0) e_new_hang();
-            if (e_hmode) toast(e_low ? "Select it, then Pin where it hangs" : "At the top? Tap this line: bars go down");
+            if (e_smode && e_ns == 0) e_new_sway();
+            if (e_smode) toast(e_low ? "Select it, then its guides (Tool)" : "At the top? Tap this line: bars go down");
             e_dirty = true;
             return;
         }
         if (i == TB1_DEPTH) {                         // depth planes on / off
             e_dmode = !e_dmode;
-            e_wmode = false; e_hmode = false;
+            e_wmode = false; e_smode = false;
             e_armed = -1; e_active = -1; e_pn = 0; e_glive = false;
             if (e_wtool == WT_LINE) e_wtool = WT_SMART;
             if (e_dmode && e_np == 0) e_new_plane();
@@ -1888,7 +2054,7 @@ void e_bar_tap(int x, int y, uint32_t held) {
             return;
         }
         if (i == TB1_WATER) {                         // water editing on / off
-            e_dmode = false; e_hmode = false; e_glive = false;
+            e_dmode = false; e_smode = false; e_glive = false;
             e_wmode = !e_wmode;
             e_armed = -1; e_active = -1; e_pn = 0;
             if (e_wmode && e_nw == 0) e_new_water();
@@ -1897,7 +2063,7 @@ void e_bar_tap(int x, int y, uint32_t held) {
             return;
         }
         if (i < SHAPE_COUNT) {
-            e_wmode = false; e_dmode = false; e_hmode = false; e_pn = 0;
+            e_wmode = false; e_dmode = false; e_smode = false; e_pn = 0;
             if (e_armed == i) { e_armed = -1; e_dirty = true; return; }
             if (e_n >= MAX_ZONES) { toast("4 zones max - Del one first"); return; }
             e_armed = i;
@@ -1917,35 +2083,46 @@ void e_bar_tap(int x, int y, uint32_t held) {
             if (e_pgrid && e_gq[0] == 0 && e_gq[1] == 0 && e_gq[2] == 0) e_grid_default();
             toast(e_pgrid ? "Grid on" : "Grid off - flat water, planes at their own depth");
             break;
+        case 4:                                   // does the ground itself slide when you tilt?
+            e_pprm[PP_GROUND] = e_pprm[PP_GROUND] >= 0.5f ? 0.0f : 1.0f;
+            toast(e_pprm[PP_GROUND] >= 0.5f ? "The ground slides too when you tilt" : "The ground stays put (planes still stand on it)");
+            break;
         }
         e_dirty = true;
         return;
     }
-    if (e_hmode) {
-        Hang* h = e_hang();
-        switch (x * TB2H_N / IMG_W) {
-        case 0:                                   // tool: Paint → Smart → Erase → Shape → Pin
+    if (e_smode) {
+        Sway* h = e_sway();
+        switch (x * TB2S_N / IMG_W) {
+        case 0:                                   // tool: Paint → Smart → Erase → Shape → its guides
             e_wtool = (uint8_t)((e_wtool + 1) % WT_COUNT);
             if (e_wtool == WT_GRID) e_wtool = WT_BRUSH;
-            e_pn = 0; e_glive = false; e_pinned = 0;
+            e_pn = 0; e_glive = false; e_stroke = false;
+            if (e_wtool == WT_LINE && h)
+                toast(h->kind == SK_HAIR ? "Drag along each lock, from its root" : (h->kind == SK_CLOTH ? "Tap the waistband's two ends" : "Tap where it hangs from"));
             break;
         case 1:                                   // next one (hold: a new one)
-            if (held >= 500) { if (!e_new_hang()) toast("3 hanging things max"); else toast("New - select it"); }
-            else if (e_nh > 0) { e_hi = (e_hi + 1) % e_nh; e_pinned = 0; }
-            e_pn = 0; e_glive = false;
+            if (held >= 500) { if (!e_new_sway()) toast("4 max - Del one first"); else toast("New - select it"); }
+            else if (e_ns > 0) e_si = (e_si + 1) % e_ns;
+            e_pn = 0; e_glive = false; e_stroke = false;
             break;
-        case 2:                                   // hair → cloth → charm
-            if (h) h->kind = (uint8_t)((h->kind + 1) % HANG_KIND_COUNT);
+        case 2:                                   // hair → cloth → pendant (its guides start over)
+            if (h) {
+                h->kind = (uint8_t)((h->kind + 1) % SK_COUNT);
+                h->ng = 0; memset(h->gn, 0, sizeof(h->gn));
+                h->lax = h->lay = h->lbx = h->lby = -1;
+                toast(h->kind == SK_HAIR ? "Hair: draw its locks (Tool)" : (h->kind == SK_CLOTH ? "Cloth: its waistband (Tool)" : "Pendant: its pin (Tool)"));
+            }
             break;
         case 3:                                   // swing: low → mid → high
-            if (h) h->prm[HP_SWING] = h->prm[HP_SWING] < 0.75f ? 1.0f : (h->prm[HP_SWING] < 1.3f ? 1.6f : 0.5f);
+            if (h) h->prm[SP_SWING] = h->prm[SP_SWING] < 0.75f ? 1.0f : (h->prm[SP_SWING] < 1.3f ? 1.6f : 0.5f);
             break;
         case 4:                                   // delete this one
             if (h) {
-                hang_free(*h);
-                for (int k = e_hi; k < e_nh - 1; ++k) { e_h[k] = e_h[k + 1]; e_h[k + 1] = Hang(); }
-                --e_nh;
-                if (e_nh == 0) e_new_hang(); else if (e_hi >= e_nh) e_hi = e_nh - 1;
+                sway_free(*h);
+                for (int k = e_si; k < e_ns - 1; ++k) { e_s[k] = e_s[k + 1]; e_s[k + 1] = Sway(); }
+                --e_ns;
+                if (e_ns == 0) e_new_sway(); else if (e_si >= e_ns) e_si = e_ns - 1;
                 toast("Deleted");
                 e_glive = false;
             }
@@ -1969,14 +2146,17 @@ void e_bar_tap(int x, int y, uint32_t held) {
             e_pn = 0; e_glive = false;
             break;
         case 2:                                   // its depth: far → near
-            if (e_pgrid) {                        // with the grid: planes stand on it; does the ground slide too?
-                e_pprm[PP_GROUND] = e_pprm[PP_GROUND] >= 0.5f ? 0.0f : 1.0f;
-                toast(e_pprm[PP_GROUND] >= 0.5f ? "The ground slides too (planes stand on it)" : "The ground stays put (planes stand on it)");
-            }
-            else if (p) {
-                int k = 0;
-                while (k < 5 && DEPTHS[k] < p->depth - 0.01f) ++k;
-                p->depth = DEPTHS[(k + 1) % 5];
+            // its depth: with a grid it stands where it meets the ground, or (tap on) set by hand
+            // 0.15 … 0.9, then back on the ground. Without a grid: by hand only.
+            if (p) {
+                if (e_pgrid && !p->fixed) { p->fixed = true; p->depth = DEPTHS[0]; toast("Depth by hand (it doesn't stand on the ground)"); }
+                else {
+                    int k = 0;
+                    while (k < 5 && DEPTHS[k] < p->depth - 0.01f) ++k;
+                    if (e_pgrid && k >= 4) { p->fixed = false; toast("Stands on the ground: depth from where it meets it"); }
+                    else p->depth = DEPTHS[(k + 1) % 5];
+                    if (!e_pgrid) p->fixed = false;
+                }
                 p->ramp = false;
             }
             break;
@@ -2061,12 +2241,17 @@ void e_bar_tap(int x, int y, uint32_t held) {
 void e_image_tap(int x, int y, uint32_t held) {
     (void)held;
     if (e_mm()) {
-        if (e_hmode && e_wtool == WT_LINE) {           // Pin: A, then B (a third tap starts over)
-            Hang* h = e_hang();
-            if (h) {
-                if (e_pinned == 0) { h->ax = h->bx = (int16_t)x; h->ay = h->by = (int16_t)y; e_pinned = 1; toast("Pinned at a point - tap again for a line"); }
-                else { h->bx = (int16_t)x; h->by = (int16_t)y; e_pinned = 0; toast("Pinned along a line"); }
-            }
+        if (e_smode && e_wtool == WT_LINE) {           // guides by tap: cloth's waistband and folds, a pendant's pin
+            Sway* h = e_sway();
+            if (h && h->kind == SK_PENDANT) {
+                h->ng = 1; h->gn[0] = 1; h->gx[0][0] = (float)x; h->gy[0][0] = (float)y;
+                toast("Pinned - it swings from here");
+            } else if (h && h->kind == SK_CLOTH) {
+                if (h->ng == 0) { h->ng = 1; h->gn[0] = 1; h->gx[0][0] = (float)x; h->gy[0][0] = (float)y; toast("Now the waistband's other end"); }
+                else if (h->gn[0] < 2) { h->gn[0] = 2; h->gx[0][1] = (float)x; h->gy[0][1] = (float)y; toast("Waistband set - tap folds, or done"); }
+                else if (h->ng < SG_MAX) { h->gn[h->ng] = 1; h->gx[h->ng][0] = (float)x; h->gy[h->ng][0] = (float)y; ++h->ng; toast("Fold marked"); }
+                else toast("That's the most folds");
+            } else toast("Drag along the lock, from its root to its tip");
             e_dirty = true;
             return;
         }
@@ -2238,9 +2423,10 @@ void present() {
 void clear_zones() {
     for (int i = 0; i < g_n; ++i) free_map(g_z[i]);
     g_n = 0;
-    clear_hangs();
+    clear_sways();
     clear_waters();
     clear_parallax();
+    g_keep_len = 0;
     g_jig_path[0] = 0;
 }
 
@@ -2268,10 +2454,10 @@ void load_zones(const char* image_path) {
         if (!ok) return;
         if (parse_water_line(ln, g_wat, g_nw, wcur)) return;
         if (parse_parallax_line(ln, g_par, pcur, water_alloc)) return;
-        if (parse_hang_line(ln, g_hang, g_nh, hcur, water_alloc)) return;
-        if (g_n >= MAX_ZONES) return;
+        if (parse_sway_line(ln, g_sway, g_ns, hcur, g_body, water_alloc)) { g_body_saved |= g_body != nullptr; return; }
         Zone z;
-        if (!parse_zone(ln, z)) return;
+        if (!parse_zone(ln, z)) { keep_line(ln); return; }
+        if (g_n >= MAX_ZONES) return;
         g_z[g_n] = z;
         rebuild(g_z[g_n]);
         g_shown[g_n] = false;
@@ -2294,10 +2480,10 @@ void load_zones(const char* image_path) {
     }
     if (len > 0 && !skipping && ok) { line[len] = 0; take_line(line); }
     f.close();
-    prepare_hangs();
+    prepare_sways();                                   // (rests on the body lines, else the depth figures' masks)
     prepare_waters();
     prepare_parallax();
-    Serial.printf("jig: %d zone(s), %d water, %d depth plane(s), %d hanging from %s\n", g_n, g_nw, g_par.n, g_nh, g_jig_path);
+    Serial.printf("jig: %d zone(s), %d water, %d depth plane(s), %d hair / cloth / pendant from %s\n", g_n, g_nw, g_par.n, g_ns, g_jig_path);
 }
 
 void play_tick(uint32_t now, bool may_draw) {
@@ -2347,12 +2533,13 @@ void play_tick(uint32_t now, bool may_draw) {
     if (have) g_motion_echo.update(dt, dyn, gdev, g_w);
     for (int i = 0; i < g_nw; ++i)                     // water: real gravity + your jolts
         if (g_wat[i].edge) water_step(g_wat[i], dt, dn_live, dyn);
-    for (int i = 0; i < g_nh; ++i)                     // hanging things: the same
-        if (g_hang[i].ready) { if (hang_step(g_hang[i], dt, dn_live, dyn)) g_hang[i].drawn = false; }
     // Swayed back and forth and stopped: the forms keep swaying on their own springs, dying out
     // slowly (damping eased off, coming back over ECHO_FADE_S). Nothing is replayed.
     g_echo = g_motion_echo.strength();
     for (int i = 0; i < g_n; ++i) g_z[i].damp_k = 1.0f - ECHO_DAMP_CUT * g_echo;
+    g_sway_damp = 1.0f - ECHO_DAMP_CUT * g_echo;
+    for (int i = 0; i < g_ns; ++i)                     // hair / cloth / pendants: real gravity + your jolts (+ the echo)
+        if (g_sway[i].ready) { if (sway_step(g_sway[i], dt, dn_live, dyn, g_sway_damp, g_sdf)) g_sway[i].drawn = false; }
     bool echoing = g_echo > 0.02f;
     if (echoing != g_was_echo) {
         g_was_echo = echoing;
@@ -2366,7 +2553,7 @@ void play_tick(uint32_t now, bool may_draw) {
     // or clicks never lock, so they never kick anything. Before the lock nothing moves.
     bool mic_beat = false;
     g_mic_new = false;
-    const bool want_mic = MIC_DANCE && g_dance_on && g_n > 0;
+    const bool want_mic = MIC_DANCE && g_dance_on && (g_n > 0 || g_ns > 0);
     if (want_mic && !g_mic_on) {
         if (M5.Speaker.isEnabled()) M5.Speaker.end(); // Core2: mic and speaker share one I2S port
         g_mic_on = M5.Mic.isEnabled() || M5.Mic.begin();
@@ -2404,9 +2591,12 @@ void play_tick(uint32_t now, bool may_draw) {
     const bool beat = music && mic_beat;
     const int sign = g_rhythm_mic.beat_sign();
 
-    if (g_n == 0 && g_nw == 0 && g_nh == 0 && !g_par.ready) return;   // nothing to animate (water / depth / hangs alone still do)
+    if (g_n == 0 && g_nw == 0 && g_ns == 0 && !g_par.ready) return;   // nothing to animate (water / depth / sways alone still do)
 
-    if (beat) {
+    if (beat)                                          // hair / cloth / pendants: the same small nudge, only if near rest
+        for (int i = 0; i < g_ns; ++i)
+            if (g_sway[i].ready && g_sway[i].disp < DANCE_SWAY_ROOM) { sway_kick(g_sway[i], DANCE_GAIN * g_dance * g_sway_damp, sign); g_sway[i].drawn = false; }
+    if (beat && g_n > 0) {
         float cen = 0;
         for (int i = 0; i < g_n; ++i) cen += g_z[i].cx;
         cen /= g_n;
@@ -2500,17 +2690,17 @@ void play_tick(uint32_t now, bool may_draw) {
             }
     }
     if (g_wj.phase) return;                            // (zones wait for the water to finish)
-    if (may_draw && g_nh > 0 && g_nw == 0 && now - g_last_hang >= FRAME_MS) {   // hanging things (no water)
-        int which[HANG_MAX];
-        const int nd = hang_update(false, which);
+    if (may_draw && g_ns > 0 && g_nw == 0 && now - g_last_sway >= FRAME_MS) {   // hair / cloth / pendants (no water)
+        int which[SWAY_MAX];
+        const int nd = sway_update(false, which);
         if (nd) {
-            g_last_hang = now;
-            hang_push(which, nd);
+            g_last_sway = now;
+            sway_push(which, nd);
             for (int k = 0; k < nd; ++k)                // zones over them draw on top
                 for (int i = 0; i < g_n; ++i) {
-                    const Hang& h = g_hang[which[k]];
+                    const Sway& h = g_sway[which[k]];
                     const Zone& z = g_z[i];
-                    if (z.wmap && regions_meet(z.bx, z.by, z.bx + z.bw, z.by + z.bh, h.x0, h.y0, h.x1, h.y1)) { g_shown[i] = true; any = true; }
+                    if (z.wmap && regions_meet(z.bx, z.by, z.bx + z.bw, z.by + z.bh, h.ux0, h.uy0, h.ux1, h.uy1)) { g_shown[i] = true; any = true; }
                 }
         }
     }
@@ -2530,8 +2720,8 @@ bool poke(int x, int y) {
             return true;
         }
     }
-    for (int i = 0; i < g_nh; ++i)                     // a tap on hair / cloth / a charm: a flick
-        if (g_hang[i].ready && hang_poke(g_hang[i], (float)x, (float)y)) { g_hang[i].drawn = false; return true; }
+    for (int i = 0; i < g_ns; ++i)                     // a tap on hair / cloth / a pendant: a flick
+        if (g_sway[i].ready && sway_poke(g_sway[i], (float)x, (float)y)) { g_sway[i].drawn = false; return true; }
     for (int i = 0; i < g_nw; ++i)                     // a tap on water: a ripple
         if (water_contains(g_wat[i], x, y)) { water_poke(g_wat[i], (float)x, (float)y, 160.0f, 2); return true; }
     return false;
@@ -2548,7 +2738,7 @@ bool dance_is_on() { return g_dance_on; }
 void refresh() {
     present();
     for (int i = 0; i < g_n; ++i) g_shown[i] = true;
-    for (int i = 0; i < g_nh; ++i) g_hang[i].drawn = false;
+    for (int i = 0; i < g_ns; ++i) g_sway[i].drawn = false;
     g_last_draw = 0;
 }
 bool animating() {
@@ -2556,7 +2746,7 @@ bool animating() {
     if (g_layer) return true;
     if (g_par.ready && g_par_moving) return true;
     for (int i = 0; i < g_n; ++i) if (g_z[i].awake) return true;
-    for (int i = 0; i < g_nh; ++i) if (g_hang[i].awake) return true;
+    for (int i = 0; i < g_ns; ++i) if (g_sway[i].awake) return true;
     return false;
 }
 
@@ -2586,12 +2776,12 @@ void editor_open() {
                 break;
             }
     e_gmode = false;
-    for (int k = 0; k < HANG_MAX; ++k) hang_free(e_h[k]);
-    e_nh = 0;
-    for (int k = 0; k < g_nh; ++k) { hang_copy_def(e_h[e_nh], g_hang[k], water_alloc); ++e_nh; }
-    e_hi = e_nh ? 0 : -1;
-    e_pinned = 0;
-    e_wmode = false; e_dmode = false; e_hmode = false; e_wtool = WT_BRUSH; e_pn = 0;
+    for (int k = 0; k < SWAY_MAX; ++k) sway_free(e_s[k]);
+    e_ns = 0;
+    for (int k = 0; k < g_ns; ++k) { sway_copy_def(e_s[e_ns], g_sway[k], water_alloc); ++e_ns; }
+    e_si = e_ns ? 0 : -1;
+    e_stroke = false;
+    e_wmode = false; e_dmode = false; e_smode = false; e_wtool = WT_BRUSH; e_pn = 0;
     e_active = -1;
     e_armed = -1;
     e_btn_ready = false;
@@ -2656,6 +2846,9 @@ void editor_tick(uint32_t now) {
             }
             if (!t_bar && e_mm() && e_wtool == WT_SMART) { e_bx = -1; e_mark(td.x, td.y); e_dirty = true; }
             if (!t_bar && e_mm() && e_wtool == WT_GRID) e_grid_press(td.x, td.y);
+            if (!t_bar && e_smode && e_wtool == WT_LINE && e_sway() && e_sway()->kind == SK_HAIR) {   // a lock: root here
+                e_stroke = true; e_pn = 1; e_px[0] = (int16_t)td.x; e_py[0] = (int16_t)td.y;
+            }
         } else if (!t_bar) {
             if (!t_moved && (abs(td.x - t_x0) > 6 || abs(td.y - t_y0) > 6)) t_moved = true;
             if (e_mm()) {                     // masks: drags paint / erase / mark (shape & line take taps)
@@ -2664,6 +2857,10 @@ void editor_tick(uint32_t now) {
                 }
                 if (e_wtool == WT_SMART && (td.x != t_lx || td.y != t_ly)) { e_mark(td.x, td.y); e_dirty = true; }
                 if (e_wtool == WT_GRID && t_moved && (td.x != t_lx || td.y != t_ly)) { e_grid_drag(td.x - t_lx, td.y - t_ly); e_dirty = true; }
+                if (e_stroke && e_pn < 32) {          // (a point every few px along the lock)
+                    const int dx = td.x - e_px[e_pn - 1], dy = td.y - e_py[e_pn - 1];
+                    if (dx * dx + dy * dy >= 25) { e_px[e_pn] = (int16_t)td.x; e_py[e_pn] = (int16_t)td.y; ++e_pn; e_dirty = true; }
+                }
                 if (e_wtool != WT_GRID || t_moved) { t_lx = td.x; t_ly = td.y; }
             } else if (t_moved) {             // first move applies the whole distance since touch-down
                 if (e_active >= 0 && (td.x != t_lx || td.y != t_ly)) {
@@ -2682,7 +2879,23 @@ void editor_tick(uint32_t now) {
         }
     } else if (t_down) {
         t_down = false;
-        if (!t_bar && e_mm() && e_wtool == WT_SMART && e_marks) {    // tap or stroke done: select from it
+        if (e_stroke) {                       // a lock drawn: kept (at most 16 points along it)
+            e_stroke = false;
+            Sway* h = e_sway();
+            if (t_moved && h && e_pn >= 2) {
+                if (h->ng >= SG_MAX) toast("6 locks max - A removes the last");
+                else {
+                    const int n = e_pn < SG_PTS ? e_pn : SG_PTS;
+                    for (int k = 0; k < n; ++k) {
+                        const int src = n > 1 ? k * (e_pn - 1) / (n - 1) : 0;
+                        h->gx[h->ng][k] = e_px[src]; h->gy[h->ng][k] = e_py[src];
+                    }
+                    h->gn[h->ng++] = n;
+                    toast(h->ng == 1 ? "Lock kept - draw the others the same way" : "Lock kept");
+                }
+            } else toast("Drag along the lock, from its root to its tip");
+            e_pn = 0; e_dirty = true;
+        } else if (!t_bar && e_mm() && e_wtool == WT_SMART && e_marks) {    // tap or stroke done: select from it
             e_smart_go(!(!t_moved && now - t_t0 >= 500));
         } else if (!t_moved) {
             if (t_bar)      e_bar_tap(t_x0, t_y0, now - t_t0);

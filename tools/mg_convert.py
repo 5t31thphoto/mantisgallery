@@ -5,8 +5,9 @@ Mantis Gallery — MG Converter (Tkinter GUI)
 Converts JPG/PNG/BMP/WEBP → .mg (RGB565 320×240) and can write
 .mg_index files so Core2 skips the first full SD scan.
 
-Jiggle tab (needs numpy, and jiggle_lab.py + jiggle_tab.py next to this file): open an .mg from the
-SD card, add jiggle zones, fine-tune and preview them, and save the .jig file beside the image.
+Dynamics Studio tab (needs numpy, and studio_tab.py, studio_model.py, jiggle_lab.py, mg_depth.py,
+mg_select.py, mg_sway.py next to this file): open an .mg from the SD card, build its scene as named layers,
+preview it with the Core2's own maths, and save the .jig file beside the image.
 
 Index format (matches firmware):
     MGIDX1
@@ -150,7 +151,7 @@ def run_gui() -> None:
 
     root = tk.Tk()
     root.title("Mantis Gallery — MG Converter")
-    root.geometry("1200x820")
+    root.geometry("1440x920")      # (the Dynamics Studio at 2× zoom; 1× fits smaller screens)
     root.minsize(640, 520)
     root.configure(bg="#1a1a1a")
 
@@ -400,21 +401,21 @@ def run_gui() -> None:
     log_box.pack(fill="both", expand=True, padx=14, pady=(6, 14))
     log_box.configure(state="disabled")
 
-    # ---- Jiggle tab -------------------------------------------------------------------------
+    # ---- Dynamics Studio tab ---------------------------------------------------------------
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        from jiggle_tab import JiggleTab
+        from studio_tab import StudioTab
         import jiggle_lab
         if jiggle_lab.np is None:
             raise ImportError("numpy is not installed (pip install numpy)")
-        nb.add(JiggleTab(nb, root), text="Jiggle")
+        nb.add(StudioTab(nb, root), text="Dynamics Studio")
     except ImportError as e:
         holder = tk.Frame(nb, bg="#1a1a1a")
-        tk.Label(holder, text=f"Jiggle editor unavailable: {e}\n\n"
-                              "It needs numpy (pip install numpy) and jiggle_lab.py + jiggle_tab.py\n"
-                              "in the same folder as mg_convert.py.",
+        tk.Label(holder, text=f"Dynamics Studio unavailable: {e}\n\n"
+                              "It needs numpy (pip install numpy) and studio_tab.py, studio_model.py,\n"
+                              "jiggle_lab.py, mg_depth.py, mg_select.py, mg_sway.py in the same folder as mg_convert.py.",
                  fg=muted, bg="#1a1a1a", justify="left").pack(padx=20, pady=20, anchor="w")
-        nb.add(holder, text="Jiggle")
+        nb.add(holder, text="Dynamics Studio")
 
     root.mainloop()
 

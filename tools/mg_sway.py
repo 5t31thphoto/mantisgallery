@@ -32,6 +32,7 @@ import numpy as np
 W, H = 320, 240
 SWAY_MAX = 4
 GUIDE_MAX = 6
+SR_MAX = 9                           # rods (cloth: fold lines, ≤ 8 panels)
 KINDS = ("hair", "cloth", "pendant")
 DT = 1.0 / 120.0
 BEND_MAX = math.radians(55)         # a joint bends at most this far past its bend in the photo
@@ -70,7 +71,9 @@ class Sway:
     def ok(self):
         if self.mask is None or self.mask.sum() < 12 or not self.guides:
             return False
-        return all(len(g) >= (1 if self.kind == "pendant" else 2) for g in self.guides)
+        if self.kind == "hair":                          # every lock root → tip
+            return all(len(g) >= 2 for g in self.guides)
+        return len(self.guides[0]) >= (1 if self.kind == "pendant" else 2)   # (cloth: then any marked folds, one point each)
 
 
 # ---- helpers -------------------------------------------------------------------------------------------
@@ -80,7 +83,14 @@ def grow1(m):
 
 
 def edt(seed):
-    """Exact-enough Euclidean distance to the nearest seed pixel (two-pass 8-neighbour propagation)."""
+    """Euclidean distance to the nearest seed pixel."""
+    try:
+        from scipy.ndimage import distance_transform_edt
+        if not seed.any():
+            return np.full(seed.shape, 1e6, np.float32)
+        return distance_transform_edt(~seed).astype(np.float32)
+    except ImportError:
+        pass
     from mg_depth import _nearest
     ny, nx, d = _nearest(seed, max(W, H))
     return np.sqrt(np.where(ny >= 0, d, 1e12)).astype(np.float32)
@@ -93,6 +103,24 @@ def body_sdf(body):
     out = edt(body)            # outside: distance to the body
     ins = edt(~body)           # inside: distance to the outside
     return np.where(body, -ins + 0.5, out - 0.5).astype(np.float32)
+
+
+def rest_body(body, masks):
+    """What the moving things rest on: the body without them, plus each of their pixels whose nearest
+    pixel that doesn't move is the body (a lock over her face lies on her; one hanging past her
+    against the wall is in front of the wall). body: the figures; masks: every sway's mask."""
+    if body is None or not body.any():
+        return None
+    mv = np.zeros((H, W), bool)
+    for m in masks:
+        if m is not None:
+            mv |= m
+    bp = body & ~mv; sc = ~body & ~mv
+    if not mv.any() or not bp.any():
+        return body.copy()
+    if not sc.any():
+        return body | mv
+    return bp | (mv & (edt(bp) <= edt(sc)))
 
 
 def sdf_at(sdf, x, y):
@@ -257,7 +285,9 @@ def matte(photo, mask, plate):
 
 # ---- the simulation ------------------------------------------------------------------------------------
 class SwaySim:
-    def __init__(self, sw: Sway, photo, body=None, sdf=None, forbid=None):
+    def __init__(self, sw: Sway, photo, body=None, sdf=None, forbid=None, plate=None):
+        """plate: a fill made before ((H, W, 3) image, (H, W) where it has one) - from a saved splate or
+        an earlier run; used where it has one (and the rest filled as usual)."""
         self.s = sw
         self.ok = sw is not None and sw.ok()
         if not self.ok:
@@ -278,12 +308,30 @@ class SwaySim:
             self.hole = grow1(grow1(self.moving)) & (cov >= 0)      # (the selection and the two rings the matte carries)
         # behind it: everything that can move away, filled from around it; its edge matted
         fb = grow1(grow1(sw.mask)) | (forbid if forbid is not None else False)
-        if self.body is not None:                       # behind what lies on her is her; behind what hangs free is the scene
+        given = None
+        if plate is not None:
+            pimg, have = plate
+            if (self.hole & ~have).sum() == 0:          # (it has all of it: nothing to fill)
+                given = np.where(have[..., None], np.asarray(pimg, np.float32), self.photo)
+        if given is not None:
+            self.plate = given
+        elif self.body is not None:                       # behind what lies on her is her; behind what hangs free is the scene
             onb = self.hole & self.body
             plate = inpaint_em(self.photo, self.hole & ~self.body, forbid=fb | self.body)
-            self.plate = inpaint_em(plate, onb, forbid=fb | ~self.body) if onb.any() else plate
+            if onb.any():
+                # Behind hair lying on her is the skin / cloth right next to it - never her dress from a
+                # hand's width away: sources only from her own pixels close around the hole (widened only
+                # if there's too little there).
+                near = edt(self.hole)
+                for reach in (8.0, 14.0, 24.0, 1e9):
+                    src = self.body & ~fb & (near <= reach)
+                    if src.sum() >= 60 + 2 * onb.sum() ** 0.5:
+                        break
+                plate = inpaint_em(plate, onb, forbid=~src | fb, win=max(10, int(min(reach, 40))))
+            self.plate = plate
         else:
             self.plate = inpaint_em(self.photo, self.hole, forbid=fb)
+        self.fill_hole = self.hole.copy()              # (where the fill is used: what a saved splate carries)
         self.alpha, self.texd, _ = matte(self.photo, self.moving, self.plate)
         if self.s.kind != "pendant":                    # the rings past it belong to its nearest lock / panel
             from mg_depth import _nearest
@@ -366,15 +414,22 @@ class SwaySim:
         sm = np.convolve(prof, np.ones(5) / 5, mode="same")
         cands = [i for i in range(3, len(sm) - 3) if sm[i] < sm[i - 3] - 2 and sm[i] < sm[i + 3] - 2 and sm[i] == sm[i - 3:i + 4].min()]
         cuts = [s0]
-        for i in sorted(cands, key=lambda i: sm[i]):
-            b = float(bins[i])
-            if all(abs(b - c) >= 9 for c in cuts) and s1 - b >= 9:
-                cuts.append(b)
+        marked = [g[0] for g in self.s.guides[1:GUIDE_MAX]]
+        if marked:                                         # the folds you marked (any point on each fold line)
+            for fx_, fy_ in marked[:SR_MAX - 2]:
+                c = (fx_ - ax) * ex + (fy_ - ay) * ey
+                if s0 + 3 < c < s1 - 3:
+                    cuts.append(float(c))
+        else:
+            for i in sorted(cands, key=lambda i: sm[i]):
+                b = float(bins[i])
+                if all(abs(b - c) >= 9 for c in cuts) and s1 - b >= 9:
+                    cuts.append(b)
         cuts = sorted(cuts) + [s1]
         while len(cuts) > 9:                               # (at most 8 panels: merge the narrowest)
             k = int(np.argmin(np.diff(cuts)[1:-1])) + 1 if len(cuts) > 3 else 1
             del cuts[k]
-        if len(cuts) < 4:                                  # no clear folds: even panels ~12 px
+        if len(cuts) < 4 and not marked:                   # no clear folds (and none marked): even panels ~12 px
             n = max(3, int((s1 - s0) / 12))
             cuts = list(np.linspace(s0, s1, n + 1))
         self.cuts = cuts
@@ -805,19 +860,22 @@ def inpaint_em(img, hole, forbid=None, patch=5, levels=3, iters=5, win=40):
             C = P[cy, cx].reshape(len(cy), -1)
             T = P[ty, tx].reshape(len(ty), -1)
             cc = (C * C).sum(1)
-            best = np.zeros(len(ty), np.int64)
+            best = np.zeros(len(ty), np.int64); has = np.zeros(len(ty), bool)
             for a in range(0, len(ty), 512):          # nearest candidate within the window (‖t−c‖² = t² + c² − 2tc)
                 tb = T[a:a + 512]
                 d = cc[None, :] - 2.0 * tb @ C.T
                 far = (np.abs(ty[a:a + 512, None] - cy[None, :]) > wwin) | (np.abs(tx[a:a + 512, None] - cx[None, :]) > wwin)
+                none = far.all(1)                     # (none within reach: the best from anywhere allowed)
+                far[none] = False
                 d[far] = np.inf
                 best[a:a + 512] = np.argmin(d, 1)
+                has[a:a + 512] = True
             acc = np.zeros((h, w, 3), np.float32); wt = np.zeros((h, w), np.float32)
             src = P[cy[best], cx[best]]               # (n, 3, p, p)
             for dy in range(patch):                   # vote: each target patch paints its source over itself
                 for dx in range(patch):
                     yy = ty + dy - r; xx = tx + dx - r
-                    ok = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < w)
+                    ok = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < w) & has
                     np.add.at(acc, (yy[ok], xx[ok]), src[ok, :, dy, dx])
                     np.add.at(wt, (yy[ok], xx[ok]), 1.0)
             upd = M & (wt > 0)
@@ -831,6 +889,7 @@ def inpaint_em(img, hole, forbid=None, patch=5, levels=3, iters=5, win=40):
             for a in range(0, len(hy), 512):
                 d = cc[None, :] - 2.0 * T[a:a + 512] @ C.T
                 far = (np.abs(hy[a:a + 512, None] - cy[None, :]) > win) | (np.abs(hx[a:a + 512, None] - cx[None, :]) > win)
+                far[far.all(1)] = False
                 d[far] = np.inf
                 b = np.argmin(d, 1)
                 I[hy[a:a + 512], hx[a:a + 512]] = P[cy[b], cx[b]][:, :, r, r]
@@ -937,6 +996,6 @@ def parse_lines(lines):
             for i in range(len(hx) // 4):
                 v = int(hx[4 * i:4 * i + 4], 16)
                 if 0 <= x + i < W and 0 <= y < H:
-                    img[y, x + i] = ((v >> 11) * 255 / 31, ((v >> 5) & 63) * 255 / 63, (v & 31) * 255 / 31)
+                    img[y, x + i] = ((v >> 11) * 255 // 31, ((v >> 5) & 63) * 255 // 63, (v & 31) * 255 // 31)   # (as the Core2 reads it)
                     have[y, x + i] = True
     return sways, body, plates

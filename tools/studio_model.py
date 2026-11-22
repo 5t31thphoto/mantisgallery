@@ -145,7 +145,16 @@ class Studio:
             w.grid = None if not self.par.grid else [tuple(p) for p in self.par.grid]
         txt = J.format_jig(self.ed.zones, self.ed.waters, self.par, self.ed.hangs)
         body = self.body_mask()
-        lines = SW.format_lines(self.sways, body if body.any() and self.sways else None)
+        plates = None
+        ok = [s for s in self.sways if s.ok()]
+        if ok and self.image is not None:                # the fill behind each, as the Core2 will draw it
+            try:
+                protos = J.sway_protos(self.image, ok, body if body.any() else None)
+                it = iter(protos)
+                plates = [((lambda p: (p.plate, p.fill_hole))(next(it))) if s.ok() else None for s in self.sways]
+            except Exception:
+                plates = None                            # (the Core2 makes its own)
+        lines = SW.format_lines(self.sways, body if body.any() and self.sways else None, plates)
         if lines:
             txt += "\n".join(lines) + "\n"
         return txt
@@ -208,7 +217,7 @@ class Studio:
             return "grid fitted" if self.par.grid else "no grid yet — fit it here"
         if L.kind == "figure":
             d = self.figure_depth(L.index)
-            src = "feet line" if L.obj.feet is not None else ("lowest point" if self.par.grid else "set depth")
+            src = "by hand" if L.obj.fixed or not self.par.grid else ("feet line" if L.obj.feet is not None else "lowest point")
             return f"depth {d:.2f} ({src})" + ("" if self.protect.get(L.name, True) else " · unprotected")
         if L.kind == "water":
             return f"{J.WMODES[L.obj.mode][1].lower()}" + (" · on the grid" if self.par.grid else "")
@@ -477,7 +486,7 @@ class Studio:
     def figure_depth(self, i):
         p = self.par.planes[i]
         gr = self.par.ground()
-        if gr is None or p.mask is None or not p.mask.any():
+        if p.fixed or gr is None or p.mask is None or not p.mask.any():
             return p.depth
         c0, cx, cy = gr
         x, y = self.feet(i)
@@ -503,10 +512,20 @@ class Studio:
         L.obj.feet = (int(round(min(W - 1, max(0, x)))), int(round(min(H - 1, max(0, y)))))
 
     def set_depth(self, v):
+        """Depth by hand (0 = as far as the sky, 1 = nearest): for things that don't stand on the ground."""
         L = self.layer()
         if L.kind == "figure":
             self.push_undo()
             L.obj.depth = float(min(1.0, max(0.0, v)))
+            L.obj.fixed = True
+
+    def set_depth_by_feet(self, on):
+        L = self.layer()
+        if L.kind == "figure" and L.obj.fixed == bool(on):
+            self.push_undo()
+            if not on:
+                L.obj.depth = self.figure_depth(L.index)        # start from where it stood
+            L.obj.fixed = not on
 
     def set_pprm(self, k, v):
         self.push_undo()
@@ -600,10 +619,22 @@ class Studio:
                 sw.guides = []
             sw.guides = (sw.guides + [g[:16]])[-SW.GUIDE_MAX:]
         elif sw.kind == "cloth":
-            sw.guides = [[pts[0], pts[-1]]]
+            if replace or not sw.guides or len(pts) >= 2:
+                sw.guides = [[pts[0], pts[-1]]] + sw.guides[1:]           # the waistband (marked folds kept)
+            else:
+                sw.guides = (sw.guides + [[pts[0]]])[:SW.GUIDE_MAX]    # a fold you mark: one point on it
         else:
             sw.guides = [[pts[0]]]
         return True
+
+    def undo_guide(self):
+        """The last lock / fold / pin off."""
+        L = self.layer()
+        if L.kind == "sway" and L.obj.guides:
+            self.push_undo()
+            L.obj.guides = L.obj.guides[:-1]
+            return True
+        return False
 
     def clear_guides(self):
         L = self.layer()
@@ -721,7 +752,7 @@ class Studio:
         for p in self.par.planes:
             if p.mask is not None and p.mask.any():
                 p.depth = float(np.clip(np.median(self.depth_in[p.mask]), 0, 1))
-                p.feet = None
+                p.fixed = True
                 n += 1
         if self.par.grid:                 # with a grid the Core2 stands planes on it; a map depth needs it off
             self.par.prm["ground"] = self.par.prm.get("ground", 1.0)
@@ -797,8 +828,7 @@ class Studio:
             fn = f"{L.name}.{self._type_word(L)}.png"
             Image.fromarray((L.mask * 255).astype(np.uint8)).resize((W * S_, H * S_), Image.NEAREST).save(folder / fn)
             files.append({"name": L.name, "type": self._type_word(L), "file": fn})
-        dep = (self.scene_depth() * 65535).astype(np.uint16)
-        Image.fromarray(dep).resize((W * S_, H * S_), Image.BILINEAR).save(folder / "depth.png")
+        self._save16(self.scene_depth(), folder / "depth.png")
         meta = {"photo": "photo.png", "size": [W * S_, H * S_], "core2_size": [W, H], "layers": files,
                 "depth": {"file": "depth.png", "near": "white", "bits": 16},
                 "note": "White = in the layer, black = out. Name a new file Layer.type.png (figure / water / sway) to import it as that type."}
@@ -895,9 +925,14 @@ class Studio:
 
     def export_depth(self, path):
         from PIL import Image
-        dep = (np.clip(self.scene_depth() if self.depth_in is None else self.depth_in, 0, 1) * 65535).astype(np.uint16)
-        Image.fromarray(dep).resize((W * EXPORT_SCALE, H * EXPORT_SCALE), Image.BILINEAR).save(path)
+        self._save16(self.scene_depth() if self.depth_in is None else self.depth_in, path)
         return path
+
+    @staticmethod
+    def _save16(d, path):
+        from PIL import Image
+        big = np.asarray(Image.fromarray(np.clip(d, 0, 1).astype(np.float32)).resize((W * EXPORT_SCALE, H * EXPORT_SCALE), Image.BILINEAR))
+        Image.fromarray((np.clip(big, 0, 1) * 65535).astype(np.uint16)).save(path)
 
     def import_depth(self, path, near_is_white=True):
         from PIL import Image

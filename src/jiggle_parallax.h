@@ -47,6 +47,7 @@ struct Plane {
     int16_t ax = 0, ay = 0, bx = 0, by = 0;
     float   depth_b = 0.5f;
     int16_t fx = -1, fy = -1;             // where it meets the ground (feet line), if set; else its lowest row
+    bool    fixed = false;                // depth set by hand (it doesn't stand on the ground)
     char    name[16] = {0};               // the Studio's layer name (kept so a save on the Core2 keeps it)
     uint8_t* mask = nullptr;
     // ---- runtime
@@ -135,7 +136,7 @@ inline void plane_copy_def(Plane& dst, const Plane& src, void* (*alloc)(size_t))
     dst = Plane();
     dst.depth = src.depth; dst.ramp = src.ramp; dst.depth_b = src.depth_b;
     dst.ax = src.ax; dst.ay = src.ay; dst.bx = src.bx; dst.by = src.by;
-    dst.fx = src.fx; dst.fy = src.fy; memcpy(dst.name, src.name, sizeof(dst.name));
+    dst.fx = src.fx; dst.fy = src.fy; dst.fixed = src.fixed; memcpy(dst.name, src.name, sizeof(dst.name));
     if (src.mask && plane_ensure_mask(dst, alloc)) memcpy(dst.mask, src.mask, MASK_BYTES);
     (void)keep;
 }
@@ -254,7 +255,7 @@ inline bool parallax_prepare(Parallax& P, const uint16_t* photo, bool sw, void* 
         }
         for (int k = 0; k < P.n; ++k) {               // a card stands where its bottom meets the ground
             Plane& p = P.pl[k];
-            if (!p.mask) continue;
+            if (!p.mask || p.fixed) continue;
             int yb = -1; long sx = 0; int nx_ = 0;
             for (int y = IMG_H - 1; y >= 0 && yb < 0; --y)
                 for (int x = 0; x < IMG_W; ++x) if (mask_get(p.mask, x, y)) { yb = y; sx += x; ++nx_; }
@@ -660,6 +661,7 @@ inline bool parse_parallax_line(char* line, Parallax& P, int& cur, void* (*alloc
             int fx_, fy_;
             if (sscanf(tok, "depth=%f", &d) == 1 && !isnan(d)) p.depth = d < 0 ? 0 : (d > 1 ? 1 : d);
             else if (sscanf(tok, "feet=%d,%d", &fx_, &fy_) == 2) { p.fx = (int16_t)fx_; p.fy = (int16_t)fy_; }
+            else if (strcmp(tok, "fixed=1") == 0) p.fixed = true;
             else if (strncmp(tok, "name=", 5) == 0) { size_t L = strlen(tok + 5); if (L > sizeof(p.name) - 1) L = sizeof(p.name) - 1; memcpy(p.name, tok + 5, L); p.name[L] = 0; }
             else if (sscanf(tok, "ramp=%d,%d,%d,%d,%f", &ax, &ay, &bx, &by, &db) == 5 && !isnan(db)) {
                 p.ramp = true;
@@ -721,6 +723,7 @@ inline void save_parallax(F& f, const Parallax& P) {
         f.printf("plane depth=%.3g", p.depth);
         if (p.ramp) f.printf(" ramp=%d,%d,%d,%d,%.3g", p.ax, p.ay, p.bx, p.by, p.depth_b);
         if (p.fx >= 0) f.printf(" feet=%d,%d", p.fx, p.fy);
+        if (p.fixed) f.printf(" fixed=1");
         if (p.name[0]) f.printf(" name=%s", p.name);
         f.printf("\n");
         save_mask_rows(f, p.mask, "prow");

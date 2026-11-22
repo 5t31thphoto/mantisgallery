@@ -795,6 +795,36 @@ def contact_pass(zs, gaps, h):
 _SWAY_CACHE = {}
 
 
+def sway_protos(img, sways, body=None):
+    """The prepared hair / cloth / pendants (fills behind them made, edges matted), as the Core2 builds
+    them from the saved lines: on what they rest (mg_sway.rest_body), never filled from one another.
+    Cached: the same ones again come back at once."""
+    import mg_sway as SW
+    import hashlib
+    sways = [s for s in sways if s.ok()][:SW.SWAY_MAX]
+    rb = SW.rest_body(body, [s.mask for s in sways])
+    sdf = None
+    out = []
+    for i, sw in enumerate(sways):
+        others = np.zeros(sw.mask.shape, bool)
+        for j, o in enumerate(sways):
+            if j != i:
+                others |= o.mask
+        key = (sw.kind, sw.mask.tobytes(), repr(sw.guides), repr(sorted(sw.prm.items())), others.tobytes(),
+               None if rb is None else rb.tobytes(), img.tobytes() if img is not None else b"")
+        hk = hashlib.sha1(b"".join(k if isinstance(k, bytes) else k.encode() for k in key if k is not None)).hexdigest()
+        proto = _SWAY_CACHE.get(hk)
+        if proto is None:
+            if sdf is None and rb is not None:
+                sdf = SW.body_sdf(rb)
+            proto = SW.SwaySim(sw, img, rb, sdf=sdf, forbid=others if others.any() else None)
+            _SWAY_CACHE[hk] = proto
+            while len(_SWAY_CACHE) > 8:
+                _SWAY_CACHE.pop(next(iter(_SWAY_CACHE)))
+        out.append(proto)
+    return out
+
+
 class Sim:
     """Drives zones like the Core2 does. Feed screen-space accelerometer readings (g, gravity
     included: the Core2 held upright reads (0, -1, 0)), plus beats and pokes."""
@@ -821,21 +851,8 @@ class Sim:
 
     def add_sways(self, sways, body=None):
         """Swaying things over the photo (prepared once per mask / guides: their plates take a moment)."""
-        import mg_sway as SW
-        self.ss = []
-        for sw in sways:
-            key = (sw.kind, sw.mask.tobytes(), repr(sw.guides), repr(sorted(sw.prm.items())),
-                   None if body is None else body.tobytes(), self.img.tobytes() if self.img is not None else b"")
-            import hashlib
-            hk = hashlib.sha1(b"".join(k if isinstance(k, bytes) else k.encode() for k in key if k is not None)).hexdigest()
-            proto = _SWAY_CACHE.get(hk)
-            if proto is None:
-                proto = SW.SwaySim(sw, self.img, body)
-                _SWAY_CACHE[hk] = proto
-                while len(_SWAY_CACHE) > 8:
-                    _SWAY_CACHE.pop(next(iter(_SWAY_CACHE)))
-            import copy
-            self.ss.append(copy.deepcopy(proto))
+        import copy
+        self.ss = [copy.deepcopy(p) for p in sway_protos(self.img, sways, body)]
 
     def step(self, dt, accel=(0.0, -1.0, 0.0), dance=0.0, twist=(0.0, 0.0)):
         """Same as the Core2: gravity pinned to the real one, jolts on top. `dance` is unused here
