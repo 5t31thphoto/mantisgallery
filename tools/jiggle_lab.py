@@ -991,7 +991,7 @@ class Sim:
                 ss.render(layer)
             frame = warp(layer, OX, OY)         # …and the zones warp that (effects stack)
         if self.depth is not None:
-            frame = self.depth.render(frame, self.v)
+            frame = self.depth.render(frame, self.v, self.view.sharp)
         return frame
 
 
@@ -1235,6 +1235,13 @@ class WaterSim:
             self.onx = np.where(none, 0.0, bnx); self.ony = np.where(none, 1.0, bny)
         Y, X = np.mgrid[self.by:self.by + self.bh, self.bx:self.bx + self.bw]
         self.X, self.Y = X.astype(np.float64), Y.astype(np.float64)
+        # the node lattice (every second pixel, x and y even) the waves are worked out on, and the four nodes
+        # each pixel blends (½ weights: an odd pixel is halfway between two) - as the Core2
+        self.ni0, self.nj0 = self.bx >> 1, self.by >> 1
+        NY, NX = np.mgrid[2 * self.nj0:2 * (((self.by + self.bh - 1) >> 1) + 2):2, 2 * self.ni0:2 * (((self.bx + self.bw - 1) >> 1) + 2):2]
+        self.NX, self.NY = NX.astype(np.float64), NY.astype(np.float64)
+        self.pi, self.pj = (X >> 1) - self.ni0, (Y >> 1) - self.nj0
+        self.po, self.pq = X & 1, Y & 1
         self.ok = True
         self.pax = self.pay = None                  # perspective grid (see water_perspective)
         self.ghz = -1.0
@@ -1383,11 +1390,18 @@ class WaterSim:
         inside = m[sy, sx]
         return np.where(inside, ox, 0.0), np.where(inside, oy, 0.0)
 
+    def _up(self, a):
+        """node values → pixels: each pixel the mean of its four nodes (two of them, or one, the same)"""
+        i, j, o, q = self.pi, self.pj, self.po, self.pq
+        return 0.25 * (a[j, i] + a[j, i + o] + a[j + q, i] + a[j + q, i + o])
+
     def render_into(self, frame, src):
-        """Draw this water into `frame` (H, W, 3 uint8), sampling the untouched photo `src`."""
+        """Draw this water into `frame` (H, W, 3 uint8), sampling the untouched photo `src`. The ripples, waves
+        and swell are worked out on the node lattice (half the picture's resolution, as the Core2); the photo
+        is sampled at every pixel, at full resolution, and the fade toward the bank is each pixel's own."""
         if not self.ok:
             return
-        w, t, X, Y = self.w, self.t, self.X, self.Y
+        w, t, X, Y = self.w, self.t, self.NX, self.NY
         hz = w.get("horizon")
         if hz < 0:
             hz = self.ghz if -200 < self.ghz < self.by + self.bh else float(self.by)   # the grid's, if any
@@ -1422,36 +1436,37 @@ class WaterSim:
             shade = shade + light * W_OCEAN_SHADE * (A / W_OCEAN_A) * (cp + 0.7 * np.cos(2.0 * ph - 0.6))
             zone = lam * 0.6
             foam = np.where((d < zone) & (sp_ > 0.7), foam_k * (sp_ - 0.7) * 3.3 * (1.0 - d / zone) * np.minimum(A / W_OCEAN_A, 1.0), 0.0)
-        e = self.e
-        dx, dy = dx * e, dy * e
+        g = w.get("glint")
+        glint = np.clip((slope - 18.0) / 40.0, 0, 1) * g if g > 0 else None
+        # … to the pixels: blended from the nodes, faded by each pixel's own distance from the bank
+        e, up = self.e, self._up
         f = src.astype(np.float32)
 
         def sample(ox, oy):
-            sx = np.clip(X + ox, 0, IMG_W - 1.001); sy = np.clip(Y + oy, 0, IMG_H - 1.001)
+            sx = np.clip(self.X + ox, 0, IMG_W - 1.001); sy = np.clip(self.Y + oy, 0, IMG_H - 1.001)
             ix, iy = sx.astype(int), sy.astype(int)
             fx_, fy_ = (sx - ix)[..., None], (sy - iy)[..., None]
             top = f[iy, ix] * (1 - fx_) + f[iy, ix + 1] * fx_
             bot = f[iy + 1, ix] * (1 - fx_) + f[iy + 1, ix + 1] * fx_
             return top * (1 - fy_) + bot * fy_
 
-        if w.mode == W_RIVER and self.fx is not None:
-            sp = W_RIVER_PX * w.get("speed") * W_RIVER_T * e
+        if w.mode == W_RIVER and self.fx is not None:     # the two phases of the flow, cross-faded
+            sp = W_RIVER_PX * w.get("speed") * W_RIVER_T
             fx_, fy_ = self._lerp(self.fx, CX, CY), self._lerp(self.fy, CX, CY)
             f1 = (t / W_RIVER_T) % 1.0; f2 = (f1 + 0.5) % 1.0
-            a = self._clamp(dx - fx_ * (f1 - 0.5) * sp, dy - fy_ * (f1 - 0.5) * sp)
-            b = self._clamp(dx - fx_ * (f2 - 0.5) * sp, dy - fy_ * (f2 - 0.5) * sp)
+            a = self._clamp(up(dx - fx_ * (f1 - 0.5) * sp) * e, up(dy - fy_ * (f1 - 0.5) * sp) * e)
+            b = self._clamp(up(dx - fx_ * (f2 - 0.5) * sp) * e, up(dy - fy_ * (f2 - 0.5) * sp) * e)
             mixw = abs(2.0 * f1 - 1.0)
             col = sample(*a) * (1 - mixw) + sample(*b) * mixw
         else:
-            col = sample(*self._clamp(dx, dy))
-        col = col * (shade * e + (1.0 - e))[..., None]
-        fm = np.clip(foam, 0, 0.85) * e
+            col = sample(*self._clamp(up(dx) * e, up(dy) * e))
+        col = col * ((up(shade) - 1.0) * e + 1.0)[..., None]
+        fm = np.clip(up(foam), 0, 0.85) * e
         col = col + (255.0 - col) * fm[..., None]
         col = np.clip(col, 0, 255)
-        g = w.get("glint")
-        if g > 0:
+        if glint is not None:
             lum = col.mean(-1)
-            k = np.clip((slope - 18.0) / 40.0, 0, 1) * g * e * (lum / 255.0) * (lum > 120)
+            k = up(glint) * e * (lum / 255.0) * (lum > 120)
             col = col + (255.0 - col) * k[..., None]
         sub = frame[self.by:self.by + self.bh, self.bx:self.bx + self.bw]
         inside = e > 0

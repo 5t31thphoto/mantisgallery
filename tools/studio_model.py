@@ -608,6 +608,31 @@ class Studio:
         c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
         self.par.grid = [(cx + (x - cx) * c - (y - cy) * s, cy + (x - cx) * s + (y - cy) * c) for x, y in self.par.grid]
 
+    def grid_is_level(self):
+        """The near edge and the far edge are both exactly horizontal: the horizon is flat and the ground's depth
+        depends only on the row (cx is exactly 0 — the Core2 then draws it on its cheaper row-by-row path)."""
+        g = self.par.grid
+        return bool(g) and g[0][1] == g[1][1] and g[2][1] == g[3][1]
+
+    def grid_level(self):
+        """Level the ground: make the near edge and the far edge horizontal (each at its two corners' average
+        height, on the 0.1 px steps the .jig saves), corners keep their x. Returns None when done, or the
+        reason it wasn't (nothing is changed then)."""
+        g = self.par.grid
+        if not g:
+            return "No ground grid to level."
+        if self.grid_is_level():
+            return "The ground is already level."
+        (x0, y0), (x1, y1), (x2, y2), (x3, y3) = g
+        yn, yf = round((y0 + y1) / 2, 1), round((y2 + y3) / 2, 1)
+        if (yn - yf < 2 or x1 - x0 < 2 or x2 - x3 < 2              # near edge at the bottom, left → right
+                or abs(y1 - y0) >= x1 - x0 or abs(y2 - y3) >= x2 - x3):  # each edge off level by under 45°
+            return ("The grid is turned too far to level — turn it back (or drag the corners) so the near edge "
+                    "is at the bottom, then try again.")
+        self.push_undo()
+        self.par.grid = [(x0, yn), (x1, yn), (x2, yf), (x3, yf)]
+        return None
+
     def horizon(self):
         """The horizon as (y at x=0, y at x=W), or None: where the ground's depth reaches 0."""
         gr = self.par.ground()

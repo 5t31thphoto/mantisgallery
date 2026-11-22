@@ -815,10 +815,8 @@ JIG_INLINE uint16_t bswap16(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8))
 JIG_INLINE uint16_t rd(const uint16_t* p, bool swapped) { return swapped ? bswap16(*p) : *p; }
 
 // Bilinear sample at 8.8 fixed-point coordinates. Returns native RGB565.
-JIG_INLINE uint16_t sample_fx(const uint16_t* src, bool swapped, int32_t sx8, int32_t sy8) {
-    const int32_t maxx = ((IMG_W - 1) << 8) - 1, maxy = ((IMG_H - 1) << 8) - 1;
-    if (sx8 < 0) sx8 = 0; else if (sx8 > maxx) sx8 = maxx;
-    if (sy8 < 0) sy8 = 0; else if (sy8 > maxy) sy8 = maxy;
+// sample_fx_in: the same where 0 ≤ sx8 < (IMG_W − 1)·256 and 0 ≤ sy8 < (IMG_H − 1)·256 (its clamps change nothing).
+JIG_INLINE uint16_t sample_fx_in(const uint16_t* src, bool swapped, int32_t sx8, int32_t sy8) {
     int ix = sx8 >> 8, iy = sy8 >> 8;
     uint32_t fx = (uint32_t)(sx8 & 255) >> 3, fy = (uint32_t)(sy8 & 255) >> 3;
     const uint16_t* p = src + iy * IMG_W + ix;
@@ -827,6 +825,12 @@ JIG_INLINE uint16_t sample_fx(const uint16_t* src, bool swapped, int32_t sx8, in
     uint32_t top = ((a * (32 - fx) + b * fx) >> 5) & MASK_565X;
     uint32_t bot = ((c * (32 - fx) + d * fx) >> 5) & MASK_565X;
     return pack565(((top * (32 - fy) + bot * fy) >> 5) & MASK_565X);
+}
+JIG_INLINE uint16_t sample_fx(const uint16_t* src, bool swapped, int32_t sx8, int32_t sy8) {
+    const int32_t maxx = ((IMG_W - 1) << 8) - 1, maxy = ((IMG_H - 1) << 8) - 1;
+    if (sx8 < 0) sx8 = 0; else if (sx8 > maxx) sx8 = maxx;
+    if (sy8 < 0) sy8 = 0; else if (sy8 > maxy) sy8 = maxy;
+    return sample_fx_in(src, swapped, sx8, sy8);
 }
 
 // Float reference of the offset field at one pixel (tests + the Python port check against this).

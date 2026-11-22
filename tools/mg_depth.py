@@ -353,14 +353,56 @@ class DepthPreview:
         # sampling at x − sx = (x − ix) − fx: between x − ix − 1 (weight fx) and x − ix (1 − fx)
         return (a00 * (1 - fx) + a10 * fx) * (1 - fy) + (a01 * (1 - fx) + a11 * fx) * fy
 
+    @staticmethod
+    def _taps(t, q):
+        """The Core2's colour filter at phase t (0..1): 4 taps, bilinear eased toward Catmull-Rom by q (0..1)."""
+        t2, t3 = t * t, t * t * t
+        cr = ((-t3 + 2 * t2 - t) * 0.5, (3 * t3 - 5 * t2 + 2) * 0.5, (-3 * t3 + 4 * t2 + t) * 0.5, (t3 - t2) * 0.5)
+        bl = (0.0, 1.0 - t, t, 0.0)
+        return [b + (c - b) * q for b, c in zip(bl, cr)]
+
+    @classmethod
+    def _shift4(cls, img, sx, sy, q):
+        """img (H, W, 3) sampled at (x − sx, y − sy) with the colour filter (_taps), separable, edges clamped."""
+        if q <= 0:
+            return cls._shift(img, sx, sy)
+        # sample position x − sx = (x − ix − 1) + (1 − fx): taps at x − ix − 2 … x − ix + 1, phase 1 − fx
+        ix, iy = math.floor(sx), math.floor(sy)
+        tx, ty = 1.0 - (sx - ix), 1.0 - (sy - iy)
+        if tx >= 1.0: ix, tx = ix - 1, 0.0               # (a whole shift: taps from x − ix − 1, phase 0)
+        if ty >= 1.0: iy, ty = iy - 1, 0.0
+        wx, wy = cls._taps(tx, q), cls._taps(ty, q)
+        xs = np.arange(W); ys = np.arange(H)
+        h = sum(w * img[:, np.clip(xs - ix - 2 + k, 0, W - 1)] for k, w in enumerate(wx))
+        out = sum(w * h[np.clip(ys - iy - 2 + k, 0, H - 1)] for k, w in enumerate(wy))
+        return np.clip(out, 0, 255)
+
+    @classmethod
+    def _sample4(cls, a, qx, qy, q):
+        """a (H, W, 3) sampled at per-pixel (qx, qy) (clamped inside) with the colour filter (_taps)."""
+        ix, iy = np.floor(qx).astype(np.int32), np.floor(qy).astype(np.int32)
+        tx, ty = qx - ix, qy - iy
+        if q <= 0:
+            fx, fy = tx[..., None], ty[..., None]
+            x1, y1 = np.minimum(ix + 1, W - 1), np.minimum(iy + 1, H - 1)
+            return (a[iy, ix] * (1 - fx) + a[iy, x1] * fx) * (1 - fy) + (a[y1, ix] * (1 - fx) + a[y1, x1] * fx) * fy
+        wx, wy = cls._taps(tx, q), cls._taps(ty, q)
+        out = 0.0
+        for m in range(4):
+            yy = np.clip(iy - 1 + m, 0, H - 1)
+            row = sum(wx[k][..., None] * a[yy, np.clip(ix - 1 + k, 0, W - 1)] for k in range(4))
+            out = out + wy[m][..., None] * row
+        return np.clip(out, 0, 255)
+
     def _alpha(self, k, kx, ky):
         """the plane's silhouette, its edge feather showing as far as it has slid (as the Core2)"""
         fade = min(1.0, self.planes[k].dhi() * max(abs(kx), abs(ky)))
         s = self.soft[k]
         return np.where(s > 0, 1.0 - (1.0 - s) * fade, 0.0).astype(np.float32)
 
-    def render(self, content, view):
-        """content: (H, W, 3) uint8 (the photo with water / zones drawn in). view: (vx, vy) in −1..1."""
+    def render(self, content, view, sharp=1.0):
+        """content: (H, W, 3) uint8 (the photo with water / zones drawn in). view: (vx, vy) in −1..1.
+        sharp: the colour filter as the Core2 eases it (GyroView.sharp): 1 = Catmull-Rom, 0 = bilinear."""
         if not self.ok:
             return content
         P = self.P
@@ -380,7 +422,7 @@ class DepthPreview:
                 def g(a):
                     a = a if a.ndim == 3 else a[..., None]
                     return (a[iy, ix] * (1 - fx) + a[iy, ix + 1] * fx) * (1 - fy) + (a[iy + 1, ix] * (1 - fx) + a[iy + 1, ix + 1] * fx) * fy
-                c = g(src)
+                c = self._sample4(src, qx, qy, sharp)
                 a = np.ones((H, W), np.float32) if lid == 0 else g(self._alpha(lid - 1, kx, ky))[..., 0]
                 wgt = a * rem
                 out += c * wgt[..., None]
@@ -399,12 +441,12 @@ class DepthPreview:
                         t = a[iy, ix] * (1 - fx[..., None]) + a[iy, ix + 1] * fx[..., None]
                         b = a[iy + 1, ix] * (1 - fx[..., None]) + a[iy + 1, ix + 1] * fx[..., None]
                         return t * (1 - fy[..., None]) + b * fy[..., None]
-                    c, a = g(src), g(self._alpha(lid - 1, kx, ky))[..., 0]
+                    c, a = self._sample4(src, qx, qy, sharp), g(self._alpha(lid - 1, kx, ky))[..., 0]
                 else:
                     sx, sy = (p.depth - f) * kx, (p.depth - f) * ky
-                    c, a = self._shift(src, sx, sy), self._shift(self._alpha(lid - 1, kx, ky), sx, sy)
+                    c, a = self._shift4(src, sx, sy, sharp), self._shift(self._alpha(lid - 1, kx, ky), sx, sy)
             else:
-                c, a = (self._shift(src, -f * kx, -f * ky) if f > 0 else src), np.ones((H, W), np.float32)
+                c, a = (self._shift4(src, -f * kx, -f * ky, sharp) if f > 0 else src), np.ones((H, W), np.float32)
             wgt = a * rem
             out += c * wgt[..., None]
             rem -= wgt
@@ -444,10 +486,12 @@ class GyroView:
     then a critically damped spring. rates: (about the screen's horizontal axis: top edge away = +,
     about its vertical axis: right edge away = +)."""
     RECENTER_S, DEAD_DPS = 2.5, 0.6
+    SOFT_PXS, SHARP_PXS, SOFT_S, SHARP_S = 10.0, 4.0, 0.1, 0.35   # the filter: soft while it slides fast (as the Core2)
 
     def __init__(self, P):
         self.P, self.t = P, 0.0
         self.th = [0.0, 0.0]; self.v = [0.0, 0.0]; self.vv = [0.0, 0.0]
+        self.sharp = 1.0                                  # 1 = Catmull-Rom, 0 = bilinear (DepthPreview.render)
 
     def step(self, dt, rates=(0.0, 0.0)):
         P = self.P
@@ -475,6 +519,11 @@ class GyroView:
             for a in range(2):
                 self.vv[a] += (w * w * (tg[a] - self.v[a]) - 2 * w * self.vv[a]) * h
                 self.v[a] += self.vv[a] * h
+        speed = (abs(self.vv[0]) + abs(self.vv[1])) * (P.get("amount") if P else 0.0)   # px/s
+        if speed > self.SOFT_PXS:
+            self.sharp = max(0.0, self.sharp - dt / self.SOFT_S)
+        elif speed < self.SHARP_PXS:
+            self.sharp = min(1.0, self.sharp + dt / self.SHARP_S)
         return tuple(self.v)
 
 

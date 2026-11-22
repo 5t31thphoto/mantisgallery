@@ -70,7 +70,6 @@ constexpr float ROT_SCALE = 4.0f;        // treat the picture as bigger than the
 constexpr float ECHO_FADE_S = 9.0f;      // after a back-and-forth sway, it keeps swaying this long
 constexpr float ECHO_DAMP_CUT = 0.955f;  // …with damping eased off by this much: slow, smooth die-out
 constexpr float ECHO_SLOW_TAU = 1.5f;    // s: "average down" the gravity swing is measured from
-constexpr uint32_t FRAME_MS = 16;        // redraw cap (~60 fps); big zones are limited by the SPI bus
 
 // ---- Music ---------------------------------------------------------------------------------------
 constexpr bool     MIC_DANCE = true;      // dance to music heard by the microphone (when switched on: swipe up)
@@ -84,7 +83,6 @@ constexpr bool     USE_DMA = true;        // set false to push strips without DM
 
 // ---- Rendering ---------------------------------------------------------------------------------
 constexpr int STRIP_ROWS = 12;
-constexpr uint32_t WATER_FRAME_MS = FRAME_MS;   // water draws at the jiggle's cadence (smooth: blended steps)
 constexpr size_t STRIP_PIX = (size_t)STRIP_ROWS * IMG_W;
 
 // ---- Editor layout -----------------------------------------------------------------------------
@@ -119,10 +117,8 @@ Zone g_z[MAX_ZONES];
 bool g_shown[MAX_ZONES];                 // screen currently shows this zone displaced
 Water    g_wat[WATER_MAX];               // water regions
 int      g_nw = 0;
-uint32_t g_last_water = 0;
 Sway*    g_sway = nullptr;               // hair, cloth, pendants (SWAY_MAX of them, in PSRAM: begin())
 int      g_ns = 0;
-uint32_t g_last_sway = 0;
 uint8_t* g_body = nullptr;               // what they rest on (the Studio's "body" lines; else the depth figures)
 bool     g_body_saved = false;           // (it came from the file: written back)
 int16_t* g_sdf = nullptr;                // its signed distance (×8), for collisions
@@ -161,7 +157,6 @@ float    g_echo = 0;                     // echo strength 0..1
 float    g_sway_damp = 1.0f;             // hair / cloth / pendants: their damping while the echo plays
 float    g_hold[MAX_ZONES][3];           // targets a resting zone is holding
 uint32_t g_last_us = 0;
-uint32_t g_last_draw = 0;
 // Drawing never holds the loop for long: a frame that takes longer than this is finished over the next
 // ticks (the gallery reads the touch screen and buttons in between, so taps and swipes always land).
 constexpr uint32_t SLICE_US = 12000;
@@ -195,6 +190,44 @@ struct Rate {
     }
 };
 Rate g_r_water, g_r_sway;
+
+// ---- Frame clock --------------------------------------------------------------------------------
+// Frames start on a steady beat - 60, 30, 25 or 20 a second - not whenever the last one happens to finish:
+// evenly spaced frames look smooth where a faster but uneven rate looks cheap. The beat is the fastest one
+// the frames' measured work (start to on screen) fits with room to spare; it slows at once when they don't,
+// and speeds up again only once they've fit the faster one for a while (so it never hunts).
+constexpr uint32_t CLOCK_MS[] = {16, 33, 40, 50};
+struct FrameClock {
+    int lvl = 1;
+    uint32_t next = 0, t0 = 0;
+    bool open = false;                                 // a frame started and not yet on screen
+    uint32_t work = 0;                                 // a frame's work (ms): up at once, down slowly
+    uint32_t fit0 = 0;                                 // since when it has fit the faster beat (0: it doesn't)
+    uint32_t period() const { return CLOCK_MS[lvl]; }
+    bool due(uint32_t now) const { return !open && (int32_t)(now - next) >= 0; }
+    void begin(uint32_t now) {
+        next += period();
+        if ((int32_t)(now - next) >= 0) next = now + period();   // (behind: on the beat from now - no catching up)
+        t0 = now; open = true;
+    }
+    void end(uint32_t now) {
+        if (!open) return;
+        open = false;
+        const uint32_t d = now - t0;
+        work = d >= work ? d : work - ((work - d + 7) >> 3);
+        const uint32_t need = work + work / 8 + 2;
+        if (need > period() && lvl < 3) {              // doesn't fit: slower, now
+            while (lvl < 3 && need > period()) ++lvl;
+            fit0 = 0;
+        } else if (lvl > 0 && need * 5 <= CLOCK_MS[lvl - 1] * 4) {   // fits the faster one with room …
+            if (!fit0) fit0 = now | 1;
+            else if (now - fit0 > 1500) { --lvl; fit0 = 0; }          // … for 1.5 s: faster
+        } else fit0 = 0;
+    }
+    void cancel() { open = false; }                    // (started, but there was nothing to draw)
+    void soon() { open = false; next = millis(); }     // (draw at the next chance)
+};
+FrameClock g_clock;
 struct RPiece {
     Rate& r; uint32_t u, t0;
     RPiece(Rate& r_, uint32_t u_) : r(r_), u(u_), t0(micros()) {}
@@ -271,10 +304,61 @@ void zone_off_water(Zone& z) {
                 if (z.wmap[y * z.bw + x] && mask_get(w.mask, z.bx + x, z.by + y)) z.wmap[y * z.bw + x] = 0;
     }
 }
+// Each hair / cloth / pendant: how far (px) its strands lie from the nearest water that's drawn - water
+// redrawn further away than it has swung (+ its soft edge) can't show through it (sway_due). A chamfer
+// distance over the frame, in PSRAM for the moment; without the memory, 0 (always: as close as can be).
+void sway_wet_dist() {
+    for (int i = 0; i < g_ns; ++i) g_sway[i].wetd = 0;
+    if (g_ns == 0) return;
+    bool any = false;
+    for (int w = 0; w < g_nw; ++w) any |= g_wat[w].edge && g_wat[w].mask;
+    if (!any) return;
+    uint16_t* D = (uint16_t*)alloc_psram((size_t)IMG_W * IMG_H * 2);
+    if (!D) return;
+    for (int k = 0; k < IMG_W * IMG_H; ++k) {
+        bool wet = false;
+        for (int w = 0; w < g_nw && !wet; ++w) wet = g_wat[w].edge && g_wat[w].mask && ((g_wat[w].mask[k >> 3] >> (k & 7)) & 1);
+        D[k] = wet ? 0 : 60000;
+    }
+    auto lo = [](uint16_t& d, int v) { if (v < d) d = (uint16_t)v; };   // (3 a step across, 4 diagonally)
+    for (int y = 0; y < IMG_H; ++y)
+        for (int x = 0; x < IMG_W; ++x) {
+            uint16_t& d = D[y * IMG_W + x];
+            if (x) lo(d, D[y * IMG_W + x - 1] + 3);
+            if (y) {
+                lo(d, D[(y - 1) * IMG_W + x] + 3);
+                if (x) lo(d, D[(y - 1) * IMG_W + x - 1] + 4);
+                if (x < IMG_W - 1) lo(d, D[(y - 1) * IMG_W + x + 1] + 4);
+            }
+        }
+    for (int y = IMG_H - 1; y >= 0; --y)
+        for (int x = IMG_W - 1; x >= 0; --x) {
+            uint16_t& d = D[y * IMG_W + x];
+            if (x < IMG_W - 1) lo(d, D[y * IMG_W + x + 1] + 3);
+            if (y < IMG_H - 1) {
+                lo(d, D[(y + 1) * IMG_W + x] + 3);
+                if (x < IMG_W - 1) lo(d, D[(y + 1) * IMG_W + x + 1] + 4);
+                if (x) lo(d, D[(y + 1) * IMG_W + x - 1] + 4);
+            }
+        }
+    for (int i = 0; i < g_ns; ++i) {
+        Sway& h = g_sway[i];
+        if (!h.ready || !h.own) continue;              // (0: as close as can be)
+        int m = 60000;
+        for (int y = 0; y < h.rh; ++y)
+            for (int x = 0; x < h.rw; ++x) {
+                const int sx = h.rx0 + x, sy = h.ry0 + y;
+                if (h.own[y * h.rw + x] >= 0 && sx >= 0 && sy >= 0 && sx < IMG_W && sy < IMG_H && D[sy * IMG_W + sx] < m) m = D[sy * IMG_W + sx];
+            }
+        h.wetd = m / 3.0f;
+    }
+    free(D);
+}
 void prepare_waters() {
     for (int i = 0; i < g_nw; ++i) water_prepare(g_wat[i], water_alloc);
     for (int i = 0; i < g_n; ++i) zone_off_water(g_z[i]);
     layer_sync();
+    sway_wet_dist();
 }
 void clear_sways() {
     for (int i = 0; i < g_ns; ++i) sway_free(g_sway[i]);
@@ -455,6 +539,7 @@ void save_waters(F& f, const Water* ws, int nw) {
 // so it costs no extra memory.
 uint16_t* g_layer = nullptr;
 bool      g_layer_sw = false;
+uint16_t* g_photo_n = nullptr;                      // the photo in native byte order, for the water to sample (while any)
 
 const uint16_t* render_src() {
     if (g_layer) return g_layer;
@@ -473,8 +558,15 @@ void layer_sync() {
         if (g_swapped) memcpy(g_src_fast, photo, n * 2);
         else for (size_t i = 0; i < n; ++i) g_src_fast[i] = bswap16(photo[i]);
     }
-    bool live = false;
-    for (int i = 0; i < g_nw; ++i) live |= g_wat[i].edge != nullptr;
+    bool wet = false;                                   // (the water samples the photo: native order, no swap per read)
+    for (int i = 0; i < g_nw; ++i) wet |= g_wat[i].edge != nullptr;
+    if (wet && !g_photo_n) g_photo_n = (uint16_t*)alloc_psram(n * 2);
+    if (!wet && g_photo_n) { free(g_photo_n); g_photo_n = nullptr; }
+    if (g_photo_n) {
+        if (g_swapped) for (size_t i = 0; i < n; ++i) g_photo_n[i] = bswap16(photo[i]);
+        else memcpy(g_photo_n, photo, n * 2);
+    }
+    bool live = wet;
     for (int i = 0; i < g_ns; ++i) live |= g_sway[i].ready;          // (hair / cloth / pendants draw into it too)
     if (!live) { g_layer = nullptr; return; }
     if (g_src_fast) { g_layer = g_src_fast; g_layer_sw = true; return; }
@@ -640,10 +732,14 @@ void strip_rows(void* c, int lane, int y0, int y1) {
     StripJob& j = *(StripJob*)c;
     render_rect(j.src, j.sw, j.out + (y0 - j.ys) * (j.xb - j.xa), g_z, j.members, j.nm, j.xa, y0, j.xb, y1, lane ? g_acc1 : g_acc);
 }
-struct WaterJob { const Water* w; const uint16_t* photo; bool psw; };
+struct WaterJob { const Water* w; const WFrame* fr; const uint16_t* photo; bool psw; };
 void water_rows(void* c, int lane, int y0, int y1) {
     WaterJob& j = *(WaterJob*)c;
-    water_render(*j.w, j.photo, j.psw, g_layer, g_layer_sw, 0, y0, IMG_W, y1, lane);
+    water_render(*j.w, *j.fr, j.photo, j.psw, g_layer, g_layer_sw, 0, y0, IMG_W, y1, lane);
+}
+void water_node_rows_job(void* c, int lane, int j0, int j1) {   // (rows here: node rows)
+    WaterJob& j = *(WaterJob*)c;
+    water_node_rows(*j.w, *j.fr, water_row_scratch(lane), j0, j1);
 }
 
 struct SwayJob { const Sway* s; const SwDraw* d; };
@@ -764,48 +860,19 @@ void draw_frame(DirtyRects* dr = nullptr) {
     }
 }
 
-// Draw the water regions: render into the layer, then send just the columns with water, strip by strip.
-void water_update() {
-    const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
-    for (int i = 0; i < g_nw; ++i)
-        if (g_wat[i].edge) {
-            WaterJob job{&g_wat[i], photo, g_swapped};
-            par_rows(water_rows, &job, g_wat[i].by, g_wat[i].by + g_wat[i].bh);   // both cores
-        }
-}
-void water_push() {
-    int cur = 0;
-    bool inflight = false;
-    M5.Display.startWrite();
+// The water frame in progress: 1 = rendering into the layer, 2 = hair / cloth / pendants over it, 3 = sending.
+struct WaterJobState { uint8_t phase = 0; int wi = 0, y = -1, nd = 0; int which[8]; bool par = false, sw = false; WFrame wf[WATER_MAX]; };
+WaterJobState g_wj;
+void water_job_begin(bool par) {                       // (each water as it stands now: the whole frame shows this moment)
+    g_wj = WaterJobState(); g_wj.phase = 1; g_wj.par = par;
     for (int i = 0; i < g_nw; ++i) {
         const Water& w = g_wat[i];
         if (!w.edge) continue;
-        for (int y = w.by; y < w.by + w.bh; y += STRIP_ROWS) {
-            const int ye = y + STRIP_ROWS < w.by + w.bh ? y + STRIP_ROWS : w.by + w.bh;
-            int xa, xb;
-            water_rows_extent(w, y, ye, xa, xb);           // just the columns that hold water
-            if (xa >= xb) continue;
-            uint16_t* out = g_strip[cur];
-            if (inflight && USE_DMA && g_dma) { M5.Display.waitDMA(); inflight = false; }
-            const int ow = xb - xa;
-            for (int yy = y; yy < ye; ++yy) {
-                const uint16_t* row = g_layer + yy * IMG_W + xa;
-                uint16_t* o = out + (yy - y) * ow;
-                if (g_layer_sw) memcpy(o, row, (size_t)ow * 2);
-                else for (int x = 0; x < ow; ++x) o[x] = bswap16(row[x]);
-            }
-            push_strip(xa, y, ow, ye - y, out, inflight);
-            cur ^= 1;
-        }
+        water_frame_setup(w, g_wj.wf[i]);
+        water_snapshot(w, w.sgx, w.sgy);
+        g_wj.wf[i].sgx = w.sgx; g_wj.wf[i].sgy = w.sgy;
     }
-    if (inflight) M5.Display.waitDMA();
-    M5.Display.endWrite();
 }
-
-// The water frame in progress: 1 = rendering into the layer, 2 = hair / cloth / pendants over it, 3 = sending.
-struct WaterJobState { uint8_t phase = 0; int wi = 0, y = -1, nd = 0; int which[8]; bool par = false, sw = false; };
-WaterJobState g_wj;
-void water_job_begin(bool par) { g_wj = WaterJobState(); g_wj.phase = 1; g_wj.par = par; }
 bool sway_redraw_run(bool budget);
 void sway_redraw_start(bool water_moved);
 void sway_push(const int* which, int nd);
@@ -832,7 +899,8 @@ uint32_t water_units(const Water& w, int y0, int y1, int& ym) {
 }
 // Advance it until done (true) or this tick's time is up (false).
 bool water_job() {
-    const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
+    const uint16_t* photo = g_photo_n ? g_photo_n : (const uint16_t*)g_img.getBuffer();
+    const bool psw = g_photo_n ? false : g_swapped;
     while (g_wj.phase == 1) {
         if (g_wj.wi >= g_nw) { g_wj.phase = 2; break; }
         const Water& w = g_wat[g_wj.wi];
@@ -843,8 +911,11 @@ bool water_job() {
         const uint32_t units = water_units(w, g_wj.y, ye, ym);
         if (!fits(g_r_water.est(units))) return false;
         RPiece pc(g_r_water, units);
-        WaterJob job{&w, photo, g_swapped};
-        par_rows_at(water_rows, &job, g_wj.y, ym, ye);   // both cores, about half the wet pixels each
+        WaterJob job{&w, &g_wj.wf[g_wj.wi], photo, psw};
+        int j0, j1;                                    // its new node rows (the ripple field at half resolution) …
+        water_nodes_due(w, g_wj.wf[g_wj.wi], g_wj.y, ye, j0, j1);
+        if (j0 < j1) par_rows(water_node_rows_job, &job, j0, j1);
+        par_rows_at(water_rows, &job, g_wj.y, ym, ye);   // … then its pixels: both cores, about half the wet pixels each
         g_wj.y = ye;
     }
     if (g_wj.phase == 2 && g_wj.par) { g_wj.phase = 0; return true; }   // (depth: the rest is its content step)
@@ -857,7 +928,6 @@ bool water_job() {
         if (g_wj.sw && !sway_redraw_run(true)) return false;
         g_wj.nd = g_wj.sw ? g_sj_nd() : 0;
         for (int k = 0; k < g_wj.nd; ++k) g_wj.which[k] = g_sj_which(k);
-        if (g_wj.nd) g_last_sway = millis();
         g_wj.phase = 3; g_wj.wi = 0; g_wj.y = -1;
     }
     // Sending: the last strip is followed at once by the hair over it and the zones on top (a zone left out
@@ -903,11 +973,29 @@ bool regions_meet(int ax0, int ay0, int ax1, int ay1, int bx0, int by0, int bx1,
     return !(ax0 >= bx1 || bx0 >= ax1 || ay0 >= by1 || by0 >= ay1);
 }
 // Which to redraw this frame: moving, settling (one last frame at rest), or over water that moved.
+// How far (px) its pose is from the one on screen, and that one noted as it starts drawing.
+float sway_moved(const Sway& h) {
+    if (h.kind == SK_PENDANT) return fabsf(h.th - h.drth) * h.tlen;
+    float m = 0;
+    for (int k = 0; k < h.nr; ++k)
+        for (int j = 0; j < h.nn[k]; ++j) {
+            const float d = fmaxf(fabsf(h.x[k][j] - h.drx[k][j]), fabsf(h.y[k][j] - h.dry[k][j]));
+            if (d > m) m = d;
+        }
+    return m;
+}
+void sway_mark(Sway& h) { memcpy(h.drx, h.x, sizeof(h.x)); memcpy(h.dry, h.y, sizeof(h.y)); h.drth = h.th; }
+// Due a redraw: new, poked, kicked or put back (not drawn); moved 1/4 px from the pose on screen - finer
+// steps don't show, and a breeze moving it a fiftieth of a pixel a frame would otherwise redraw all of it
+// every frame; come to rest (once more, exactly); or water redrawn within its strands' reach (the water
+// under a strand's soft edge shows through it).
 bool sway_due(int i, bool water_moved) {
     const Sway& h = g_sway[i];
     if (!h.ready) return false;
-    if (h.awake || !h.drawn) return true;
-    if (water_moved)
+    if (!h.drawn) return true;
+    const float m = sway_moved(h);
+    if (m >= 0.25f || (!h.awake && m > 0.0f)) return true;
+    if (water_moved && h.wetd <= h.disp + 3.0f)
         for (int k = 0; k < g_nw; ++k)
             if (g_wat[k].edge && regions_meet(h.lx0, h.ly0, h.lx1, h.ly1, g_wat[k].bx, g_wat[k].by, g_wat[k].bx + g_wat[k].bw, g_wat[k].by + g_wat[k].bh))
                 return true;
@@ -917,10 +1005,13 @@ bool sway_due(int i, bool water_moved) {
 // Returns how many regions were redrawn (their indices in `which`).
 // The redraw in progress (the depth frame draws it a slice at a time; elsewhere at once): each due
 // one's rect back to the photo, then every one there drawn - all from meshes posed at its start.
-struct SwayRedraw { bool on = false; bool wm = false; int nd = 0, which[SWAY_MAX]; int tn = 0, touch[SWAY_MAX]; int k = 0, y = -1; };
+struct SwayRedraw { bool on = false; bool wm = false; int nd = 0, which[SWAY_MAX]; int tn = 0, touch[SWAY_MAX]; int k = 0, y = -1;
+                    int by0 = 0, by1 = IMG_H; };                  // (the rows put back: only those are drawn)
 SwayRedraw g_sj;
 int g_sj_nd() { return g_sj.nd; }
 bool g_sw_send = false;                                // (flat) hair redrawn, waiting to be sent
+bool g_ff = false;                                     // (flat) a frame is under way (its zones still to draw)
+bool g_sw_start = false;                               // (flat) … its hair / cloth / pendants still to start
 int g_sj_which(int k) { return g_sj.which[k]; }
 SwDraw* g_sdraw[SWAY_MAX] = {nullptr};
 void sway_redraw_start(bool water_moved) {
@@ -932,6 +1023,7 @@ void sway_redraw_start(bool water_moved) {
         if (!g_sdraw[i]) { g_sdraw[i] = (SwDraw*)water_alloc(sizeof(SwDraw)); if (!g_sdraw[i]) { g_sj.nd = 0; return; } }
     for (int i = 0; i < g_ns; ++i) sway_draw_prep(g_sway[i], *g_sdraw[i]);   // (the pose it draws, fixed now)
     for (int k = 0; k < g_sj.nd; ++k) sway_dirty_d(g_sway[g_sj.which[k]], *g_sdraw[g_sj.which[k]]);   // (what it drew last time and now)
+    for (int k = 0; k < g_sj.nd; ++k) sway_mark(g_sway[g_sj.which[k]]);   // (the pose it draws)
     const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
     for (int k = 0; k < g_sj.nd; ++k) {
         const Sway& h = g_sway[g_sj.which[k]];
@@ -964,6 +1056,12 @@ void sway_redraw_start(bool water_moved) {
         }
         if (touched) g_sj.touch[g_sj.tn++] = i;
     }
+    g_sj.by0 = IMG_H; g_sj.by1 = 0;                    // only the rows put back need drawing (the rest is as it was)
+    for (int k = 0; k < g_sj.nd; ++k) {
+        const Sway& a = g_sway[g_sj.which[k]];
+        if (a.uy0 < g_sj.by0) g_sj.by0 = a.uy0;
+        if (a.uy1 > g_sj.by1) g_sj.by1 = a.uy1;
+    }
     g_sj.on = true;
 }
 // Draw on (both cores, 24 rows at a time); budget: stop when this tick's time is up. True when done.
@@ -971,9 +1069,10 @@ bool sway_redraw_run(bool budget) {
     while (g_sj.on && g_sj.k < g_sj.tn) {
         const int i = g_sj.touch[g_sj.k];
         const Sway& s = g_sway[i];
-        if (g_sj.y < 0) g_sj.y = s.y0;
-        if (g_sj.y >= s.y1) { ++g_sj.k; g_sj.y = -1; continue; }
-        const int ye = g_sj.y + 24 < s.y1 ? g_sj.y + 24 : s.y1;
+        const int sy0 = s.y0 > g_sj.by0 ? s.y0 : g_sj.by0, sy1 = s.y1 < g_sj.by1 ? s.y1 : g_sj.by1;
+        if (g_sj.y < 0) g_sj.y = sy0;
+        if (g_sj.y >= sy1) { ++g_sj.k; g_sj.y = -1; continue; }
+        const int ye = g_sj.y + 24 < sy1 ? g_sj.y + 24 : sy1;
         const uint32_t units = (uint32_t)((ye - g_sj.y + 1) / 2) * (uint32_t)(s.x1 - s.x0 + 16);   // (a core's half)
         if (budget && !fits(g_r_sway.est(units))) return false;
         RPiece pc(g_r_sway, units);
@@ -982,7 +1081,7 @@ bool sway_redraw_run(bool budget) {
         g_sj.y = ye;
     }
     if (g_sj.on)
-        for (int k = 0; k < g_sj.nd; ++k) g_sway[g_sj.which[k]].drawn = !g_sway[g_sj.which[k]].awake;
+        for (int k = 0; k < g_sj.nd; ++k) g_sway[g_sj.which[k]].drawn = true;   // (moving on: sway_due)
     g_sj.on = false;
     return true;
 }
@@ -1021,10 +1120,13 @@ void sway_push(const int* which, int nd) {
 // Content (what the planes show of themselves): the photo with the water drawn in (the layer), and the
 // zones drawn into g_anim on top of that when there are zones.
 // The parallax frame being sent (it may take a few ticks).
-struct ParJobState { bool on = false; ParFrame F; DirtyRects dr; int ri = 0, y = 0; uint32_t px = 0, us = 0; float v0[2] = {0, 0}; };
+struct ParJobState { bool on = false; ParFrame F; DirtyRects dr; int ri = 0, y = 0; uint32_t px = 0, us = 0; float v0[2] = {0, 0}, s0 = 1; };
 ParJobState g_pj;
 uint8_t g_ps = 0;                                      // the depth frame's stage (par_tick; 0: none)
-void frame_reset() { g_pj.on = false; g_wj = WaterJobState(); g_sj = SwayRedraw(); g_sw_send = false; g_ps = 0; }   // (no frame in progress)
+void frame_reset() {                                  // (no frame in progress)
+    g_pj.on = false; g_wj = WaterJobState(); g_sj = SwayRedraw(); g_sw_send = g_ff = g_sw_start = false; g_ps = 0;
+    g_clock.cancel();
+}   // (no frame in progress)
 void par_push(uint32_t now);
 const uint16_t* par_content(bool& sw) {
     if (g_anim) { sw = g_anim_sw; return g_anim; }
@@ -1063,10 +1165,10 @@ bool any_plane(const Parallax& P) {
     return false;
 }
 
-struct ParJob { const ParFrame* F; uint16_t* out; int x0, x1, ys; };
+struct ParJob { const ParFrame* F; uint16_t* out; int x0, x1, ys; int16_t* rng; };
 void par_rows_job(void* c, int lane, int y0, int y1) {
     ParJob& j = *(ParJob*)c;
-    parallax_render(*j.F, j.out + (y0 - j.ys) * (j.x1 - j.x0), j.x0, y0, j.x1, y1, lane);
+    parallax_render(*j.F, j.out + (y0 - j.ys) * (j.x1 - j.x0), j.x0, y0, j.x1, y1, lane, j.rng + 2 * (y0 - j.ys));
 }
 
 
@@ -1083,7 +1185,8 @@ void par_tick(uint32_t now, float dt, bool may_draw, bool zones_any) {
     if (g_pj.on) { par_push(now); return; }            // finish sending the frame in progress first
     static bool s_water_done = false, s_moved = false, s_zones = false;   // (carried while the stages run)
     if (g_ps == 0) {
-        if (now - g_last_draw < FRAME_MS) return;
+        if (!g_clock.due(now)) return;
+        g_clock.begin(now);
         s_moved = moved; s_zones = zones_any; s_water_done = false;
         if (g_nw > 0 && g_layer) { water_job_begin(true); g_ps = 1; } else g_ps = 2;
     } else { s_moved |= moved; s_zones |= zones_any; }
@@ -1246,8 +1349,7 @@ void par_content_finish(uint32_t now, bool moved) {
     const int16_t* const* wrows = J.wrows;
     const bool water_done = J.water_done, full_sync = J.full;
     for (int i = 0; i < wbox.n; ++i) content.add(wbox.r[i][0], wbox.r[i][1], wbox.r[i][2], wbox.r[i][3]);   // (for what to redraw)
-    if (!moved && content.n == 0) return;
-    g_last_draw = now;
+    if (!moved && content.n == 0) { g_clock.cancel(); return; }
 
     // screen rects: planes that slid (or the whole frame if the background slides too), plus content
     // changes, spread by the most any plane is shifted
@@ -1271,11 +1373,12 @@ void par_content_finish(uint32_t now, bool moved) {
     const uint16_t* anim = par_content(sw);
     // Not moved (yet): the content is drawn at the view the screen shows, not one it hasn't caught up to -
     // or the redrawn bits would sit a fraction of a pixel off the rest, and the screen would never catch up.
-    float vnow[2] = {g_par.v[0], g_par.v[1]};
-    if (!moved && g_par.drawn) { g_par.v[0] = g_par.dv[0]; g_par.v[1] = g_par.dv[1]; }
+    // (Likewise as sharp as the screen shows it.)
+    const float vnow[2] = {g_par.v[0], g_par.v[1]}, snow = g_par.sharp;
+    if (!moved && g_par.drawn) { g_par.v[0] = g_par.dv[0]; g_par.v[1] = g_par.dv[1]; g_par.sharp = g_par.dsharp; }
     parallax_frame(g_pj.F, g_par, anim, sw, g_nw > 0 || g_n > 0);
-    const float vshow[2] = {g_par.v[0], g_par.v[1]};
-    g_par.v[0] = vnow[0]; g_par.v[1] = vnow[1];
+    const float vshow[2] = {g_par.v[0], g_par.v[1]}, sshow = g_par.sharp;
+    g_par.v[0] = vnow[0]; g_par.v[1] = vnow[1]; g_par.sharp = snow;
     // pixels drawn exactly as the screen shows them are copied, not redrawn: not across what changed
     g_pj.F.front = g_par.drawn ? g_front : nullptr;
     ParFrame& F = g_pj.F;                              // what changed, exactly: the render works out which pixels
@@ -1294,7 +1397,7 @@ void par_content_finish(uint32_t now, bool moved) {
         }
     for (int k = 0; k < g_sj.nd; ++k) { const Sway& h = g_sway[g_sj.which[k]]; frect(h.ux0, h.uy0, h.ux1, h.uy1); }
     for (int i = 0; i < zc.n; ++i) frect(zc.r[i][0], zc.r[i][1], zc.r[i][2], zc.r[i][3]);
-    g_pj.v0[0] = vshow[0]; g_pj.v0[1] = vshow[1];
+    g_pj.v0[0] = vshow[0]; g_pj.v0[1] = vshow[1]; g_pj.s0 = sshow;
     g_pj.ri = 0; g_pj.y = dr.n ? dr.r[0][1] : 0; g_pj.px = 0; g_pj.us = 0;
     g_pj.on = true;
 }
@@ -1329,19 +1432,22 @@ void par_push(uint32_t now) {
         if (!fits(cost)) break;
         Piece pc(cost);
         g_pj.y = ye;
-        ParJob job{&g_pj.F, g_strip[cur], x0, x1, y};
+        int16_t rng[2 * STRIP_ROWS];                // (per row: the columns worked out afresh - the rest is the screen's)
+        ParJob job{&g_pj.F, g_strip[cur], x0, x1, y, rng};
         par_rows(par_rows_job, &job, y, ye);        // both cores
         int bx0 = x0, bx1 = x1, by0 = y, by1 = ye;
         uint16_t* buf = g_strip[cur];
         const int w = x1 - x0;
         if (g_front && g_par.drawn) {               // send only what changed (exact: same picture)
             bx0 = IMG_W; bx1 = -1; by0 = IMG_H; by1 = -1;
-            for (int yy = y; yy < ye; ++yy) {
+            for (int yy = y; yy < ye; ++yy) {     // (only where it was worked out afresh: the rest is the screen's)
                 const uint16_t* a = buf + (yy - y) * w;
                 const uint16_t* f = g_front + yy * IMG_W + x0;
-                int l = 0, r = w - 1;
-                while (l < w && a[l] == f[l]) ++l;
-                if (l == w) continue;
+                const int lo = rng[2 * (yy - y)] - x0, hi = rng[2 * (yy - y) + 1] - x0;
+                if (lo >= hi) continue;
+                int l = lo, r = hi - 1;
+                while (l < hi && a[l] == f[l]) ++l;
+                if (l == hi) continue;
                 while (a[r] == f[r]) --r;
                 if (x0 + l < bx0) bx0 = x0 + l;
                 if (x0 + r + 1 > bx1) bx1 = x0 + r + 1;
@@ -1366,8 +1472,10 @@ void par_push(uint32_t now) {
     g_pj.us += micros() - t0;
     if (g_pj.ri < dr.n) return;                     // (more next tick)
     g_pj.on = false;
-    g_par.dv[0] = g_pj.v0[0]; g_par.dv[1] = g_pj.v0[1];   // the view this frame shows
+    g_par.dv[0] = g_pj.v0[0]; g_par.dv[1] = g_pj.v0[1];   // the view this frame shows (and its filter)
+    g_par.dsharp = g_pj.s0;
     g_par.drawn = true;
+    g_clock.end(now);
     g_pf_us += g_pj.us; g_pf_px += g_pj.px; ++g_pf_frames;
     if (now - g_pf_t0 >= 3000) {
         if (g_pf_frames)
@@ -2820,7 +2928,7 @@ void play_tick(uint32_t now, bool may_draw) {
     uint32_t us = micros();
     g_tick_us0 = us;
     g_tick_did = false;
-    if (may_draw && !g_pj.on && g_ps == 0 && g_wj.phase == 0 && !g_sj.on && !g_sw_send) lcd_recheck(now);   // (80 MHz still holding? between frames)
+    if (may_draw && !g_pj.on && g_ps == 0 && !g_ff && g_wj.phase == 0 && !g_sj.on && !g_sw_send) lcd_recheck(now);   // (80 MHz still holding? between frames)
     float dt = (us - g_last_us) * 1e-6f;
     g_last_us = us;
     if (!g_ok) return;
@@ -2881,7 +2989,7 @@ void play_tick(uint32_t now, bool may_draw) {
                 float* P = sw.push[sw.npush++];
                 P[0] = z.cx + z.dx; P[1] = z.cy + z.dy; P[2] = z.r; P[3] = z.vx; P[4] = z.vy;
             }
-        if (sway_step(sw, dt, dn_live, dyn, g_sway_damp, g_sdf)) sw.drawn = false;
+        sway_step(sw, dt, dn_live, dyn, g_sway_damp, g_sdf);   // (redrawn once it has moved enough: sway_due)
     }
     bool echoing = g_echo > 0.02f;
     if (echoing != g_was_echo) {
@@ -3013,14 +3121,20 @@ void play_tick(uint32_t now, bool may_draw) {
         if (z.awake || g_shown[i]) any = true;
     }
     if (g_par.ready) { par_tick(now, dt, may_draw, any); return; }   // depth: everything goes through it
-    // Water: rendered into the layer and sent a slice at a time (a big sea can't hold the loop up);
-    // then the hanging things over it, and the zones over it draw on top.
-    bool under = false;                                // something under the zones was just sent: they follow now
-    if (g_wj.phase == 0 && may_draw && g_nw > 0 && g_layer && now - g_last_water >= WATER_FRAME_MS) {
-        g_last_water = now;
-        water_job_begin(false);
+    // The flat picture: a frame on each beat (g_clock) - the water into the layer and sent a slice at a time
+    // (a big sea can't hold the loop up), the hanging things over it, then the zones on top.
+    if (!g_ff && may_draw && g_clock.due(now)) {
+        const bool water = g_nw > 0 && g_layer, sways = !water && g_ns > 0 && any_sway_due();
+        if (water || sways || any) {
+            g_clock.begin(now); g_ff = true;
+            if (water) water_job_begin(false);
+            else g_sw_start = sways;
+        }
     }
-    if (g_wj.phase && may_draw && water_job()) {
+    if (!g_ff || !may_draw) return;
+    bool under = false;                                // something under the zones was just sent: they follow now
+    if (g_wj.phase) {
+        if (!water_job()) return;                      // (zones wait for the water to finish)
         under = true;
         for (int i = 0; i < g_n; ++i)                  // zones over water draw on top of it
             for (int k = 0; k < g_nw; ++k) {
@@ -3032,38 +3146,34 @@ void play_tick(uint32_t now, bool may_draw) {
                 }
             }
     }
-    if (g_wj.phase) return;                            // (zones wait for the water to finish)
-    if (may_draw && g_ns > 0 && g_nw == 0) {           // hair / cloth / pendants (no water): into the layer a slice
-        if (!g_sj.on && !g_sw_send && now - g_last_sway >= FRAME_MS && any_sway_due() && fits(g_c_swstart)) {
-            g_last_sway = now;                         //  at a time, then sent - with the zones over them
-            Piece pc(g_c_swstart);
-            sway_redraw_start(false);
-        }
-        if (g_sj.on) {
-            if (!sway_redraw_run(true)) return;        // (zones wait for it, as for the water)
-            g_sw_send = true;
-        }
-        if (g_sw_send) {
-            if (!fits(g_c_swpush.us + (g_n > 0 ? g_c_zones.us : 0))) return;
-            g_sw_send = false;
-            { Piece pc(g_c_swpush); sway_push(g_sj.which, g_sj.nd); }
-            under = true;
-            for (int k = 0; k < g_sj.nd; ++k)          // zones over them draw on top
-                for (int i = 0; i < g_n; ++i) {
-                    const Sway& h = g_sway[g_sj.which[k]];
-                    const Zone& z = g_z[i];
-                    if (z.wmap && regions_meet(z.bx, z.by, z.bx + z.bw, z.by + z.bh, h.ux0, h.uy0, h.ux1, h.uy1)) { g_shown[i] = true; any = true; }
-                }
-        }
+    if (g_sw_start) {                                  // hair / cloth / pendants (no water): into the layer a slice
+        if (!fits(g_c_swstart)) return;                //  at a time, then sent - with the zones over them
+        g_sw_start = false;
+        Piece pc(g_c_swstart);
+        sway_redraw_start(false);
+    }
+    if (g_sj.on) {
+        if (!sway_redraw_run(true)) return;            // (zones wait for it, as for the water)
+        g_sw_send = true;
+    }
+    if (g_sw_send) {
+        if (!fits(g_c_swpush.us + (g_n > 0 ? g_c_zones.us : 0))) return;
+        g_sw_send = false;
+        { Piece pc(g_c_swpush); sway_push(g_sj.which, g_sj.nd); }
+        under = true;
+        for (int k = 0; k < g_sj.nd; ++k)              // zones over them draw on top
+            for (int i = 0; i < g_n; ++i) {
+                const Sway& h = g_sway[g_sj.which[k]];
+                const Zone& z = g_z[i];
+                if (z.wmap && regions_meet(z.bx, z.by, z.bx + z.bw, z.by + z.bh, h.ux0, h.uy0, h.ux1, h.uy1)) { g_shown[i] = true; any = true; }
+            }
     }
     static bool s_zone_skipped = false;                 // (the zones next tick - but never two ticks running)
     if (!under && !s_zone_skipped && any && !fits(g_c_zones)) { s_zone_skipped = true; return; }
     s_zone_skipped = false;
-    if (!any || !may_draw) return;
-    if (!under && now - g_last_draw < FRAME_MS) return;
-    g_last_draw = now;
-    Piece pc(g_c_zones);
-    draw_frame();
+    g_ff = false;
+    if (any) { Piece pc(g_c_zones); draw_frame(); }
+    g_clock.end(now);
 }
 
 bool poke(int x, int y) {
@@ -3094,7 +3204,7 @@ void refresh() {
     present();
     for (int i = 0; i < g_n; ++i) g_shown[i] = true;
     for (int i = 0; i < g_ns; ++i) g_sway[i].drawn = false;
-    g_last_draw = 0;
+    g_clock.soon();
 }
 bool animating() {
     if (!g_ok) return false;

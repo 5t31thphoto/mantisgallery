@@ -106,6 +106,8 @@ struct Sway {
     int   nr = 0, nn[SR_MAX] = {0};
     float rx[SR_MAX][SN_MAX], ry[SR_MAX][SN_MAX];     // rest
     float x[SR_MAX][SN_MAX], y[SR_MAX][SN_MAX], xp[SR_MAX][SN_MAX], yp[SR_MAX][SN_MAX];
+    float drx[SR_MAX][SN_MAX], dry[SR_MAX][SN_MAX], drth = 0;   // runtime: the pose on screen (jiggle.cpp sway_due)
+    float wetd = 0;                           // runtime: px from its strands to the nearest water drawn (0: unknown)
     float len[SR_MAX][SN_MAX], kn[SR_MAX][SN_MAX], cap[SR_MAX][SN_MAX], rsdf[SR_MAX][SN_MAX];
     bool  onb[SR_MAX][SN_MAX];
     float lw[SR_MAX][SN_MAX], rwd[SR_MAX][SN_MAX], ext[SR_MAX];  // hair: half widths, tip overhang

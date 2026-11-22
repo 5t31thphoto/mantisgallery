@@ -17,6 +17,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <new>
+#if defined(ESP_PLATFORM)
+#include <esp_heap_caps.h>
+#endif
 #include "jiggle_core.h"
 
 namespace jig {
@@ -84,6 +88,7 @@ struct Water {
     float *h0 = nullptr, *h1 = nullptr;          // surface heights (two time levels)
     float *gx = nullptr, *gy = nullptr;          // surface slope after the latest step
     float *gxp = nullptr, *gyp = nullptr;        // …and the step before (drawn blended between them)
+    float *sgx = nullptr, *sgy = nullptr;        // the blend as it stood when this frame began (water_snapshot)
     uint8_t* cin = nullptr;                      // cell is water
     int8_t *cnx = nullptr, *cny = nullptr;       // outward normal at the water's edge (else 0)
     float *fx = nullptr, *fy = nullptr;          // river: flow (px/s) per cell
@@ -202,12 +207,12 @@ using WAlloc = void* (*)(size_t);
 inline void* water_default_alloc(size_t n) { return malloc(n); }
 
 inline void water_free_runtime(Water& w) {
-    void* ps[] = {w.edge, w.dsafe, w.sp_off, w.sp, w.h0, w.h1, w.gx, w.gy, w.gxp, w.gyp, w.cin, w.cnx, w.cny,
+    void* ps[] = {w.edge, w.dsafe, w.sp_off, w.sp, w.h0, w.h1, w.gx, w.gy, w.gxp, w.gyp, w.sgx, w.sgy, w.cin, w.cnx, w.cny,
                   w.fx, w.fy, w.od, w.onx, w.ony, w.pax, w.pay};
     w.pax = w.pay = nullptr; w.ghz = -1.0f; w.oworld = false;
     for (void* p : ps) if (p) free(p);
     w.edge = nullptr; w.dsafe = nullptr; w.sp_off = nullptr; w.sp = nullptr;
-    w.h0 = w.h1 = w.gx = w.gy = w.gxp = w.gyp = nullptr; w.cin = nullptr; w.cnx = w.cny = nullptr;
+    w.h0 = w.h1 = w.gx = w.gy = w.gxp = w.gyp = w.sgx = w.sgy = nullptr; w.cin = nullptr; w.cnx = w.cny = nullptr;
     w.fx = w.fy = w.od = w.onx = w.ony = nullptr;
     w.bw = w.bh = w.area = 0;
 }
@@ -427,11 +432,11 @@ inline bool water_prepare(Water& w, WAlloc al = water_default_alloc) {
     w.gh = (w.bh + WCELL - 1) / WCELL + 2;
     const int gn = w.gw * w.gh;
     w.h0 = (float*)al(gn * 4); w.h1 = (float*)al(gn * 4); w.gx = (float*)al(gn * 4); w.gy = (float*)al(gn * 4);
-    w.gxp = (float*)al(gn * 4); w.gyp = (float*)al(gn * 4);
+    w.gxp = (float*)al(gn * 4); w.gyp = (float*)al(gn * 4); w.sgx = (float*)al(gn * 4); w.sgy = (float*)al(gn * 4);
     w.cin = (uint8_t*)al(gn); w.cnx = (int8_t*)al(gn); w.cny = (int8_t*)al(gn);
-    if (!w.h0 || !w.h1 || !w.gx || !w.gy || !w.gxp || !w.gyp || !w.cin || !w.cnx || !w.cny) { water_free_runtime(w); return false; }
+    if (!w.h0 || !w.h1 || !w.gx || !w.gy || !w.gxp || !w.gyp || !w.sgx || !w.sgy || !w.cin || !w.cnx || !w.cny) { water_free_runtime(w); return false; }
     memset(w.h0, 0, gn * 4); memset(w.h1, 0, gn * 4); memset(w.gx, 0, gn * 4); memset(w.gy, 0, gn * 4);
-    memset(w.gxp, 0, gn * 4); memset(w.gyp, 0, gn * 4);
+    memset(w.gxp, 0, gn * 4); memset(w.gyp, 0, gn * 4); memset(w.sgx, 0, gn * 4); memset(w.sgy, 0, gn * 4);
     for (int j = 0; j < w.gh; ++j)
         for (int i = 0; i < w.gw; ++i) {
             int cx = x0 + (i - 1) * WCELL + WCELL / 2, cy = y0 + (j - 1) * WCELL + WCELL / 2;
@@ -603,8 +608,10 @@ inline void water_step(Water& w, float dt, const float dn[3], const float jolt[3
 }
 
 // ---- render -------------------------------------------------------------------------------------
-// Fast and exact: everything smooth at cell scale is interpolated once per row; per pixel it's a few
-// adds, integer-phase table sines (one add per wave per pixel), and the bilinear sample of the photo.
+// The waves, ripples and swell are smooth: worked out at half the picture's resolution (a node every
+// second pixel each way), with everything smooth at cell scale interpolated once per row and integer-
+// phase table sines. Per pixel: a blend of its nodes, its own fade toward the bank, and the bilinear
+// sample of the photo - at full resolution (the photo itself is never scaled).
 static int16_t s_wsin[1025];                        // sin, Q14, 1024 steps (+1 for the lerp)
 static bool s_wsin_ok = false;
 inline __attribute__((noinline)) const int16_t* wsin_tab() {
@@ -636,37 +643,25 @@ JIG_INLINE uint16_t rgb565_brighten(uint16_t c, float k) {          // toward wh
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
-// Keep a sample inside the water: back off toward the pixel itself if it would land on the bank.
-inline void water_clamp(const Water& w, int x, int y, float& ox, float& oy) {
-    for (int k = 0; k < 3; ++k) {
-        if (mask_get(w.mask, (int)floorf(x + ox + 0.5f), (int)floorf(y + oy + 0.5f))) return;
-        ox *= 0.5f; oy *= 0.5f;
-    }
-    ox = oy = 0;
-}
 
-// Render the water in rows [y0,y1) × cols [x0,x1) into `out` — a full frame (stride IMG_W) in
-// out_swapped byte order — sampling the untouched photo `src` (src_swapped order). Only water pixels
-// are written.
-// lane: 0 or 1 — which core's scratch rows to use (two cores can render different rows at once).
 JIG_INLINE uint16_t rgb565_scale(uint16_t c, float f) {             // brightness × f (clamped)
     int r = (int)((c >> 11) * f), g = (int)(((c >> 5) & 63) * f), b = (int)((c & 31) * f);
     r = r > 31 ? 31 : r; g = g > 63 ? 63 : g; b = b > 31 ? 31 : b;
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
-// Water is drawn in three steps: what holds for the whole frame (WFrame), for one row (WRow), and then
-// each pixel. water_render runs them over the picture; the depth view runs them for the pixels on screen,
-// sampling each at the exact spot the view slid it to (one resample - not water drawn, then resampled).
+// Water is drawn per frame (WFrame: what holds for all of it), per node row (WRow) and per pixel.
 constexpr int W_NC = IMG_W / WCELL + 4;
 struct WFrame {
     float t, al, rk, slx, sly, hz, span_h, amb0, glint, light, foam_k;
     bool ocean, river;
     float tT, ospc, oA0;
     float k1, k2; int mix8;
-    const float* sgx = nullptr;                      // (optional) the ripple field as it stands this frame,
-    const float* sgy = nullptr;                      //   blended between steps - held for the whole frame
+    const float* sgx = nullptr;                      // (optional) the ripple field as it stood when the frame
+    const float* sgy = nullptr;                      //   began (water_snapshot) - every row from the same moment
+    uint32_t id = 0;                                 // (which frame: the node rows cached for it)
 };
-// That snapshot: gw·gh blended slopes each, exactly as water_row_setup would blend them live.
+// That snapshot: gw·gh blended slopes each, exactly as water_row_setup would blend them live. A frame drawn
+// over several ticks then shows one moment, however far the surface has stepped since.
 inline void water_snapshot(const Water& w, float* sgx, float* sgy) {
     const float al = w.alpha;
     for (int k = 0; k < w.gw * w.gh; ++k) {
@@ -683,6 +678,8 @@ struct WRow {
     float rRX[W_NC], rRY[W_NC], rGX[W_NC], rGY[W_NC], rA[W_NC], rB[W_NC], rC[W_NC];
 };
 inline void water_frame_setup(const Water& w, WFrame& F) {
+    static uint32_t s_id = 0;
+    F.id = ++s_id;
     F.t = w.t; F.al = w.alpha;
     F.rk = W_RIP_K * wprm(w, WP_RIPPLE);
     F.slx = w.sx * 0.5f; F.sly = w.sy * 0.5f;
@@ -742,16 +739,26 @@ inline void water_row_setup(const Water& w, const WFrame& F, int y, WRow& R) {
     R.inv_lam = 1.0f / R.lam; R.half_lam = R.lam * 0.5f; R.oA = F.oA0 * p;
     R.oA8 = R.oA * 0.8f; R.oAr = R.oA / W_OCEAN_A; R.oAr1 = R.oAr > 1 ? 1 : R.oAr;   // (per row, not per pixel)
 }
-// One water pixel (x, R.y), its colour (native RGB565). P1..P3: its wave phases (b + d·x). The picture is
-// sampled around (sx, sy): x, y themselves - or, on the depth view, where the view slid that pixel to.
-// at_pixel: (sx, sy) is exactly (x, y) (an unshifted pixel is then just read).
-JIG_INLINE uint16_t water_pixel(const Water& w, const WFrame& F, const WRow& R, int x, uint32_t P1, uint32_t P2, uint32_t P3,
-                                float sx, float sy, bool at_pixel, const uint16_t* src, bool src_swapped) {
-    const int y = R.y;
-    const float e = w.edge[R.ry * w.bw + x - w.bx] * (1.0f / 255.0f);
+// The ripples, waves and swell are smooth: they're worked out on a lattice of every second pixel (x and y
+// even, "nodes": half the picture's resolution), and each pixel blends its nodes (½ weights). Only the
+// photo is sampled at every pixel - at full resolution, at the spot its blend displaces it to - and the
+// fade toward the bank is the pixel's own. (Everything here is before that fade.)
+struct alignas(4) WNode {                            // 12 bytes
+    int16_t ax, ay, bx, by;                          // displacement, 1/64 px (river: the two flow phases; else b = a)
+    int16_t sh;                                      // painted light: shade − 1, ×8192 …
+    int8_t  fo, gl;                                  // … foam, glint strength: ×127 (these three: one aligned word)
+};
+JIG_INLINE uint32_t wnode_extras(const WNode& n) { uint32_t v; memcpy(&v, &n.sh, 4); return v; }   // (0: none)
+JIG_INLINE int wq(float v, float k, int lim) {       // (to the node's fixed point, rounded, clamped)
+    const float q = v * k;
+    return q > (float)lim ? lim : (q < -(float)lim ? -lim : (int)(q + (q >= 0 ? 0.5f : -0.5f)));
+}
+// One node (x even, R a row set up for y = R.y even). P1..P3: its wave phases (b + d·x).
+JIG_INLINE WNode water_node(const Water& w, const WFrame& F, const WRow& R, int x, uint32_t P1, uint32_t P2, uint32_t P3) {
     const float u = (x - w.bx) * (1.0f / WCELL) + 0.5f;
-    int i = (int)u; if (i > w.gw - 2) i = w.gw - 2;
-    const float fx = u - i, fx0 = 1.0f - fx;
+    int i = (int)u; if (i < 0) i = 0; if (i > w.gw - 2) i = w.gw - 2;
+    float fx = u - i; fx = fx < 0 ? 0 : (fx > 1 ? 1 : fx);
+    const float fx0 = 1.0f - fx;
     const float gxr = R.rGX[i] * fx0 + R.rGX[i + 1] * fx, gyr = R.rGY[i] * fx0 + R.rGY[i + 1] * fx;
     float shade = 1.0f - F.light * W_RIP_SHADE * gyr * (F.rk > 0 ? 1.0f : 0.0f);   // painted light (optional)
     float foam = 0.0f;
@@ -761,7 +768,7 @@ JIG_INLINE uint16_t water_pixel(const Water& w, const WFrame& F, const WRow& R, 
         const float c06 = 0.82533561f, s06 = 0.56464247f;            // cos 0.6, sin 0.6
         const float d = R.rA[i] * fx0 + R.rA[i + 1] * fx, nx = R.rB[i] * fx0 + R.rB[i + 1] * fx, ny = R.rC[i] * fx0 + R.rC[i + 1] * fx;
         float q = d * R.inv_lam + F.tT;
-        q -= (float)(int)q;
+        q -= floorf(q);
         const uint32_t U = (uint32_t)(q * 4294967296.0f);
         const float sp_ = wsin_u(U), cp = wsin_u(U + 0x40000000u);
         const float s2 = 2.0f * sp_ * cp * c06 - (cp * cp - sp_ * sp_) * s06;   // sin(2φ − 0.6)
@@ -776,62 +783,216 @@ JIG_INLINE uint16_t water_pixel(const Water& w, const WFrame& F, const WRow& R, 
         const float zone = R.lam * 0.6f;
         if (F.foam_k > 0 && d < zone && sp_ > 0.7f) foam = F.foam_k * (sp_ - 0.7f) * 3.3f * (1.0f - d / zone) * R.oAr1;
     }
-    dx *= e; dy *= e;
-    const float lim = (float)w.dsafe[R.ry * w.bw + x - w.bx] - 1.0f;   // shorter shifts can't reach the bank
-    uint16_t c;
-    if (F.river) {
-        const float fxv = (R.rA[i] * fx0 + R.rA[i + 1] * fx) * e, fyv = (R.rB[i] * fx0 + R.rB[i + 1] * fx) * e;
-        float ax = dx + fxv * F.k1, ay = dy + fyv * F.k1, bx = dx + fxv * F.k2, by = dy + fyv * F.k2;
-        if (fabsf(ax) + fabsf(ay) >= lim) water_clamp(w, x, y, ax, ay);
-        if (fabsf(bx) + fabsf(by) >= lim) water_clamp(w, x, y, bx, by);
-        const uint16_t c1 = sample_fx(src, src_swapped, (int32_t)((sx + ax) * 256.0f), (int32_t)((sy + ay) * 256.0f));
-        const uint16_t c2 = sample_fx(src, src_swapped, (int32_t)((sx + bx) * 256.0f), (int32_t)((sy + by) * 256.0f));
-        c = rgb565_mix(c1, c2, F.mix8);
-    } else {
-        if (fabsf(dx) + fabsf(dy) >= lim) water_clamp(w, x, y, dx, dy);
-        if (dx == 0.0f && dy == 0.0f && at_pixel) c = src_swapped ? bswap16(src[y * IMG_W + x]) : src[y * IMG_W + x];
-        else c = sample_fx(src, src_swapped, (int32_t)((sx + dx) * 256.0f), (int32_t)((sy + dy) * 256.0f));
-    }
-    if (shade < 0.995f || shade > 1.005f) c = rgb565_scale(c, shade * e + (1.0f - e));
-    if (foam > 0.01f) c = rgb565_brighten(c, (foam > 0.85f ? 0.85f : foam) * e);
-    if (F.glint > 0) {                                   // light caught on a steep ripple
+    WNode n;
+    if (F.river) {                                   // two phases of the flow, cross-faded per pixel
+        const float fxv = R.rA[i] * fx0 + R.rA[i + 1] * fx, fyv = R.rB[i] * fx0 + R.rB[i + 1] * fx;
+        n.ax = (int16_t)wq(dx + fxv * F.k1, 64.0f, 32767); n.ay = (int16_t)wq(dy + fyv * F.k1, 64.0f, 32767);
+        n.bx = (int16_t)wq(dx + fxv * F.k2, 64.0f, 32767); n.by = (int16_t)wq(dy + fyv * F.k2, 64.0f, 32767);
+    } else { n.ax = n.bx = (int16_t)wq(dx, 64.0f, 32767); n.ay = n.by = (int16_t)wq(dy, 64.0f, 32767); }
+    n.sh = (int16_t)wq(shade - 1.0f, 8192.0f, 32767);
+    n.fo = (int8_t)wq(foam, 127.0f, 127);
+    float g = 0.0f;                                  // light caught on a steep ripple (scaled by the pixel's light)
+    if (F.glint > 0) {
         const float sl2 = gxr * gxr + gyr * gyr;
-        if (sl2 > 324.0f) {
+        if (sl2 > 324.0f) { g = (sqrtf(sl2) - 18.0f) * (1.0f / 40.0f); g = (g > 1 ? 1 : g) * F.glint; }
+    }
+    n.gl = (int8_t)wq(g, 127.0f, 127);
+    return n;
+}
+// The node rows of the frame being drawn, shared by both cores: a slice of pixel rows first has its new node
+// rows worked out (water_nodes - the two cores take half each), then its pixels blend them (water_render).
+// Slices go down the water, so the row a slice shares with the last is kept, not worked out again.
+constexpr int W_NN = IMG_W / 2 + 3;                  // nodes per row (x up to IMG_W + 2: past the picture is fine)
+constexpr int W_NR = 8;                              // node rows kept (a slice of STRIP_ROWS ≤ 12 rows needs ≤ 7)
+struct WNodeCache {
+    const Water* w = nullptr; uint32_t id = 0;
+    int tag[W_NR];                                   // the node row in each slot (INT32_MIN: none)
+    int dmax[W_NR];                                  // its largest displacement (1/64 px, either axis, either phase)
+    WNode n[W_NR][W_NN];
+    WNode mid[2][W_NN];                              // per core: an odd pixel row, halfway between its two node rows
+};
+// (~20 KB, read at every water pixel: internal RAM when there's comfortably room, else PSRAM - on the heap,
+// so it can never crowd the firmware's fixed data out of internal RAM. Made by the first water_nodes_due, on
+// one core.)
+inline WNodeCache*& water_nodes_ptr() { static WNodeCache* c = nullptr; return c; }
+inline WNodeCache* water_nodes_cache() {
+    WNodeCache*& c = water_nodes_ptr();
+    if (!c) {
+        void* p = nullptr;
+#if defined(ESP_PLATFORM)                             // (the same room kept free as the other fast scratch)
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) > sizeof(WNodeCache) + 48 * 1024)
+            p = heap_caps_malloc(sizeof(WNodeCache), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#endif
+        if (!p) p = malloc(sizeof(WNodeCache));
+        if (p) c = new (p) WNodeCache();
+    }
+    return c;
+}
+inline WRow& water_row_scratch(int lane) { static WRow r[2]; return r[lane & 1]; }   // (a core's)
+// Pixel row y's water reaches nodes x0/2 … (x1−1)/2 + 1 of each span [x0, x1).
+JIG_INLINE void water_need(const Water& w, int y, uint8_t* need) {
+    if (y < w.by || y >= w.by + w.bh) return;
+    for (int k = w.sp_off[y - w.by]; k < w.sp_off[y - w.by + 1]; ++k) {
+        const int a = w.sp[2 * k] >> 1, b = ((w.sp[2 * k + 1] - 1) >> 1) + 2;
+        if (a < b) memset(need + a, 1, (size_t)(b - a));
+    }
+}
+// Node rows [j0, j1) into their slots (R: this core's row scratch). Only the nodes pixels in rows 2j−1 … 2j+1
+// blend - not across dry gaps.
+inline void water_node_rows(const Water& w, const WFrame& F, WRow& R, int j0, int j1) {
+    WNodeCache* Cp = water_nodes_ptr();
+    if (!Cp) return;
+    WNodeCache& C = *Cp;
+    uint8_t need[W_NN];
+    for (int j = j0; j < j1; ++j) {
+        memset(need, 0, sizeof need);
+        for (int y = 2 * j - 1; y <= 2 * j + 1; ++y) water_need(w, y, need);
+        const int slot = ((j % W_NR) + W_NR) % W_NR;
+        WNode* n = C.n[slot];
+        bool set = false;
+        int dm = 0;
+        for (int i = 0; i < W_NN; ++i) {
+            if (!need[i]) continue;
+            if (!set) { water_row_setup(w, F, 2 * j, R); set = true; }
+            const uint32_t x = 2u * (uint32_t)i;
+            const WNode& m = n[i] = water_node(w, F, R, (int)x, R.b1 + (uint32_t)R.d1 * x, R.b2 + (uint32_t)R.d2 * x, R.b3 + (uint32_t)R.d3 * x);
+            const int d = abs(m.ax) | abs(m.ay) | abs(m.bx) | abs(m.by);   // (≥ each: a bound, cheaply)
+            if (d > dm) dm = d;
+        }
+        C.dmax[slot] = dm;
+    }
+}
+// The node rows pixel rows [y0, y1) need that aren't kept yet: claims their slots, returns them as [j0, j1)
+// (call water_node_rows for those - on both cores - before water_render). One core at a time.
+inline void water_nodes_due(const Water& w, const WFrame& F, int y0, int y1, int& j0, int& j1) {
+    j0 = j1 = 0;
+    WNodeCache* Cp = water_nodes_cache();
+    if (!Cp) return;
+    WNodeCache& C = *Cp;
+    if (C.w != &w || C.id != F.id) { C.w = &w; C.id = F.id; for (int k = 0; k < W_NR; ++k) C.tag[k] = INT32_MIN; }
+    const int ja = y0 >> 1, jb = ((y1 - 1) >> 1) + ((y1 - 1) & 1) + 1;   // (the last row, if odd, needs the next)
+    j0 = jb; j1 = jb;
+    for (int j = ja; j < jb; ++j) {
+        int& t = C.tag[((j % W_NR) + W_NR) % W_NR];
+        if (t == j) continue;
+        t = j;
+        if (j0 == jb) j0 = j;
+        j1 = j + 1;
+    }
+}
+// Keep a sample inside the water (displacement in 1/64 px): back off toward the pixel itself if it would
+// land on the bank.
+JIG_INLINE void water_clamp_q(const Water& w, int x, int y, int& ax, int& ay) {
+    for (int k = 0; k < 3; ++k) {
+        const int sx = x + ((ax + 32) >> 6), sy = y + ((ay + 32) >> 6);   // ⌊x + ax/64 + ½⌋
+        if (w.mask && (unsigned)sx < (unsigned)IMG_W && (unsigned)sy < (unsigned)IMG_H) {
+            const int i = sy * IMG_W + sx;
+            if ((w.mask[i >> 3] >> (i & 7)) & 1) return;
+        }
+        ax /= 2; ay /= 2;
+    }
+    ax = ay = 0;
+}
+// One water pixel (x, y) from its nodes P[0], P[o] (o = x & 1), its fade e and bank distance. IN: every
+// sample it can take lies inside the picture (sample_fx's clamps would change nothing: none).
+template <bool IN>
+JIG_INLINE uint16_t water_px(const Water& w, const WFrame& F, const WNode* P, int x, int y, int e, int ds,
+                             const uint16_t* srow, const uint16_t* src, bool src_swapped, bool river) {
+    const int o = x & 1;                                 // odd: halfway to the next node (even: (2a) >> 1 = a)
+    int ax = (P[0].ax + P[o].ax) >> 1, ay = (P[0].ay + P[o].ay) >> 1;
+    int bx = 0, by = 0;
+    if (river) { bx = (P[0].bx + P[o].bx) >> 1; by = (P[0].by + P[o].by) >> 1; }
+    if (e != 255) {                                      // (·e·257 >> 16 ≈ ·e / 255)
+        const int ek = e * 257;
+        ax = (ax * ek) >> 16; ay = (ay * ek) >> 16; bx = (bx * ek) >> 16; by = (by * ek) >> 16;
+    }
+    const int lim = (ds << 6) - 64;                      // shorter shifts can't reach the bank
+    auto smp = [&](int dx, int dy) {
+        return IN ? sample_fx_in(src, src_swapped, (x << 8) + dx * 4, (y << 8) + dy * 4)
+                  : sample_fx(src, src_swapped, (x << 8) + dx * 4, (y << 8) + dy * 4);
+    };
+    uint16_t c;
+    if (river) {                                         // the two phases of the flow, cross-faded
+        if (abs(ax) + abs(ay) >= lim) water_clamp_q(w, x, y, ax, ay);
+        if (abs(bx) + abs(by) >= lim) water_clamp_q(w, x, y, bx, by);
+        c = rgb565_mix(smp(ax, ay), smp(bx, by), F.mix8);
+    } else {
+        if (abs(ax) + abs(ay) >= lim) water_clamp_q(w, x, y, ax, ay);
+        if ((ax | ay) == 0) c = src_swapped ? bswap16(srow[x]) : srow[x];
+        else c = smp(ax, ay);
+    }
+    if (wnode_extras(P[0]) | wnode_extras(P[o])) {       // painted light, foam, glints (only where a node has any)
+        const int sh = (P[0].sh + P[o].sh) >> 1, fo = (P[0].fo + P[o].fo) >> 1, gl = (P[0].gl + P[o].gl) >> 1;
+        if (sh) {
+            const float k = 1.0f + (float)((sh * e * 257) >> 16) * (1.0f / 8192);
+            if (k < 0.995f || k > 1.005f) c = rgb565_scale(c, k);
+        }
+        if (fo > 1) c = rgb565_brighten(c, (fo > 108 ? 108 : fo) * (1.0f / 127) * (e * (1.0f / 255)));
+        if (gl > 0) {                                    // light caught on a steep ripple
             const int lum = ((c >> 11) * 8 + ((c >> 5) & 63) * 4 + (c & 31) * 8) / 3;
-            if (lum > 120) {
-                float k = (sqrtf(sl2) - 18.0f) * (1.0f / 40.0f);
-                k = (k > 1 ? 1 : k) * F.glint * e * (lum * (1.0f / 255.0f));
-                c = rgb565_brighten(c, k);
-            }
+            if (lum > 120) c = rgb565_brighten(c, gl * (1.0f / 127) * (e * (1.0f / 255)) * (lum * (1.0f / 255)));
         }
     }
     return c;
 }
-// fr: the frame to draw (a snapshot taken earlier: the depth view draws one water moment a frame); else now.
-JIG_HOT void water_render(const Water& w, const uint16_t* src, bool src_swapped, uint16_t* out, bool out_swapped,
-                         int x0, int y0, int x1, int y1, int lane = 0, const WFrame* fr = nullptr) {
-    if (!w.edge) return;
-    static WRow sR[2];
-    WRow& R = sR[lane & 1];
-    WFrame Fnow;
-    if (!fr) water_frame_setup(w, Fnow);
-    const WFrame& F = fr ? *fr : Fnow;
+// Render the water in rows [y0,y1) × cols [x0,x1) into `out` — a full frame (stride IMG_W) in out_swapped
+// byte order — sampling the untouched photo `src` (src_swapped order). Only water pixels are written.
+// F: the frame (water_frame_setup + water_snapshot at its start); its node rows must be worked out first
+// (water_nodes_due / water_node_rows). lane: 0 or 1 — which core's scratch to use.
+JIG_HOT void water_render(const Water& w, const WFrame& F, const uint16_t* src, bool src_swapped, uint16_t* out, bool out_swapped,
+                          int x0, int y0, int x1, int y1, int lane = 0) {
+    const WNodeCache* Cp = water_nodes_ptr();
+    if (!w.edge || !w.sp_off || !Cp) return;
+    const WNodeCache& C = *Cp;
+    WNode* mid = water_nodes_ptr()->mid[lane & 1];
     if (y0 < w.by) y0 = w.by;
     if (y1 > w.by + w.bh) y1 = w.by + w.bh;
+    const bool river = F.river;
     for (int y = y0; y < y1; ++y) {
         const int ry = y - w.by;
         const int s0 = w.sp_off[ry], s1 = w.sp_off[ry + 1];
         if (s0 == s1) continue;
-        water_row_setup(w, F, y, R);
+        // this row's nodes: row y/2 (even y), else halfway between rows (y−1)/2 and (y+1)/2
+        const WNode* N = C.n[(y >> 1) % W_NR];
+        if (y & 1) {
+            const WNode* N1 = C.n[((y >> 1) + 1) % W_NR];
+            for (int sidx = s0; sidx < s1; ++sidx) {
+                const int a = w.sp[2 * sidx] >> 1, b = ((w.sp[2 * sidx + 1] - 1) >> 1) + 2;
+                for (int i = a; i < b; ++i) {
+                    const WNode& p = N[i]; const WNode& q = N1[i]; WNode& m = mid[i];
+                    m.ax = (int16_t)((p.ax + q.ax) >> 1); m.ay = (int16_t)((p.ay + q.ay) >> 1);
+                    m.bx = (int16_t)((p.bx + q.bx) >> 1); m.by = (int16_t)((p.by + q.by) >> 1);
+                    m.sh = (int16_t)((p.sh + q.sh) >> 1); m.fo = (int8_t)((p.fo + q.fo) >> 1); m.gl = (int8_t)((p.gl + q.gl) >> 1);
+                }
+            }
+            N = mid;
+        }
+        // Where no sample can leave the picture (this row's largest displacement, its node rows' bound, can't
+        // reach the edge): sampled without the clamps - the same pixels.
+        const int D = 4 * ((y & 1) ? (C.dmax[(y >> 1) % W_NR] > C.dmax[((y >> 1) + 1) % W_NR] ? C.dmax[(y >> 1) % W_NR] : C.dmax[((y >> 1) + 1) % W_NR])
+                                   : C.dmax[(y >> 1) % W_NR]);   // (1/256 px)
+        const bool vin = (y << 8) - D >= 0 && (y << 8) + D <= ((IMG_H - 1) << 8) - 1;
+        const int sxl = (D + 255) >> 8, sxr = ((((IMG_W - 1) << 8) - 1 - D) >> 8) + 1;   // x in [sxl, sxr): inside
         uint16_t* orow = out + y * IMG_W;
+        const uint8_t* erow = w.edge + ry * w.bw - w.bx;
+        const uint8_t* drow = w.dsafe + ry * w.bw - w.bx;
+        const uint16_t* srow = src + y * IMG_W;
         for (int sidx = s0; sidx < s1; ++sidx) {
             int xa = w.sp[2 * sidx], xb = w.sp[2 * sidx + 1];
             if (xa < x0) xa = x0;
             if (xb > x1) xb = x1;
-            if (xa >= xb) continue;
-            uint32_t P1 = R.b1 + (uint32_t)R.d1 * (uint32_t)xa, P2 = R.b2 + (uint32_t)R.d2 * (uint32_t)xa, P3 = R.b3 + (uint32_t)R.d3 * (uint32_t)xa;
-            for (int x = xa; x < xb; ++x, P1 += (uint32_t)R.d1, P2 += (uint32_t)R.d2, P3 += (uint32_t)R.d3) {
-                const uint16_t c = water_pixel(w, F, R, x, P1, P2, P3, (float)x, (float)y, true, src, src_swapped);
+            const int ia = vin ? (xa > sxl ? xa : sxl) : xb, ib = vin ? (xb < sxr ? xb : sxr) : xb;
+            int x = xa;
+            for (; x < xb && x < ia; ++x) {
+                const uint16_t c = water_px<false>(w, F, N + (x >> 1), x, y, erow[x], drow[x], srow, src, src_swapped, river);
+                orow[x] = out_swapped ? bswap16(c) : c;
+            }
+            for (; x < ib; ++x) {
+                const uint16_t c = water_px<true>(w, F, N + (x >> 1), x, y, erow[x], drow[x], srow, src, src_swapped, river);
+                orow[x] = out_swapped ? bswap16(c) : c;
+            }
+            for (; x < xb; ++x) {
+                const uint16_t c = water_px<false>(w, F, N + (x >> 1), x, y, erow[x], drow[x], srow, src, src_swapped, river);
                 orow[x] = out_swapped ? bswap16(c) : c;
             }
         }

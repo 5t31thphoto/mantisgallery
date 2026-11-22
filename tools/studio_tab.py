@@ -419,6 +419,11 @@ class StudioTab(tk.Frame):
                 self._btn(row, "⟳ Turn", lambda: self._do(lambda: self.st.grid_turn(1))).pack(side="left", padx=2)
                 self._btn(row, "Reset", lambda: self._do(self.st.grid_default)).pack(side="left", padx=2)
                 self._btn(row, "Remove grid", lambda: self._do(self.st.delete_active)).pack(side="left", padx=2)
+                row2 = tk.Frame(f, bg=PANEL); row2.pack(fill="x", pady=(4, 0))
+                self._btn(row2, "Level the ground", self.level_grid).pack(side="left")
+                lvl = self.st.grid_is_level()
+                self._label(row2, "✓ level" if lvl else "for a flat ground that's a little off",
+                            LIME if lvl else MUTED, bg=PANEL).pack(side="left", padx=6)
             else:
                 self._btn(row, "Add the ground grid", lambda: (self._do(self.st.grid_default), self.set_tool("grid")), "teal").pack(side="left")
             self._label(f, "Used by: Depth (how far each pixel is) · Figures (where they stand) · Water (wave size "
@@ -1089,6 +1094,15 @@ class StudioTab(tk.Frame):
         r = fn()
         self._changed()
         return r
+
+    def level_grid(self):
+        """Ground ▸ Level the ground: near and far edges made horizontal (undoable)."""
+        why = self.st.grid_level()
+        if why:                                          # nothing changed: just say why
+            self.status.set(why)
+            return
+        self._changed()
+        self.status.set("Ground levelled — the near and far edges are flat, so the horizon is level. Undo puts it back.")
 
     def open_dialog(self):
         p = filedialog.askopenfilename(parent=self, title="Open an .mg photo", filetypes=[("Mantis Gallery image", "*.mg"), ("All", "*.*")])
