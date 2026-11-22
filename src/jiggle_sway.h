@@ -143,7 +143,7 @@ inline bool sway_ensure_mask(Sway& s, void* (*alloc)(size_t)) {
 }
 inline void sway_copy_def(Sway& d, const Sway& s, void* (*alloc)(size_t)) {
     sway_free(d);
-    d = Sway();
+    new (&d) Sway();                                    // (in place: a Sway is ~8 KB - never a temporary on the stack)
     d.kind = s.kind; memcpy(d.prm, s.prm, sizeof(d.prm));
     d.narm = s.narm; memcpy(d.armx, s.armx, sizeof(d.armx)); memcpy(d.army, s.army, sizeof(d.army)); d.arm_back = s.arm_back;
     d.ng = s.ng; memcpy(d.gn, s.gn, sizeof(d.gn)); memcpy(d.gx, s.gx, sizeof(d.gx)); memcpy(d.gy, s.gy, sizeof(d.gy));
@@ -1335,7 +1335,7 @@ inline bool parse_sway_line(char* line, Sway* ss, int& ns, int& cur, uint8_t*& b
         cur = -1;
         if (ns >= SWAY_MAX) return true;
         Sway& s = ss[ns];
-        sway_free(s); s = Sway();
+        sway_free(s); new (&s) Sway();
         char k[16];
         if (sscanf(rest, "%15s%n", k, &n) == 1) {
             for (int q = 0; q < SK_COUNT; ++q) if (strcmp(k, sway_kind_info((uint8_t)q).key) == 0) s.kind = (uint8_t)q;
@@ -1366,7 +1366,7 @@ inline bool parse_sway_line(char* line, Sway* ss, int& ns, int& cur, uint8_t*& b
         if (sscanf(rest, "%9s %d,%d %d,%d%n", kn, &ax, &ay, &bx, &by, &n) != 5) return true;
         rest += n;
         Sway& s = ss[ns];
-        sway_free(s); s = Sway();
+        sway_free(s); new (&s) Sway();
         s.kind = strcmp(kn, "cloth") == 0 ? SK_CLOTH : (strcmp(kn, "charm") == 0 ? SK_PENDANT : SK_HAIR);
         s.lax = (int16_t)ax; s.lay = (int16_t)ay; s.lbx = (int16_t)bx; s.lby = (int16_t)by;
         char tok[40];

@@ -29,9 +29,6 @@
 #include "jiggle_sway.h"
 #include <new>
 #include <SD.h>
-#if defined(ESP_PLATFORM) && !defined(MG_LCD_40MHZ)
-#include <driver/gpio.h>                       // (the LCD pins' drive strength)
-#endif
 #if defined(ESP_PLATFORM)
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -110,8 +107,7 @@ uint16_t* g_strip[2] = {nullptr, nullptr};
 bool g_dma = false;
 int32_t g_acc[2 * IMG_W];
 int32_t g_acc1[2 * IMG_W];               // the second core's row accumulator
-constexpr uint32_t LCD_WRITE_HZ = 40000000;   // display SPI write clock (raised to this if lower) …
-constexpr uint32_t LCD_FAST_HZ = 80000000;    // … or this, if this unit's panel passes the check at boot
+constexpr uint32_t LCD_WRITE_HZ = 40000000;   // display SPI write clock (raised to this if lower)
 
 Zone g_z[MAX_ZONES];
 bool g_shown[MAX_ZONES];                 // screen currently shows this zone displaced
@@ -701,11 +697,11 @@ void row_worker(void*) {
         xSemaphoreGive(g_done);
     }
 }
-void par_start() {
+void par_start() {                                   // (its stack: the depth render takes ~2.6 KB of it - room to spare)
     if (g_go) return;
     g_go = xSemaphoreCreateBinary();
     g_done = xSemaphoreCreateBinary();
-    if (!g_go || !g_done || xTaskCreatePinnedToCore(row_worker, "jig-rows", 4096, nullptr, 3, nullptr, 0) != pdPASS) {
+    if (!g_go || !g_done || xTaskCreatePinnedToCore(row_worker, "jig-rows", 6144, nullptr, 3, nullptr, 0) != pdPASS) {
         g_go = nullptr;                                 // run everything on this core
         Serial.printf("jig: second core unavailable, rendering on one\n");
     }
@@ -1628,7 +1624,7 @@ bool e_new_sway() {
     if (e_ns >= SWAY_MAX) return false;
     Sway& h = e_s[e_ns];
     sway_free(h);
-    h = Sway();
+    new (&h) Sway();                                    // (in place: never an ~8 KB temporary on the stack)
     if (!sway_ensure_mask(h, water_alloc)) return false;
     e_si = e_ns++;
     return true;
@@ -1921,7 +1917,7 @@ void e_tint_sways(M5Canvas& c) {
     if (!h) return;
     if (!e_sdflt) return;
     Sway& d = *e_sdflt;                                 // (none drawn yet: the ones it will get, dimmed)
-    d = Sway();
+    new (&d) Sway();
     const Sway* g = h;
     bool dflt = false;
     if (h->ng == 0 && h->mask && sway_count(*h) >= 12) {
@@ -2481,7 +2477,7 @@ void e_bar_tap(int x, int y, uint32_t held) {
         case 4:                                   // delete this one
             if (h) {
                 sway_free(*h);
-                for (int k = e_si; k < e_ns - 1; ++k) { e_s[k] = e_s[k + 1]; e_s[k + 1] = Sway(); }
+                for (int k = e_si; k < e_ns - 1; ++k) { e_s[k] = e_s[k + 1]; new (&e_s[k + 1]) Sway(); }
                 --e_ns;
                 if (e_ns == 0) e_new_sway(); else if (e_si >= e_ns) e_si = e_ns - 1;
                 toast("Deleted");
@@ -2696,61 +2692,6 @@ void e_scale_button(Btn& b, uint32_t& next, int dir, uint32_t now) {
 // ================================================================================================
 // Public API
 // ================================================================================================
-#if defined(ESP_PLATFORM) && !defined(MG_LCD_40MHZ)   // (-DMG_LCD_40MHZ: never try 80)
-bool g_lcd_fast = false;                         // running the LCD at 80 MHz (checked at boot, then every 20 s)
-uint32_t g_lcd_check_ms = 0;
-// Write a test strip at the current (fast) clock and read it back at the slow read clock: true if it all
-// came back. Its old pixels are put back afterwards. Compared on each colour's upper bits: a panel's
-// readback may round the lowest one, a link that can't keep up garbles far more than that.
-// (Patterns: every bit flipping each pixel - the hardest for the wire - and a scrambled one.)
-bool lcd_check(int W, int H, int passes) {
-    const int N = W * H;
-    uint16_t* keep = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    uint16_t* pat = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    uint16_t* back = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    bool ok = keep && pat && back;
-    if (ok) M5.Display.readRect(0, 0, W, H, (lgfx::swap565_t*)keep);
-    const uint16_t MASK = 0xDEF7;                  // (0xF7DE - R, G, B upper bits - as it sits byte-swapped)
-    uint32_t r = 0x9E3779B9u ^ millis();
-    for (int pass = 0; ok && pass < passes; ++pass) {
-        for (int i = 0; i < N; ++i) {
-            const int q = pass % 3;
-            if (q == 0) pat[i] = (uint16_t)(((i + (i / W) + pass) & 1) ? 0xAAAA : 0x5555);
-            else if (q == 1) pat[i] = (uint16_t)(((i + pass) & 1) ? 0xFFFF : 0x0000);
-            else { r ^= r << 13; r ^= r >> 17; r ^= r << 5; pat[i] = (uint16_t)r; }
-        }
-        M5.Display.pushImage(0, 0, W, H, (const lgfx::swap565_t*)pat);
-        memset(back, 0, N * 2);
-        M5.Display.readRect(0, 0, W, H, (lgfx::swap565_t*)back);
-        for (int i = 0; i < N && ok; ++i) ok = (back[i] & MASK) == (pat[i] & MASK);
-    }
-    if (keep) M5.Display.pushImage(0, 0, W, H, (const lgfx::swap565_t*)keep);
-    if (keep) free(keep);
-    if (pat) free(pat);
-    if (back) free(back);
-    return ok;
-}
-void lcd_clock(uint32_t hz) {
-    auto* bus = static_cast<lgfx::Bus_SPI*>(M5.Display.getPanel()->getBus());
-    if (!bus) return;
-    auto cfg = bus->config();
-    cfg.freq_write = hz; bus->config(cfg); bus->init();
-    gpio_set_drive_capability(GPIO_NUM_18, hz > 40000000 ? GPIO_DRIVE_CAP_3 : GPIO_DRIVE_CAP_2);   // (sharper edges)
-    gpio_set_drive_capability(GPIO_NUM_23, hz > 40000000 ? GPIO_DRIVE_CAP_3 : GPIO_DRIVE_CAP_2);
-}
-// Between frames: does 80 MHz still hold? If not, 40 MHz from then on.
-void lcd_recheck(uint32_t now) {
-    if (!g_lcd_fast || now - g_lcd_check_ms < 20000) return;
-    g_lcd_check_ms = now;
-    if (!lcd_check(32, 2, 3)) {
-        lcd_clock(LCD_WRITE_HZ);
-        g_lcd_fast = false;
-        Serial.printf("jig: LCD 80 MHz check failed while running: 40 MHz\n");
-    }
-}
-#else
-void lcd_recheck(uint32_t) {}
-#endif
 
 bool begin() {
     if (!g_sway) {                                     // (hair / cloth / pendants: ~7 KB each - PSRAM, not DRAM)
@@ -2799,29 +2740,17 @@ bool begin() {
     par_tab();                                        // parallax filter weights (likewise)
     par_start();
 #if defined(ESP_PLATFORM)
-    {   // display write clock: 80 MHz if this unit's panel takes it (checked), else 40 (M5GFX's Core2 default).
-        // Clock and data (GPIO 18, 23) are the SPI port's own direct pins, so the ESP32 can drive them at
-        // 80 MHz; whether a given panel and its flex cable keep up varies, so it's tested, not assumed:
-        // worst-case bit patterns written fast, read back slowly, compared. One wrong pixel: 40 MHz.
+    {   // display write clock: make sure it's at LCD_WRITE_HZ (M5GFX normally sets 40 MHz on the Core2)
         auto* bus = static_cast<lgfx::Bus_SPI*>(M5.Display.getPanel()->getBus());
         if (bus && M5.getBoard() == m5::board_t::board_M5StackCore2) {
             auto cfg = bus->config();
             const uint32_t was = cfg.freq_write;
-#if !defined(MG_LCD_40MHZ)
-            lcd_clock(LCD_FAST_HZ);
-            g_lcd_fast = lcd_check(160, 8, 6);
-            if (!g_lcd_fast) lcd_clock(was > LCD_WRITE_HZ ? was : LCD_WRITE_HZ);
-            g_lcd_check_ms = millis();
-            Serial.printf("jig: LCD SPI write %u Hz (was %u; 80 MHz check %s)\n", g_lcd_fast ? (unsigned)LCD_FAST_HZ : (unsigned)(was > LCD_WRITE_HZ ? was : LCD_WRITE_HZ),
-                          (unsigned)was, g_lcd_fast ? "passed" : "failed");
-#else
-            if (was < LCD_WRITE_HZ) {                  // (as it always was: at least 40 MHz)
+            if (was < LCD_WRITE_HZ) {
                 cfg.freq_write = LCD_WRITE_HZ;
                 bus->config(cfg);
                 bus->init();
             }
             Serial.printf("jig: LCD SPI write %u Hz (was %u)\n", (unsigned)cfg.freq_write, (unsigned)was);
-#endif
         }
     }
 #endif
@@ -2928,7 +2857,6 @@ void play_tick(uint32_t now, bool may_draw) {
     uint32_t us = micros();
     g_tick_us0 = us;
     g_tick_did = false;
-    if (may_draw && !g_pj.on && g_ps == 0 && !g_ff && g_wj.phase == 0 && !g_sj.on && !g_sw_send) lcd_recheck(now);   // (80 MHz still holding? between frames)
     float dt = (us - g_last_us) * 1e-6f;
     g_last_us = us;
     if (!g_ok) return;
