@@ -808,7 +808,7 @@ JIG_INLINE uint16_t water_pixel(const Water& w, const WFrame& F, const WRow& R, 
     return c;
 }
 // fr: the frame to draw (a snapshot taken earlier: the depth view draws one water moment a frame); else now.
-inline JIG_HOT void water_render(const Water& w, const uint16_t* src, bool src_swapped, uint16_t* out, bool out_swapped,
+JIG_HOT void water_render(const Water& w, const uint16_t* src, bool src_swapped, uint16_t* out, bool out_swapped,
                          int x0, int y0, int x1, int y1, int lane = 0, const WFrame* fr = nullptr) {
     if (!w.edge) return;
     static WRow sR[2];

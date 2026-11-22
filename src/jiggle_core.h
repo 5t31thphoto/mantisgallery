@@ -31,12 +31,16 @@
 // (a call per pixel costs more than the helper), and the per-pixel render loops (JIG_HOT) run from
 // internal RAM - instruction fetches then never go through the flash cache, which the PSRAM pictures
 // they stream through also share.
+// JIG_HOT functions are static, never inline: an inline (COMDAT) function's literal pool gets a section of
+// its own name, which the linker puts in flash - above the IRAM code that loads from it, which the Xtensa
+// l32r can't reach ("dangerous relocation: l32r: literal placed after use"). A static one's literals go
+// with its .iram1.* section, like any ISR's. (These headers are only included by jiggle.cpp.)
 #define JIG_INLINE inline __attribute__((always_inline))
 #if defined(ESP_PLATFORM) && !defined(MG_NO_IRAM_HOT)   // (~15 KB of IRAM; -DMG_NO_IRAM_HOT to keep them in flash)
 #include <esp_attr.h>
-#define JIG_HOT __attribute__((noinline)) IRAM_ATTR
+#define JIG_HOT static __attribute__((noinline)) IRAM_ATTR
 #else
-#define JIG_HOT __attribute__((noinline))
+#define JIG_HOT static __attribute__((noinline))
 #endif
 
 namespace jig {
@@ -901,7 +905,7 @@ inline float fold_scale(Zone& z) {
 // Fast renderer: the rectangle [x0,x1)×[y0,y1) into `out` (stride x1−x0), display byte order.
 // Integer maths, one pass per zone over its row span, each pixel sampled once however many zones
 // overlap. `acc` must hold 2·IMG_W int32 of scratch.
-inline JIG_HOT void render_rect(const uint16_t* src, bool src_swapped, uint16_t* out,
+JIG_HOT void render_rect(const uint16_t* src, bool src_swapped, uint16_t* out,
                         const Zone* zs, const int* ids, int n,
                         int x0, int y0, int x1, int y1, int32_t* acc) {
     int32_t* accx = acc;

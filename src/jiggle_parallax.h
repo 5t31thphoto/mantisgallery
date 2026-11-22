@@ -559,7 +559,7 @@ JIG_INLINE int par_soft_e(int v, int fd) { return v ? 256 - (((256 - (v == 255 ?
 
 // Render screen rows [y0, y1) × columns [x0, x1) into out (display byte order, width x1 − x0).
 // (Every layer reads only its fill: the live content is copied in by parallax_sync_content.)
-inline JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, int x1, int y1, int lane = 0) {
+JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, int x1, int y1, int lane = 0) {
     const auto& W = par_w();
     const int ow = x1 - x0;
     const float f = F.P->prm[PP_FOCUS];

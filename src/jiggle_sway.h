@@ -1222,7 +1222,7 @@ inline void sway_dirty_d(Sway& s, const SwDraw& D) {
 // At rest it draws the photo exactly. (Each triangle row by row over just its span.)
 JIG_INLINE void sw_put(uint16_t* out, bool osw, int X, int Y, uint16_t v) { out[Y * IMG_W + X] = osw ? (uint16_t)((v >> 8) | (v << 8)) : v; }
 JIG_INLINE float sw_al(const uint8_t* AL, int i, float keep, float fade) { return AL[i] ? keep + AL[i] * (1.0f / 255.0f) * fade : 0.0f; }
-inline JIG_HOT void sway_draw_rows(const Sway& s, const SwDraw& D, uint16_t* out, bool osw, int ya, int yb) {
+JIG_HOT void sway_draw_rows(const Sway& s, const SwDraw& D, uint16_t* out, bool osw, int ya, int yb) {
     if (!s.ready) return;
     for (int y = std::max(ya, s.ry0); y < std::min(yb, s.ry0 + s.rh); ++y)
         for (int x = 0; x < s.rw; ++x) { const int i = (y - s.ry0) * s.rw + x; if (s.hole[i]) sw_put(out, osw, s.rx0 + x, y, s.plate[i]); }
