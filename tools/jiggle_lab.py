@@ -811,7 +811,8 @@ def sway_protos(img, sways, body=None):
             if j != i:
                 others |= o.mask
         key = (sw.kind, sw.mask.tobytes(), repr(sw.guides), repr(sorted(sw.prm.items())), others.tobytes(),
-               None if rb is None else rb.tobytes(), img.tobytes() if img is not None else b"")
+               None if rb is None else rb.tobytes(), img.tobytes() if img is not None else b"",
+               repr(sw.arm) + ("back" if sw.back else ""), None if sw.under is None else np.asarray(sw.under).tobytes())
         hk = hashlib.sha1(b"".join(k if isinstance(k, bytes) else k.encode() for k in key if k is not None)).hexdigest()
         proto = _SWAY_CACHE.get(hk)
         if proto is None:
@@ -887,7 +888,10 @@ class Sim:
         for hs in self.hs:                      # hanging things: the same
             hs.step(dt, dn_live, dyn)
         sdk = 1.0 - ECHO_DAMP_CUT * self.echo.strength()
+        push = [(z.z.cx + z.dx, z.z.cy + z.dy, z.z.r, z.vx, z.vy) for z in self.zs if z.ok]
         for ss in self.ss:                      # swaying things: real "down" (screen axes), jolts, the echo
+            if getattr(ss, "ok", False) and ss.s.kind == "cloth":
+                ss.pushers = push               # (forms jiggling under a skirt carry it along)
             ss.step(dt, tuple(dn_live), tuple(dyn), sdk)
         for z in self.zs:                       # swayed and stopped: keeps swaying, dying out slowly
             z.damp_k = 1.0 - ECHO_DAMP_CUT * self.echo.strength()

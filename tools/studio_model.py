@@ -708,6 +708,38 @@ class Studio:
             self.push_undo()
             L.obj.arm = []
 
+    def set_back(self, back):
+        """The skirt's figure is seen from behind (the bikini bottom then covers her seat)."""
+        L = self.layer()
+        if L.kind == "sway" and L.obj.kind == "cloth" and L.obj.back != bool(back):
+            self.push_undo()
+            L.obj.back = bool(back)
+
+    def load_under(self, src):
+        """What's really under the active sway - your own layer of the same picture (e.g. her in just the
+        bikini, same pose): its fill is cut from this instead of made up. Used here to make the fill only:
+        never saved (the .jig carries the fill it makes). src: a path or an RGB image."""
+        L = self.layer()
+        if L.kind != "sway":
+            return False
+        if isinstance(src, (str, Path)):
+            import mg_convert
+            im = mg_convert.prepare_image(Path(src), "cover")          # (laid out exactly as the photo was)
+            img = np.asarray(im.convert("RGB"), np.uint8)
+        else:
+            img = np.asarray(src, np.uint8)
+        if img.shape[:2] != (H, W):
+            return False
+        self.push_undo()
+        L.obj.under = img.copy()
+        return True
+
+    def clear_under(self):
+        L = self.layer()
+        if L.kind == "sway" and L.obj.under is not None:
+            self.push_undo()
+            L.obj.under = None
+
     def undo_guide(self):
         """The last lock / fold / pin off."""
         L = self.layer()

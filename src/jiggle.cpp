@@ -29,6 +29,9 @@
 #include "jiggle_sway.h"
 #include <new>
 #include <SD.h>
+#if defined(ESP_PLATFORM) && !defined(MG_LCD_40MHZ)
+#include <driver/gpio.h>                       // (the LCD pins' drive strength)
+#endif
 #if defined(ESP_PLATFORM)
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -109,7 +112,8 @@ uint16_t* g_strip[2] = {nullptr, nullptr};
 bool g_dma = false;
 int32_t g_acc[2 * IMG_W];
 int32_t g_acc1[2 * IMG_W];               // the second core's row accumulator
-constexpr uint32_t LCD_WRITE_HZ = 40000000;   // display SPI write clock (raised to this if lower)
+constexpr uint32_t LCD_WRITE_HZ = 40000000;   // display SPI write clock (raised to this if lower) …
+constexpr uint32_t LCD_FAST_HZ = 80000000;    // … or this, if this unit's panel passes the check at boot
 
 Zone g_z[MAX_ZONES];
 bool g_shown[MAX_ZONES];                 // screen currently shows this zone displaced
@@ -163,6 +167,8 @@ uint32_t g_last_draw = 0;
 constexpr uint32_t SLICE_US = 12000;
 uint32_t g_tick_us0 = 0;
 bool over_budget() { return micros() - g_tick_us0 > SLICE_US; }
+// (Every sliced job below does at least one slice per tick before it looks at the budget: if one tick's
+// physics ever takes the whole budget, drawing slows down - it never stops.)
 
 // perf
 uint32_t g_pf_t0 = 0, g_pf_frames = 0, g_pf_us = 0, g_pf_px = 0;
@@ -203,6 +209,17 @@ int material_from_name(const char* s) {
 float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 void* water_alloc(size_t n) { return alloc_psram(n); }
+// Small, very hot scratch: internal RAM when there's comfortably room (the same margin the photo copy
+// keeps), else PSRAM. Freed with free() either way.
+void* alloc_fast(size_t n) {
+#if defined(ESP_PLATFORM)
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) > n + 48 * 1024) {
+        void* p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (p) return p;
+    }
+#endif
+    return alloc_psram(n);
+}
 
 void layer_sync();
 void clear_waters() {
@@ -762,16 +779,18 @@ void sway_push(const int* which, int nd);
 // Advance it until done (true) or this tick's time is up (false).
 bool water_job() {
     const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
+    bool did = false;
     while (g_wj.phase == 1) {
         if (g_wj.wi >= g_nw) { g_wj.phase = 2; break; }
         const Water& w = g_wat[g_wj.wi];
         if (g_wj.y < 0) g_wj.y = w.by;
         if (!w.edge || g_wj.y >= w.by + w.bh) { ++g_wj.wi; g_wj.y = -1; continue; }
-        if (over_budget()) return false;
+        if (did && over_budget()) return false;
         const int ye = g_wj.y + STRIP_ROWS < w.by + w.bh ? g_wj.y + STRIP_ROWS : w.by + w.bh;
         WaterJob job{&w, photo, g_swapped};
         par_rows(water_rows, &job, g_wj.y, ye);       // both cores
         g_wj.y = ye;
+        did = true;
     }
     if (g_wj.phase == 2 && g_wj.par) { g_wj.phase = 0; return true; }   // (depth: the rest is its content step)
     if (g_wj.phase == 2) {
@@ -787,7 +806,8 @@ bool water_job() {
         const Water& w = g_wat[g_wj.wi];
         if (g_wj.y < 0) g_wj.y = w.by;
         if (!w.edge || g_wj.y >= w.by + w.bh) { ++g_wj.wi; g_wj.y = -1; continue; }
-        if (over_budget()) break;
+        if (did && over_budget()) break;
+        did = true;
         const int y = g_wj.y, ye = y + STRIP_ROWS < w.by + w.bh ? y + STRIP_ROWS : w.by + w.bh;
         g_wj.y = ye;
         int xa, xb;
@@ -858,10 +878,13 @@ void sway_redraw_start(bool water_moved) {
                 else for (int x = 0; x < n; ++x) d[x] = bswap16(sr[x]);
                 continue;
             }
-            for (int x = 0; x < n; ++x) {
+            const uint8_t* wm[WATER_MAX]; int nm = 0;     // (the water masks that are drawn: bit reads, no bounds tests)
+            for (int w = 0; w < g_nw; ++w) if (g_wat[w].edge && g_wat[w].mask) wm[nm++] = g_wat[w].mask;
+            const bool same = g_layer_sw == g_swapped;
+            for (int x = 0, i = y * IMG_W + h.ux0; x < n; ++x, ++i) {
                 bool wet = false;
-                for (int w = 0; w < g_nw && !wet; ++w) wet = g_wat[w].edge && mask_get(g_wat[w].mask, h.ux0 + x, y);
-                if (!wet) d[x] = g_layer_sw == g_swapped ? sr[x] : bswap16(sr[x]);
+                for (int w = 0; w < nm && !wet; ++w) wet = (wm[w][i >> 3] >> (i & 7)) & 1;
+                if (!wet) d[x] = same ? sr[x] : bswap16(sr[x]);
             }
         }
     }
@@ -877,15 +900,17 @@ void sway_redraw_start(bool water_moved) {
 }
 // Draw on (both cores, 24 rows at a time); budget: stop when this tick's time is up. True when done.
 bool sway_redraw_run(bool budget) {
+    bool did = false;
     while (g_sj.on && g_sj.k < g_sj.tn) {
         const int i = g_sj.touch[g_sj.k];
         const Sway& s = g_sway[i];
         if (g_sj.y < 0) g_sj.y = s.y0;
         if (g_sj.y >= s.y1) { ++g_sj.k; g_sj.y = -1; continue; }
-        if (budget && over_budget()) return false;
+        if (budget && did && over_budget()) return false;
         const int ye = g_sj.y + 24 < s.y1 ? g_sj.y + 24 : s.y1;
         SwayJob job{&s, g_sdraw[i]};
         par_rows(sway_rows, &job, g_sj.y, ye);
+        did = true;
         g_sj.y = ye;
     }
     if (g_sj.on)
@@ -949,7 +974,7 @@ void anim_sync() {                                     // g_anim ← the layer (
 }
 void prepare_parallax() {
     g_pj.on = false; g_wj.phase = 0;
-    parallax_prepare(g_par, (const uint16_t*)g_img.getBuffer(), g_swapped, water_alloc);
+    parallax_prepare(g_par, (const uint16_t*)g_img.getBuffer(), g_swapped, water_alloc, alloc_fast);
     if (g_par.ready && g_n > 0) {
         if (!g_anim) g_anim = (uint16_t*)alloc_psram((size_t)IMG_W * IMG_H * 2);
     } else if (g_anim) { free(g_anim); g_anim = nullptr; }
@@ -1008,6 +1033,23 @@ void par_tick(uint32_t now, float dt, bool may_draw, bool zones_any) {
     par_content_step(now, moved, zones_any, water_done);
 }
 
+// Each water's wet stretch per row (x0, x1; x0 >= x1: none) - what changes when it's redrawn.
+static int16_t* s_wrow[WATER_MAX] = {nullptr};
+const int16_t* water_rows(int i) {
+    const Water& w = g_wat[i];
+    if (!w.sp || !w.sp_off) return nullptr;
+    if (!s_wrow[i]) s_wrow[i] = (int16_t*)alloc_psram((size_t)IMG_H * 4);
+    int16_t* r = s_wrow[i];
+    if (!r) return nullptr;
+    for (int y = 0; y < IMG_H; ++y) { r[2 * y] = IMG_W; r[2 * y + 1] = 0; }
+    for (int y = w.by; y < w.by + w.bh; ++y)
+        for (int k = w.sp_off[y - w.by]; k < w.sp_off[y - w.by + 1]; ++k) {
+            if (w.sp[2 * k] < r[2 * y]) r[2 * y] = w.sp[2 * k];
+            if (w.sp[2 * k + 1] > r[2 * y + 1]) r[2 * y + 1] = w.sp[2 * k + 1];
+        }
+    return r;
+}
+
 // The rest of starting a depth frame, once the water and hair / cloth are drawn into the layer.
 void par_content_step(uint32_t now, bool moved, bool zones_any, bool water_done) {
     DirtyRects content;
@@ -1047,11 +1089,14 @@ void par_content_step(uint32_t now, bool moved, bool zones_any, bool water_done)
                     g_shown[z] = true, zones_any = true;
         }
     }
-    if (zones_any && g_anim) draw_frame(&content);
+    DirtyRects zc;                                     // (zones drawn: kept apart, for the exact redraw below)
+    if (zones_any && g_anim) draw_frame(&zc);
+    for (int i = 0; i < zc.n; ++i) content.add(zc.r[i][0], zc.r[i][1], zc.r[i][2], zc.r[i][3]);
+    bool full_sync = false;
     {                                                  // the changed content into the planes' fills
         bool csw;
         const uint16_t* c = par_content(csw);
-        if (g_par_full_sync) { parallax_sync_content(g_par, c, csw, 0, 0, IMG_W, IMG_H); g_par_full_sync = false; }
+        if (g_par_full_sync) { parallax_sync_content(g_par, c, csw, 0, 0, IMG_W, IMG_H); g_par_full_sync = false; full_sync = true; }
         else for (int i = 0; i < content.n; ++i)
             parallax_sync_content(g_par, c, csw, content.r[i][0], content.r[i][1], content.r[i][2], content.r[i][3]);
     }
@@ -1066,12 +1111,44 @@ void par_content_step(uint32_t now, bool moved, bool zones_any, bool water_done)
         if (g_par.prm[PP_FOCUS] > 0.0f || par_ground(g_par) || !g_par.drawn) dr.add(0, 0, IMG_W, IMG_H);   // (the ground: all of it)
         else for (int k = 0; k < g_par.n; ++k) { int r[4]; parallax_plane_rect(g_par, k, r); dr.add(r[0], r[1], r[2], r[3]); }
     }
-    const int m = g_par.margin;
-    for (int i = 0; i < content.n; ++i) dr.add(content.r[i][0] - m, content.r[i][1] - m, content.r[i][2] + m, content.r[i][3] + m);
+    // A changed content pixel shows on screen up to 2 margins away (its slide, plus the zoom's offset toward
+    // the edges) - plus the filter's reach, inside the margin's slack.
+    // (Whole rows: the render then redraws only the pixels it must and copies the rest from the screen.)
+    const int m = 2 * g_par.margin;
+    for (int i = 0; i < content.n; ++i) dr.add(0, content.r[i][1] - m, IMG_W, content.r[i][3] + m);
+    if (moved) {
+        DirtyRects wide;
+        for (int i = 0; i < dr.n; ++i) wide.add(0, dr.r[i][1], IMG_W, dr.r[i][3]);
+        dr = wide;
+    }
     bool sw;
     const uint16_t* anim = par_content(sw);
+    // Not moved (yet): the content is drawn at the view the screen shows, not one it hasn't caught up to -
+    // or the redrawn bits would sit a fraction of a pixel off the rest, and the screen would never catch up.
+    float vnow[2] = {g_par.v[0], g_par.v[1]};
+    if (!moved && g_par.drawn) { g_par.v[0] = g_par.dv[0]; g_par.v[1] = g_par.dv[1]; }
     parallax_frame(g_pj.F, g_par, anim, sw, g_nw > 0 || g_n > 0);
-    g_pj.v0[0] = g_par.v[0]; g_pj.v0[1] = g_par.v[1];
+    const float vshow[2] = {g_par.v[0], g_par.v[1]};
+    g_par.v[0] = vnow[0]; g_par.v[1] = vnow[1];
+    // pixels drawn exactly as the screen shows them are copied, not redrawn: not across what changed
+    g_pj.F.front = g_par.drawn ? g_front : nullptr;
+    ParFrame& F = g_pj.F;                              // what changed, exactly: the render works out which pixels
+    F.force_all = full_sync; F.nforce = 0; F.nfw = 0; //  each layer's filter would see it through
+    auto frect = [&F](int x0, int y0, int x1, int y1) {
+        if (F.nforce >= 24) { F.force_all = true; return; }
+        int16_t* r = F.force[F.nforce++];
+        r[0] = (int16_t)x0; r[1] = (int16_t)y0; r[2] = (int16_t)x1; r[3] = (int16_t)y1;
+    };
+    if (water_done)
+        for (int i = 0; i < g_nw; ++i) {
+            if (!g_wat[i].edge) continue;
+            const int16_t* wr = water_rows(i);
+            if (wr) F.fwrow[F.nfw++] = wr;
+            else frect(g_wat[i].bx, g_wat[i].by, g_wat[i].bx + g_wat[i].bw, g_wat[i].by + g_wat[i].bh);
+        }
+    for (int k = 0; k < g_sj.nd; ++k) { const Sway& h = g_sway[g_sj.which[k]]; frect(h.ux0, h.uy0, h.ux1, h.uy1); }
+    for (int i = 0; i < zc.n; ++i) frect(zc.r[i][0], zc.r[i][1], zc.r[i][2], zc.r[i][3]);
+    g_pj.v0[0] = vshow[0]; g_pj.v0[1] = vshow[1];
     g_pj.ri = 0; g_pj.y = dr.n ? dr.r[0][1] : 0; g_pj.px = 0; g_pj.us = 0;
     g_pj.on = true;
     par_push(now);
@@ -1082,7 +1159,7 @@ void par_push(uint32_t now) {
     DirtyRects& dr = g_pj.dr;
     uint32_t t0 = micros();
     int cur = 0;
-    bool inflight = false;
+    bool inflight = false, did = false;
     M5.Display.startWrite();
     while (g_pj.ri < dr.n) {
         const int x0 = dr.r[g_pj.ri][0], x1 = dr.r[g_pj.ri][2];
@@ -1090,7 +1167,8 @@ void par_push(uint32_t now) {
             if (++g_pj.ri < dr.n) g_pj.y = dr.r[g_pj.ri][1];
             continue;
         }
-        if (over_budget()) break;
+        if (did && over_budget()) break;
+        did = true;
         const int y = g_pj.y, ye = y + STRIP_ROWS < dr.r[g_pj.ri][3] ? y + STRIP_ROWS : dr.r[g_pj.ri][3];
         g_pj.y = ye;
         ParJob job{&g_pj.F, g_strip[cur], x0, x1, y};
@@ -2352,6 +2430,62 @@ void e_scale_button(Btn& b, uint32_t& next, int dir, uint32_t now) {
 // ================================================================================================
 // Public API
 // ================================================================================================
+#if defined(ESP_PLATFORM) && !defined(MG_LCD_40MHZ)   // (-DMG_LCD_40MHZ: never try 80)
+bool g_lcd_fast = false;                         // running the LCD at 80 MHz (checked at boot, then every 20 s)
+uint32_t g_lcd_check_ms = 0;
+// Write a test strip at the current (fast) clock and read it back at the slow read clock: true if it all
+// came back. Its old pixels are put back afterwards. Compared on each colour's upper bits: a panel's
+// readback may round the lowest one, a link that can't keep up garbles far more than that.
+// (Patterns: every bit flipping each pixel - the hardest for the wire - and a scrambled one.)
+bool lcd_check(int W, int H, int passes) {
+    const int N = W * H;
+    uint16_t* keep = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint16_t* pat = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint16_t* back = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    bool ok = keep && pat && back;
+    if (ok) M5.Display.readRect(0, 0, W, H, (lgfx::swap565_t*)keep);
+    const uint16_t MASK = 0xDEF7;                  // (0xF7DE - R, G, B upper bits - as it sits byte-swapped)
+    uint32_t r = 0x9E3779B9u ^ millis();
+    for (int pass = 0; ok && pass < passes; ++pass) {
+        for (int i = 0; i < N; ++i) {
+            const int q = pass % 3;
+            if (q == 0) pat[i] = (uint16_t)(((i + (i / W) + pass) & 1) ? 0xAAAA : 0x5555);
+            else if (q == 1) pat[i] = (uint16_t)(((i + pass) & 1) ? 0xFFFF : 0x0000);
+            else { r ^= r << 13; r ^= r >> 17; r ^= r << 5; pat[i] = (uint16_t)r; }
+        }
+        M5.Display.pushImage(0, 0, W, H, (const lgfx::swap565_t*)pat);
+        memset(back, 0, N * 2);
+        M5.Display.readRect(0, 0, W, H, (lgfx::swap565_t*)back);
+        for (int i = 0; i < N && ok; ++i) ok = (back[i] & MASK) == (pat[i] & MASK);
+    }
+    if (keep) M5.Display.pushImage(0, 0, W, H, (const lgfx::swap565_t*)keep);
+    if (keep) free(keep);
+    if (pat) free(pat);
+    if (back) free(back);
+    return ok;
+}
+void lcd_clock(uint32_t hz) {
+    auto* bus = static_cast<lgfx::Bus_SPI*>(M5.Display.getPanel()->getBus());
+    if (!bus) return;
+    auto cfg = bus->config();
+    cfg.freq_write = hz; bus->config(cfg); bus->init();
+    gpio_set_drive_capability(GPIO_NUM_18, hz > 40000000 ? GPIO_DRIVE_CAP_3 : GPIO_DRIVE_CAP_2);   // (sharper edges)
+    gpio_set_drive_capability(GPIO_NUM_23, hz > 40000000 ? GPIO_DRIVE_CAP_3 : GPIO_DRIVE_CAP_2);
+}
+// Between frames: does 80 MHz still hold? If not, 40 MHz from then on.
+void lcd_recheck(uint32_t now) {
+    if (!g_lcd_fast || now - g_lcd_check_ms < 20000) return;
+    g_lcd_check_ms = now;
+    if (!lcd_check(32, 2, 3)) {
+        lcd_clock(LCD_WRITE_HZ);
+        g_lcd_fast = false;
+        Serial.printf("jig: LCD 80 MHz check failed while running: 40 MHz\n");
+    }
+}
+#else
+void lcd_recheck(uint32_t) {}
+#endif
+
 bool begin() {
     if (!g_sway) {                                     // (hair / cloth / pendants: ~7 KB each - PSRAM, not DRAM)
         g_sway = (Sway*)alloc_psram(sizeof(Sway) * SWAY_MAX);
@@ -2399,17 +2533,29 @@ bool begin() {
     par_tab();                                        // parallax filter weights (likewise)
     par_start();
 #if defined(ESP_PLATFORM)
-    {   // display write clock: make sure it's at LCD_WRITE_HZ (M5GFX normally sets 40 MHz on the Core2)
+    {   // display write clock: 80 MHz if this unit's panel takes it (checked), else 40 (M5GFX's Core2 default).
+        // Clock and data (GPIO 18, 23) are the SPI port's own direct pins, so the ESP32 can drive them at
+        // 80 MHz; whether a given panel and its flex cable keep up varies, so it's tested, not assumed:
+        // worst-case bit patterns written fast, read back slowly, compared. One wrong pixel: 40 MHz.
         auto* bus = static_cast<lgfx::Bus_SPI*>(M5.Display.getPanel()->getBus());
         if (bus && M5.getBoard() == m5::board_t::board_M5StackCore2) {
             auto cfg = bus->config();
             const uint32_t was = cfg.freq_write;
-            if (was < LCD_WRITE_HZ) {
+#if !defined(MG_LCD_40MHZ)
+            lcd_clock(LCD_FAST_HZ);
+            g_lcd_fast = lcd_check(160, 8, 6);
+            if (!g_lcd_fast) lcd_clock(was > LCD_WRITE_HZ ? was : LCD_WRITE_HZ);
+            g_lcd_check_ms = millis();
+            Serial.printf("jig: LCD SPI write %u Hz (was %u; 80 MHz check %s)\n", g_lcd_fast ? (unsigned)LCD_FAST_HZ : (unsigned)(was > LCD_WRITE_HZ ? was : LCD_WRITE_HZ),
+                          (unsigned)was, g_lcd_fast ? "passed" : "failed");
+#else
+            if (was < LCD_WRITE_HZ) {                  // (as it always was: at least 40 MHz)
                 cfg.freq_write = LCD_WRITE_HZ;
                 bus->config(cfg);
                 bus->init();
             }
             Serial.printf("jig: LCD SPI write %u Hz (was %u)\n", (unsigned)cfg.freq_write, (unsigned)was);
+#endif
         }
     }
 #endif
@@ -2438,6 +2584,7 @@ void present() {
         if (g_swapped) memcpy(g_front, s, n * 2);
         else for (size_t i = 0; i < n; ++i) g_front[i] = bswap16(s[i]);
         g_par.dv[0] = g_par.dv[1] = 0;                // …i.e. at the centred view: redraw what differs
+        parallax_forget_screen(g_par);
         g_par.drawn = true;
         g_par_moving = true;
     } else {
@@ -2514,6 +2661,7 @@ void load_zones(const char* image_path) {
 void play_tick(uint32_t now, bool may_draw) {
     uint32_t us = micros();
     g_tick_us0 = us;
+    if (may_draw && !g_pj.on && g_wj.phase == 0 && !g_sj.on) lcd_recheck(now);   // (80 MHz still holding? between frames)
     float dt = (us - g_last_us) * 1e-6f;
     g_last_us = us;
     if (!g_ok) return;
@@ -2563,8 +2711,19 @@ void play_tick(uint32_t now, bool may_draw) {
     g_echo = g_motion_echo.strength();
     for (int i = 0; i < g_n; ++i) g_z[i].damp_k = 1.0f - ECHO_DAMP_CUT * g_echo;
     g_sway_damp = 1.0f - ECHO_DAMP_CUT * g_echo;
-    for (int i = 0; i < g_ns; ++i)                     // hair / cloth / pendants: real gravity + your jolts (+ the echo)
-        if (g_sway[i].ready) { if (sway_step(g_sway[i], dt, dn_live, dyn, g_sway_damp, g_sdf)) g_sway[i].drawn = false; }
+    for (int i = 0; i < g_ns; ++i) {                   // hair / cloth / pendants: real gravity + your jolts (+ the echo)
+        Sway& sw = g_sway[i];
+        if (!sw.ready) continue;
+        sw.npush = 0;
+        if (sw.kind == SK_CLOTH)                       // forms jiggling under a skirt carry it along
+            for (int k = 0; k < g_n && sw.npush < SW_PUSH_MAX; ++k) {
+                const Zone& z = g_z[k];
+                if (!z.wmap) continue;
+                float* P = sw.push[sw.npush++];
+                P[0] = z.cx + z.dx; P[1] = z.cy + z.dy; P[2] = z.r; P[3] = z.vx; P[4] = z.vy;
+            }
+        if (sway_step(sw, dt, dn_live, dyn, g_sway_damp, g_sdf)) sw.drawn = false;
+    }
     bool echoing = g_echo > 0.02f;
     if (echoing != g_was_echo) {
         g_was_echo = echoing;
@@ -2729,7 +2888,9 @@ void play_tick(uint32_t now, bool may_draw) {
                 }
         }
     }
-    if (over_budget() && !drew_water) return;          // (the zones next tick)
+    static bool s_zone_skipped = false;                 // (the zones next tick - but never two ticks running)
+    if (over_budget() && !drew_water && !s_zone_skipped && any) { s_zone_skipped = true; return; }
+    s_zone_skipped = false;
     if (!any || !may_draw) return;
     if (!drew_water && now - g_last_draw < FRAME_MS) return;
     g_last_draw = now;

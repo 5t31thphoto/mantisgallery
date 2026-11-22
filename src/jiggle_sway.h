@@ -37,6 +37,9 @@ constexpr float SW_G = 1500.0f;             // gravity, px/s²
 constexpr float SW_BEND = 0.95993109f;      // 55°
 constexpr float SW_ON_BODY = 0.3f;
 constexpr float SW_FREE = 0.5235988f;       // 30°
+constexpr int SW_PUSH_MAX = 6;
+constexpr float SW_PUSH_K = 45.0f;          // a form jiggling under a skirt (a zone on her) drags the cloth on it (mg_sway.PUSH_K)
+constexpr float SW_HAIR_HOLD = 0.25f;         // (mg_sway.HAIR_HOLD)
 constexpr float SW_CLOTH_HOLD = 0.1f;        // a skirt holds its pose by gravity: its pull to the photo pose scales with how much gravity points down the picture
 constexpr float SW_CLOTH_FREE = 3.1415927f; // a skirt: no limit (upside down it falls right up; her hips stop it)
 constexpr float SW_BIND_MAX = 12.0f;        // hair farther than this from every lock isn't carried (it stays)
@@ -76,6 +79,10 @@ struct Sway {
     int16_t  lax = -1, lay = -1, lbx = -1, lby = -1;   // (an older file's "hang" pin: its guides are made from it)
     int      narm = 0;                        // cloth: her hips under it (the Studio's outline: kept, saved)
     int16_t  armx[9] = {0}, army[9] = {0};
+    bool     arm_back = false;                // … she's seen from behind (the bikini bottom covers her seat)
+    // runtime: forms jiggling under it (zones): cx, cy, r, vx, vy - set before each step
+    float    push[SW_PUSH_MAX][5];
+    int      npush = 0;
     int16_t* hipl = nullptr;                  // runtime: per row, the hips' left / right edge (−1 none)
     int16_t* hipr = nullptr;
     uint16_t* pdef = nullptr;                 // the Studio's fill (full frame, native RGB565) + which pixels it has
@@ -93,6 +100,7 @@ struct Sway {
     uint16_t* texd = nullptr;                 // edge pixels carrying their own colour (native)
     float*    c8 = nullptr;                   // the photo / the edge colour as RGB (3 floats a pixel), for drawing
     float*    t8 = nullptr;
+    uint8_t*  solid = nullptr;                // per pixel: fully its own, unmatted (alpha 255, photo = edge colour)
     int  lx0 = 0, ly0 = 0, lx1 = 0, ly1 = 0;  // what it drew last time (screen)
     int  ux0 = 0, uy0 = 0, ux1 = 0, uy1 = 0;  // what this frame redraws: that and what it draws now
     int   nr = 0, nn[SR_MAX] = {0};
@@ -112,10 +120,10 @@ struct Sway {
 };
 
 inline void sway_free_runtime(Sway& s) {
-    void* bufs[] = {s.own, s.hole, s.alpha, s.plate, s.photo, s.texd, s.c8, s.t8, s.hipl, s.hipr};
+    void* bufs[] = {s.own, s.hole, s.alpha, s.plate, s.photo, s.texd, s.c8, s.t8, s.solid, s.hipl, s.hipr};
     for (void* b : bufs) if (b) free(b);
     s.own = nullptr; s.hole = nullptr; s.alpha = nullptr; s.plate = s.photo = s.texd = nullptr; s.c8 = s.t8 = nullptr;
-    s.hipl = s.hipr = nullptr;
+    s.hipl = s.hipr = nullptr; s.solid = nullptr;
     s.ready = false;
 }
 inline void sway_free(Sway& s) {
@@ -135,7 +143,7 @@ inline void sway_copy_def(Sway& d, const Sway& s, void* (*alloc)(size_t)) {
     sway_free(d);
     d = Sway();
     d.kind = s.kind; memcpy(d.prm, s.prm, sizeof(d.prm));
-    d.narm = s.narm; memcpy(d.armx, s.armx, sizeof(d.armx)); memcpy(d.army, s.army, sizeof(d.army));
+    d.narm = s.narm; memcpy(d.armx, s.armx, sizeof(d.armx)); memcpy(d.army, s.army, sizeof(d.army)); d.arm_back = s.arm_back;
     d.ng = s.ng; memcpy(d.gn, s.gn, sizeof(d.gn)); memcpy(d.gx, s.gx, sizeof(d.gx)); memcpy(d.gy, s.gy, sizeof(d.gy));
     memcpy(d.name, s.name, sizeof(d.name)); memcpy(d.on, s.on, sizeof(d.on));
     if (s.mask && sway_ensure_mask(d, alloc)) memcpy(d.mask, s.mask, MASK_BYTES);
@@ -264,12 +272,38 @@ inline float sdf_at(const int16_t* sdf, float x, float y, float* gx = nullptr, f
 }
 
 // ---- small helpers ------------------------------------------------------------------------------------
-inline void sw_unpack(uint16_t v, float& r, float& g, float& b) {   // (as the Studio's lab reads RGB565)
-    r = (float)((v >> 11) * 255 / 31); g = (float)(((v >> 5) & 63) * 255 / 63); b = (float)((v & 31) * 255 / 31);
+// RGB565 → 0..255 per channel, as the Studio's lab reads it (x·255 / 31 or 63, integer): tables, no divides
+struct SwLevels {
+    float f5[32], f6[64];
+    SwLevels() { for (int i = 0; i < 32; ++i) f5[i] = (float)(i * 255 / 31); for (int i = 0; i < 64; ++i) f6[i] = (float)(i * 255 / 63); }
+};
+static const SwLevels s_swlv;
+JIG_INLINE void sw_unpack(uint16_t v, float& r, float& g, float& b) {
+    r = s_swlv.f5[v >> 11]; g = s_swlv.f6[(v >> 5) & 63]; b = s_swlv.f5[v & 31];
 }
-inline uint16_t sw_pack(float r, float g, float b) {
-    auto c = [](float v, int hi) { int i = (int)(v + 0.5f); return i < 0 ? 0 : (i > hi ? hi : i); };
-    return (uint16_t)((c(r * 31 / 255.0f, 31) << 11) | (c(g * 63 / 255.0f, 63) << 5) | c(b * 31 / 255.0f, 31));
+// One channel back to 5 / 6 bits: round(v·m / 255), clamped - bit for bit as (int)(v·m / 255.0f + 0.5f).
+// The Core2's FPU has no divide (a divide is a long instruction sequence), so this multiplies by m / 255
+// instead: that lands within ~3e-5 of the divided value, so whenever the result isn't that close to a
+// rounding edge it's the same integer; the rare one that is takes the exact divide.
+JIG_INLINE int sw_q(float v, int m, float k, int hi) {
+    const float u = v * k + 0.5f;
+    if (u < -1e-3f) return 0;
+    if (u >= 1e-3f) {
+        const int i = (int)u;
+        const float f = u - (float)i;
+        if (f > 1e-4f && f < 1.0f - 1e-4f) return i > hi ? hi : i;
+    }
+    const int i = (int)(v * m / 255.0f + 0.5f);
+    return i < 0 ? 0 : (i > hi ? hi : i);
+}
+// rintf (to nearest, ties to even) for 0 ≤ v < 2^23, without the library call
+JIG_INLINE int sw_rint_pos(float v) {
+    const int i = (int)v;
+    const float f = v - (float)i;                       // (exact)
+    return (f > 0.5f || (f == 0.5f && (i & 1))) ? i + 1 : i;
+}
+JIG_INLINE uint16_t sw_pack(float r, float g, float b) {
+    return (uint16_t)((sw_q(r, 31, 31.0f / 255.0f, 31) << 11) | (sw_q(g, 63, 63.0f / 255.0f, 63) << 5) | sw_q(b, 31, 31.0f / 255.0f, 31));
 }
 // a polyline resampled to n evenly spaced nodes (in double, as the Studio's lab does it)
 inline int sw_resample(const float* px, const float* py, int np, float step, int nmax, float* ox, float* oy) {
@@ -685,12 +719,14 @@ inline bool sw_bikini_poly(const Sway& s, float* qx, float* qy) {   // (mg_sway.
     if (s.narm != 9) return false;
     const float h0x = s.armx[1], h0y = s.army[1], l0x = s.armx[2], l0y = s.army[2], lix = s.armx[3];
     const float cx = s.armx[4], cy = s.army[4], rix = s.armx[5], r0x = s.armx[6], r0y = s.army[6], h1x = s.armx[7], h1y = s.army[7];
-    const float hy = (h0y + h1y) / 2, ty = hy + 0.1f * std::max(2.0f, cy - hy);
+    const bool bk = s.arm_back;                         // (seen from behind: her seat - higher, steeper, wider panel)
+    const float hy = (h0y + h1y) / 2, ty = hy + (bk ? -0.05f : 0.1f) * std::max(2.0f, cy - hy);
     auto side = [&](float ax, float ay, float bx, float by) { return ax + (bx - ax) * (by != ay ? (ty - ay) / (by - ay) : 0.0f); };
     const float xl = side(h0x, h0y, l0x, l0y) + 1.0f, xr = side(h1x, h1y, r0x, r0y) - 1.0f;
-    const float gap = std::max(3.0f, rix - lix), by = cy + 0.5f, wb = std::min(gap * 0.3f + 1.0f, 3.0f);
+    const float gap = std::max(3.0f, rix - lix), by = cy + 0.5f;
+    const float wb = bk ? std::min(gap * 0.6f + 2.0f, 6.0f) : std::min(gap * 0.3f + 1.0f, 3.0f);
     for (int k = 0; k < 6; ++k) {
-        const float t = k / 5.0f, y = ty + (by - ty) * t, f = powf(1 - t, 1.6f);
+        const float t = k / 5.0f, y = ty + (by - ty) * t, f = powf(1 - t, bk ? 0.75f : 1.6f);
         qx[k] = cx - wb - (cx - wb - xl) * f; qy[k] = y;
         qx[SW_BIKINI_N - 1 - k] = cx + wb + (xr - cx - wb) * f; qy[SW_BIKINI_N - 1 - k] = y;
     }
@@ -883,6 +919,8 @@ inline bool sway_prepare(Sway& s, const uint16_t* photo, bool psw, const uint8_t
         sw_unpack(s.photo[i], s.c8[3 * i], s.c8[3 * i + 1], s.c8[3 * i + 2]);
         sw_unpack(s.texd[i], s.t8[3 * i], s.t8[3 * i + 1], s.t8[3 * i + 2]);
     }
+    s.solid = (uint8_t*)alloc((size_t)N);              // (drawing: one test a corner instead of three reads)
+    if (s.solid) for (int i = 0; i < N; ++i) s.solid[i] = (uint8_t)(s.alpha[i] == 255 && s.photo[i] == s.texd[i]);
     if (s.kind == SK_CLOTH && s.narm == 9) {             // her hips: each row's edges (even-odd scanline of the outline)
         s.hipl = (int16_t*)alloc(IMG_H * 2); s.hipr = (int16_t*)alloc(IMG_H * 2);
         if (s.hipl && s.hipr)
@@ -996,6 +1034,15 @@ inline void sw_rods(Sway& s, float fx, float fy, float wind, float damp_k, const
                 const float v = std::min(0.9f, 8.0f * K.mu * h);
                 s.xp[k][i] += (s.x[k][i] - s.xp[k][i]) * v; s.yp[k][i] += (s.y[k][i] - s.yp[k][i]) * v;
             }
+            for (int p = 0; cloth && p < s.npush; ++p) {   // under it, a form jiggling: the cloth on it carried along
+                const float* P = s.push[p];
+                const float ddx = s.x[k][i] - P[0], ddy = s.y[k][i] - P[1];
+                float wq = 1.0f - sqrtf(ddx * ddx + ddy * ddy) / (1.6f * P[2]);
+                if (wq <= 0.0f) continue;
+                if (wq > 1.0f) wq = 1.0f;
+                ax += SW_PUSH_K * wq * (P[3] - (s.x[k][i] - s.xp[k][i]) / h);
+                ay += SW_PUSH_K * wq * (P[4] - (s.y[k][i] - s.yp[k][i]) / h);
+            }
             float nxp = s.x[k][i] + (s.x[k][i] - s.xp[k][i]) * damp + ax * h * h;
             float nyp = s.y[k][i] + (s.y[k][i] - s.yp[k][i]) * damp + ay * h * h;
             if (i == 0) { nxp = s.rx[k][0]; nyp = s.ry[k][0]; }
@@ -1074,10 +1121,10 @@ inline bool sway_step(Sway& s, float dt, const float dn[3], const float jolt[3],
             const float g = sw * K.gain;
             // a skirt: the photo's pose is held up by her only while gravity points down the picture -
             // that part is carried; the rest (sideways, upside down) pulls it
-            const bool cl = s.kind == SK_CLOTH;
+            const bool cl = s.kind == SK_CLOTH || s.kind == SK_HAIR;   // (hair too: it keeps a little more of its shape)
             const float gy = cl ? SW_G * std::min(0.0f, dn[1]) : SW_G * (dn[1] - m);
             sw_rods(s, g * (SW_G * dn[0] - K.j * jolt[0]), g * (gy - K.j * jolt[1]), wind, damp_k, sdf,
-                    cl ? std::max(SW_CLOTH_HOLD, dn[1]) : 1.0f);
+                    cl ? std::max(s.kind == SK_CLOTH ? SW_CLOTH_HOLD : SW_HAIR_HOLD, dn[1]) : 1.0f);
         }
     }
     float disp = 0, vel = 0;
@@ -1173,17 +1220,18 @@ inline void sway_dirty_d(Sway& s, const SwDraw& D) {
 }
 // Into out (the layer, RGB565; osw = byte-swapped), rows [ya, yb): the plate under it, then the mesh.
 // At rest it draws the photo exactly. (Each triangle row by row over just its span.)
-inline void sway_draw_rows(const Sway& s, const SwDraw& D, uint16_t* out, bool osw, int ya, int yb) {
+JIG_INLINE void sw_put(uint16_t* out, bool osw, int X, int Y, uint16_t v) { out[Y * IMG_W + X] = osw ? (uint16_t)((v >> 8) | (v << 8)) : v; }
+JIG_INLINE float sw_al(const uint8_t* AL, int i, float keep, float fade) { return AL[i] ? keep + AL[i] * (1.0f / 255.0f) * fade : 0.0f; }
+inline JIG_HOT void sway_draw_rows(const Sway& s, const SwDraw& D, uint16_t* out, bool osw, int ya, int yb) {
     if (!s.ready) return;
-    auto put = [&](int X, int Y, uint16_t v) { out[Y * IMG_W + X] = osw ? (uint16_t)((v >> 8) | (v << 8)) : v; };
     for (int y = std::max(ya, s.ry0); y < std::min(yb, s.ry0 + s.rh); ++y)
-        for (int x = 0; x < s.rw; ++x) { const int i = (y - s.ry0) * s.rw + x; if (s.hole[i]) put(s.rx0 + x, y, s.plate[i]); }
+        for (int x = 0; x < s.rw; ++x) { const int i = (y - s.ry0) * s.rw + x; if (s.hole[i]) sw_put(out, osw, s.rx0 + x, y, s.plate[i]); }
     const SwTri* tris = D.tris; const int* order = D.order; const int nt = D.nt;
     const float fade = s.fade, keep = 1.0f - fade;
     const bool hair = s.kind == SK_HAIR;
     const int RW = s.rw, RH = s.rh;
     const float* C8 = s.c8; const float* T8 = s.t8; const uint8_t* AL = s.alpha;
-    const uint16_t* PH = s.photo; const uint16_t* TX = s.texd;
+    const uint16_t* PH = s.photo; const uint16_t* TX = s.texd; const uint8_t* SO = s.solid;
     for (int q = 0; q < nt; ++q) {
         const SwTri& T = tris[order[q]];
         const float* X = T.dx; const float* Y = T.dy;
@@ -1217,23 +1265,24 @@ inline void sway_draw_rows(const Sway& s, const SwDraw& D, uint16_t* out, bool o
                 sx = sx < 0 ? 0 : (sx > RW - 1.001f ? RW - 1.001f : sx); sy = sy < 0 ? 0 : (sy > RH - 1.001f ? RH - 1.001f : sy);
                 const int ix = (int)sx, iy = (int)sy;
                 if (hair) {                              // only the pixels this lock carries
-                    const int ox_ = (int)rintf(sx), oy_ = (int)rintf(sy);
+                    const int ox_ = sw_rint_pos(sx), oy_ = sw_rint_pos(sy);
                     if (s.own[std::min(oy_, RH - 1) * RW + std::min(ox_, RW - 1)] != T.oid) continue;
                 }
                 const float fx = sx - ix, fy = sy - iy;
                 const int ix1 = ix + 1 < RW ? ix + 1 : RW - 1, iy1 = iy + 1 < RH ? iy + 1 : RH - 1;
                 const int i00 = iy * RW + ix, i10 = iy * RW + ix1, i01 = iy1 * RW + ix, i11 = iy1 * RW + ix1;
                 const float w0 = (1 - fx) * (1 - fy), w1 = fx * (1 - fy), w2 = (1 - fx) * fy, w3 = fx * fy;
-                if ((AL[i00] & AL[i10] & AL[i01] & AL[i11]) == 255 && PH[i00] == TX[i00] && PH[i10] == TX[i10] &&
-                    PH[i01] == TX[i01] && PH[i11] == TX[i11]) {        // inside it (most of it): solid, its own colour
+                if (SO ? (SO[i00] & SO[i10] & SO[i01] & SO[i11]) != 0
+                       : ((AL[i00] & AL[i10] & AL[i01] & AL[i11]) == 255 && PH[i00] == TX[i00] && PH[i10] == TX[i10] &&
+                          PH[i01] == TX[i01] && PH[i11] == TX[i11])) {   // inside it (most of it): solid, its own colour
                     const float r = (C8[3 * i00] * w0 + C8[3 * i10] * w1 + C8[3 * i01] * w2 + C8[3 * i11] * w3) * T.shade;
                     const float g = (C8[3 * i00 + 1] * w0 + C8[3 * i10 + 1] * w1 + C8[3 * i01 + 1] * w2 + C8[3 * i11 + 1] * w3) * T.shade;
                     const float b = (C8[3 * i00 + 2] * w0 + C8[3 * i10 + 2] * w1 + C8[3 * i01 + 2] * w2 + C8[3 * i11 + 2] * w3) * T.shade;
-                    put(x, y, sw_pack(r, g, b));
+                    sw_put(out, osw, x, y, sw_pack(r, g, b));
                     continue;
                 }
-                auto al = [&](int i) { return AL[i] ? keep + AL[i] * (1.0f / 255.0f) * fade : 0.0f; };
-                const float A = al(i00) * w0 + al(i10) * w1 + al(i01) * w2 + al(i11) * w3;
+                const float A = sw_al(AL, i00, keep, fade) * w0 + sw_al(AL, i10, keep, fade) * w1 +
+                                sw_al(AL, i01, keep, fade) * w2 + sw_al(AL, i11, keep, fade) * w3;
                 if (A <= 0) continue;
                 float col[3];
                 for (int c = 0; c < 3; ++c) {
@@ -1246,7 +1295,7 @@ inline void sway_draw_rows(const Sway& s, const SwDraw& D, uint16_t* out, bool o
                 }
                 const uint16_t ov0 = out[y * IMG_W + x], ov = osw ? (uint16_t)((ov0 >> 8) | (ov0 << 8)) : ov0;
                 float orr, og, ob; sw_unpack(ov, orr, og, ob);
-                put(x, y, sw_pack(orr * (1 - A) + col[0] * A, og * (1 - A) + col[1] * A, ob * (1 - A) + col[2] * A));
+                sw_put(out, osw, x, y, sw_pack(orr * (1 - A) + col[0] * A, og * (1 - A) + col[1] * A, ob * (1 - A) + col[2] * A));
             }
         }
     }
@@ -1336,6 +1385,7 @@ inline bool parse_sway_line(char* line, Sway* ss, int& ns, int& cur, uint8_t*& b
         int k = 0, x, y;
         while (k < 9 && sscanf(rest, " %d,%d%n", &x, &y, &n) == 2) { rest += n; s.armx[k] = (int16_t)x; s.army[k] = (int16_t)y; ++k; }
         s.narm = k == 9 ? 9 : 0;
+        s.arm_back = strstr(rest, "back") != nullptr;
         return true;
     }
     if (strcmp(kind, "sguide") == 0) {
@@ -1397,7 +1447,7 @@ inline void save_sways(F& f, const Sway* ss, int ns, const uint8_t* body) {
         if (s.kind == SK_CLOTH && s.narm == 9) {
             f.printf("sarm");
             for (int k = 0; k < 9; ++k) f.printf(" %d,%d", s.armx[k], s.army[k]);
-            f.printf("\n");
+            f.printf(s.arm_back ? " back\n" : "\n");
         }
         save_mask_rows(f, s.mask, "srow");
         if (s.pdef_ok && s.pdef && s.pdef_has)

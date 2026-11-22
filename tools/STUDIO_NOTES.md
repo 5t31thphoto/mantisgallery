@@ -79,3 +79,25 @@ only the Studio's own tools. These notes drive the UI rebuild.
   - hair pivoting from the wrong place.
 
   The UI could flag the first two automatically: a mask edge that crosses a strong colour edge.
+
+## What's under a skirt or hair
+
+- **Load what's under it…** (Sway tab, for cloth and hair): an artist's own layer of the same picture,
+  e.g. her in just the swimwear under the sarong, in the same pose. The fill behind the sway is cut from
+  it instead of being made up, and the bikini safety patch isn't needed then. It's laid out exactly as
+  the photo was converted ("cover"). It's only used to make the fill: the `.jig` carries the fill and
+  the layer itself is never saved, so the device still gets just the `.mg` and the `.jig`.
+- **Seen from the front / behind** (skirt): the safety bikini bottom's shape. From behind it covers her
+  seat: the top sits higher, the sides fall more steeply, and the panel at the bottom is wider. Saved
+  on the `sarm` line as `back`.
+- Without a layer, the skin under a skirt is sampled a little way down her thigh. Right under the hem
+  lies the skirt's own shadow, which is gone once the skirt lifts. Her hair and other sways are never
+  sampled.
+- A **jiggle zone under a skirt** (her seat, seen from behind) warps the skirt and what's under it,
+  and drags the cloth lying on it along (`PUSH_K`), so the hem carries the jiggle on.
+
+## Recording
+
+- **Record…** asks which script to use: Mixed motions, or Showcase. Showcase turns her right over,
+  shakes and wiggles her upside down, rocks her forward and back, then dances. A script can ease the
+  turn and lean (`turn A S`, `lean A S`), and it starts from wherever the turned / leaned controls sit.

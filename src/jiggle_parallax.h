@@ -69,7 +69,10 @@ struct Parallax {
     uint8_t*  owner = nullptr;            // per pixel: 0 = background, k+1 = plane k
     uint16_t* bg_fill = nullptr;
     int16_t*  vrow = nullptr;             // per core, per layer: source columns filtered top to bottom (R, G, B)
-    int32_t*  vkey = nullptr;             //   … and which row position / phase each column holds
+    struct RowSig { int32_t sx, sy; int16_t xs, xe, fade; uint8_t pres, rc; };
+    struct RowKey { float kx, ky, f; uint8_t ok; };
+    RowSig*   rsig = nullptr;             // per screen row, per layer: how the frame on screen drew it there …
+    RowKey*   rkey = nullptr;             //   … and that frame's view (ok: the whole row is that frame's)
     int       order[PLANE_MAX];           // nearest first
     int       margin = 0;
     Plane     gp;                         // the ground's depth field (grid): 1 at the nearest ground, 0 at the horizon
@@ -116,8 +119,9 @@ inline void parallax_free_runtime(Parallax& P) {
     if (P.owner) free(P.owner);
     if (P.bg_fill) free(P.bg_fill);
     if (P.vrow) free(P.vrow);
-    if (P.vkey) free(P.vkey);
-    P.owner = nullptr; P.bg_fill = nullptr; P.vrow = nullptr; P.vkey = nullptr; P.ready = false;
+    if (P.rsig) free(P.rsig);
+    if (P.rkey) free(P.rkey);
+    P.owner = nullptr; P.bg_fill = nullptr; P.vrow = nullptr; P.rsig = nullptr; P.rkey = nullptr; P.ready = false;
 }
 inline void parallax_free(Parallax& P) {
     parallax_free_runtime(P);
@@ -146,7 +150,7 @@ inline bool plane_any(const Plane& p) {
     return false;
 }
 
-inline float plane_depth_at(const Plane& p, float x, float y) {
+JIG_INLINE float plane_depth_at(const Plane& p, float x, float y) {
     float d = p.c0 + p.cx * x + p.cy * y;
     return d < p.dlo ? p.dlo : (d > p.dhi ? p.dhi : d);
 }
@@ -205,6 +209,9 @@ inline void par_fill(const uint8_t* owner, uint8_t id, const uint16_t* photo, bo
 // over something else, that pixel reads as a hard sticker edge with a thin rim of the old background.
 // So its silhouette fades in over the outer pixel: half on the edge row, most on a corner-only
 // touch. (The fade is scaled by how far the plane has moved: at rest the photo shows unchanged.)
+constexpr size_t PAR_SOFT_BYTES = (size_t)IMG_W * IMG_H + (size_t)IMG_H * 4;   // the alpha, then its row spans
+inline int16_t* par_soft_spans(uint8_t* soft) { return (int16_t*)(soft + (size_t)IMG_W * IMG_H); }
+inline const int16_t* par_soft_spans(const uint8_t* soft) { return (const int16_t*)(soft + (size_t)IMG_W * IMG_H); }
 inline void par_soften(const uint8_t* cov, uint8_t* soft) {
     for (int y = 0; y < IMG_H; ++y)
         for (int x = 0; x < IMG_W; ++x) {
@@ -218,6 +225,14 @@ inline void par_soften(const uint8_t* cov, uint8_t* soft) {
             else if (off(-1, -1) || off(1, -1) || off(-1, 1) || off(1, 1)) soft[i] = 200;
             else soft[i] = 255;
         }
+    int16_t* sp = par_soft_spans(soft);                 // each row's first / last non-zero column (render skips the rest)
+    for (int y = 0; y < IMG_H; ++y) {
+        const uint8_t* r = soft + y * IMG_W;
+        int l = 0, h = IMG_W - 1;
+        while (l < IMG_W && !r[l]) ++l;
+        while (h >= l && !r[h]) --h;
+        sp[2 * y] = (int16_t)l; sp[2 * y + 1] = (int16_t)h;   // (empty: l > h)
+    }
 }
 
 inline int parallax_max_shift(const Parallax& P) {
@@ -234,7 +249,8 @@ inline int parallax_max_shift(const Parallax& P) {
 }
 
 // Build everything the renderer needs. `photo` is the picture (sw = byte-swapped).
-inline bool parallax_prepare(Parallax& P, const uint16_t* photo, bool sw, void* (*alloc)(size_t)) {
+// fast_alloc: for the render's per-core filter scratch (touched ~20× a pixel): internal RAM on the Core2.
+inline bool parallax_prepare(Parallax& P, const uint16_t* photo, bool sw, void* (*alloc)(size_t), void* (*fast_alloc)(size_t) = nullptr) {
     parallax_free_runtime(P);
     if ((P.n <= 0 && !par_ground(P)) || !photo) return false;
     const int N = IMG_W * IMG_H;
@@ -287,15 +303,18 @@ inline bool parallax_prepare(Parallax& P, const uint16_t* photo, bool sw, void* 
     }
     P.owner = (uint8_t*)alloc(N);
     P.bg_fill = (uint16_t*)alloc((size_t)N * 2);
-    P.vrow = (int16_t*)alloc((size_t)2 * (PLANE_MAX + 1) * 3 * IMG_W * 2);
-    P.vkey = (int32_t*)alloc((size_t)2 * (PLANE_MAX + 1) * IMG_W * 4);
+    if (!fast_alloc) fast_alloc = alloc;
+    P.vrow = (int16_t*)fast_alloc((size_t)2 * (PLANE_MAX + 1) * 3 * IMG_W * 2);
+    P.rsig = (Parallax::RowSig*)alloc(sizeof(Parallax::RowSig) * IMG_H * (PLANE_MAX + 1));
+    P.rkey = (Parallax::RowKey*)alloc(sizeof(Parallax::RowKey) * IMG_H);
+    if (P.rkey) for (int y = 0; y < IMG_H; ++y) P.rkey[y].ok = 0;
     int16_t* nx = (int16_t*)alloc((size_t)N * 2);
     int16_t* ny = (int16_t*)alloc((size_t)N * 2);
-    bool ok = P.owner && P.bg_fill && P.vrow && P.vkey && nx && ny;
+    bool ok = P.owner && P.bg_fill && P.vrow && P.rsig && P.rkey && nx && ny;
     for (int k = 0; k < P.n && ok; ++k) {
         P.pl[k].cov = (uint8_t*)alloc(MASK_BYTES);
         P.pl[k].fill = (uint16_t*)alloc((size_t)N * 2);
-        P.pl[k].soft = (uint8_t*)alloc(N);
+        P.pl[k].soft = (uint8_t*)alloc(PAR_SOFT_BYTES);
         ok = P.pl[k].cov && P.pl[k].fill && P.pl[k].soft && P.pl[k].mask;
     }
     if (!ok) { if (nx) free(nx); if (ny) free(ny); parallax_free_runtime(P); return false; }
@@ -408,7 +427,11 @@ inline bool parallax_step(Parallax& P, float dt, float rate_x, float rate_y, boo
         if (fabsf(P.th[0]) + fabsf(P.th[1]) < 1e-3f) P.th[0] = P.th[1] = 0;
     }
     float moved = (fabsf(P.v[0] - P.dv[0]) + fabsf(P.v[1] - P.dv[1])) * A;
-    return !P.drawn || moved > 1.0f / 128.0f;
+    // Your hand moving it: every 1/128 px of the nearest plane's slide is drawn. Only the idle drift
+    // moving it (about 1 px a second at most): every 1/32 px - steps far below what shows, at a fraction of
+    // the redraws (a whole-screen depth frame each time).
+    const bool hand = fabsf(P.th[0]) + fabsf(P.th[1]) > 0.002f * full;
+    return !P.drawn || moved > (hand ? 1.0f / 128.0f : 1.0f / 32.0f);
 }
 
 // Per-frame slide of each plane: shift = (depth − focus) · (kx, ky)  (px, + = right / down)
@@ -458,6 +481,15 @@ struct ParFrame {
     int32_t sx[PLANE_MAX + 1], sy[PLANE_MAX + 1];       // flat: shift, Q8
     const Plane* pl[PLANE_MAX + 1];
     int lx0[PLANE_MAX + 1], lx1[PLANE_MAX + 1], ly0[PLANE_MAX + 1], ly1[PLANE_MAX + 1];   // screen box it can show in
+    // Reuse (set by the caller): the screen as it stands (as the render writes it), and where the content
+    // changed this frame (screen rects, already spread by how far a sample can reach). A pixel whose every
+    // layer would be drawn exactly as the frame on screen drew it is copied from the screen, not redrawn.
+    const uint16_t* front = nullptr;
+    bool force_all = false;                     // every fill changed
+    int nforce = 0;
+    int16_t force[24][4];                       // content that changed: rects (content coords) …
+    int nfw = 0;
+    const int16_t* fwrow[WATER_MAX];            // … and waters: per content row, its wet x0, x1 (x0 >= x1: dry)
 };
 
 inline void parallax_frame(ParFrame& F, const Parallax& P, const uint16_t* anim, bool anim_sw, bool live) {
@@ -520,77 +552,265 @@ inline void parallax_sync_content(Parallax& P, const uint16_t* anim, bool sw, in
         }
 }
 
-inline int par_clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+JIG_INLINE int par_clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// A feathered edge's coverage, faded in while the plane has barely slid (fd: 0 … 256).
+JIG_INLINE int par_soft_e(int v, int fd) { return v ? 256 - (((256 - (v == 255 ? 256 : v)) * fd) >> 8) : 0; }
 
 // Render screen rows [y0, y1) × columns [x0, x1) into out (display byte order, width x1 − x0).
 // (Every layer reads only its fill: the live content is copied in by parallax_sync_content.)
-inline void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, int x1, int y1, int lane = 0) {
+inline JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, int x1, int y1, int lane = 0) {
     const auto& W = par_w();
     const int ow = x1 - x0;
     const float f = F.P->prm[PP_FOCUS];
-    int act[PLANE_MAX + 1];
-    // Catmull-Rom is separable and the sum is the same in either order: each source column is filtered
-    // top to bottom once for a given row position and phase (key = Q >> 2), kept, and reused by every
-    // pixel (and the next row) that samples it there; each pixel then only filters across 4 columns.
+    const int16_t* ZX = F.P->zx;
+    // Catmull-Rom is separable and the sum is the same in either order: along a row each source column is
+    // filtered top to bottom once (for that row position and phase) into this core's scratch, and the
+    // pixels then only filter across 4 columns of it. (Internal RAM: it's touched ~16× a pixel.)
     int16_t* VB = F.P->vrow + (lane & 1) * (PLANE_MAX + 1) * 3 * IMG_W;
-    int32_t* KB = F.P->vkey + (lane & 1) * (PLANE_MAX + 1) * IMG_W;
-    for (int i = 0; i < F.nl * IMG_W; ++i) KB[i] = INT32_MIN;   // (fills may have changed since the last call)
+
+    // Per row, each layer that can show on it. A flat card, or a ramp that only tilts top to bottom,
+    // slides by the same amount all along the row: its source row, phase, filter taps and the stretch of
+    // the row its silhouette can reach are worked out once here instead of at every pixel.
+    struct Lay {
+        int j, xs, xe;                                  // screen columns it can show in, this row
+        bool rc;                                        // the shift is the same all along the row
+        int32_t SX, SY, key;
+        int iy, fy;
+        const int16_t* wy;
+        const uint8_t* sa; const uint8_t* sb;           // soft rows ⌊Q⌋ and ⌊Q⌋+1
+        const uint16_t* rp[4];                          // fill rows iy−1 … iy+2 (clamped)
+        int16_t* V;
+        int lo, hi;                                     // the source columns filtered (for the current row position)
+    } L[PLANE_MAX + 1];
     for (int y = y0; y < y1; ++y) {
         uint16_t* o = out + (y - y0) * ow;
-        int na = 0;                                     // the layers that can show on this row
-        for (int j = 0; j < F.nl; ++j) if (y >= F.ly0[j] && y < F.ly1[j]) act[na++] = j;
+        int na = 0;
         const int32_t zyq = (int32_t)F.P->zy[y] << 4;
+        for (int j = 0; j < F.nl; ++j) {
+            if (y < F.ly0[j] || y >= F.ly1[j]) continue;
+            Lay& l = L[na];
+            l.j = j;
+            l.xs = F.lx0[j] > x0 ? F.lx0[j] : x0; l.xe = F.lx1[j] < x1 ? F.lx1[j] : x1;
+            if (l.xs >= l.xe) continue;
+            const Plane& pl = *F.pl[j];
+            l.rc = F.flat[j] || pl.cx == 0.0f;          // (cx = 0: c0 + 0·x + cy·y is the same for every x)
+            l.V = VB + j * 3 * IMG_W; l.hi = INT32_MIN / 2; l.lo = 0; l.key = INT32_MIN;
+            if (l.rc) {
+                if (F.flat[j]) { l.SX = F.sx[j]; l.SY = F.sy[j]; }
+                else {
+                    float d = plane_depth_at(pl, 0.0f, (float)y) - f;
+                    l.SX = (int32_t)(d * F.kx * 256.0f); l.SY = (int32_t)(d * F.ky * 256.0f);
+                }
+                const int32_t QY = zyq - l.SY;
+                l.iy = QY >> 8; l.fy = QY & 255; l.key = QY >> 2; l.wy = W[l.key & 63];
+                for (int r = 0; r < 4; ++r) l.rp[r] = F.fill[j] + par_clampi(l.iy - 1 + r, 0, IMG_H - 1) * IMG_W;
+                if (F.soft[j]) {
+                    const int ya = par_clampi(l.iy, 0, IMG_H - 1), yb = par_clampi(l.iy + 1, 0, IMG_H - 1);
+                    l.sa = F.soft[j] + ya * IMG_W; l.sb = F.soft[j] + yb * IMG_W;
+                    // its silhouette's reach on these two source rows: outside it every sample reads 0
+                    const int16_t* sp = par_soft_spans(F.soft[j]);
+                    const int lo = sp[2 * ya] < sp[2 * yb] ? sp[2 * ya] : sp[2 * yb];
+                    const int hi = sp[2 * ya + 1] > sp[2 * yb + 1] ? sp[2 * ya + 1] : sp[2 * yb + 1];
+                    if (lo > hi) continue;
+                    // the source column grows with x: first x whose right sample reaches lo, last whose left
+                    // sample is still ≤ hi
+                    auto ixat = [&](int x) { return ((((int32_t)ZX[x] << 4) - l.SX) >> 8); };
+                    int a = l.xs, b = l.xe;
+                    while (a < b) { const int m = (a + b) >> 1; if (par_clampi(ixat(m) + 1, 0, IMG_W - 1) >= lo) b = m; else a = m + 1; }
+                    l.xs = a;
+                    a = l.xs; b = l.xe;
+                    while (a < b) { const int m = (a + b) >> 1; if (par_clampi(ixat(m), 0, IMG_W - 1) > hi) b = m; else a = m + 1; }
+                    l.xe = a;
+                    if (l.xs >= l.xe) continue;
+                }
+            }
+            ++na;
+        }
+        // ---- reuse: which pixels of this row would come out exactly as the screen already shows them
+        const bool full = x0 == 0 && x1 == IMG_W && F.P->rsig;
+        bool reuse = false;
+        uint8_t chg[IMG_W];
+        Parallax::RowSig NS[PLANE_MAX + 1];
+        if (full) {
+            for (int j = 0; j < F.nl; ++j) NS[j].pres = 0;
+            for (int q = 0; q < na; ++q) {
+                const Lay& l = L[q];
+                Parallax::RowSig& n = NS[l.j];
+                n.pres = 1; n.rc = l.rc; n.xs = (int16_t)l.xs; n.xe = (int16_t)l.xe;
+                n.fade = (int16_t)(F.soft[l.j] ? F.fade[l.j] : 0);
+                n.sx = l.rc ? l.SX : 0; n.sy = l.rc ? l.SY : 0;
+            }
+            const Parallax::RowKey& K = F.P->rkey[y];
+            const Parallax::RowSig* O = F.P->rsig + y * (PLANE_MAX + 1);
+            reuse = F.front && K.ok;
+            if (reuse) {
+                memset(chg, 0, IMG_W);
+                if (F.force_all) memset(chg, 1, IMG_W);
+                else if (F.nforce || F.nfw)                     // content that changed: the pixels whose filter
+                    for (int q = 0; q < na; ++q) {             //  taps (or a ramp's row) reach it, per layer
+                        const Lay& l = L[q];
+                        int r0, r1;
+                        if (l.rc) { r0 = l.iy - 1; r1 = l.iy + 2; }
+                        else {                                  // (its row position at either end of the row)
+                            const Plane& pl = *F.pl[l.j];
+                            int ia = 0, ib = 0;
+                            for (int e = 0; e < 2; ++e) {
+                                const float d = plane_depth_at(pl, (float)(e ? l.xe - 1 : l.xs), (float)y) - f;
+                                const int iy_ = (zyq - (int32_t)(d * F.ky * 256.0f)) >> 8;
+                                if (e) ib = iy_; else ia = iy_;
+                            }
+                            r0 = (ia < ib ? ia : ib) - 1; r1 = (ia < ib ? ib : ia) + 2;
+                        }
+                        r0 = par_clampi(r0, 0, IMG_H - 1); r1 = par_clampi(r1, 0, IMG_H - 1);
+                        int a = IMG_W, b = -1;                  // content columns that changed on those rows
+                        for (int i = 0; i < F.nforce; ++i)
+                            if (F.force[i][1] <= r1 && F.force[i][3] > r0) {
+                                if (F.force[i][0] < a) a = F.force[i][0];
+                                if (F.force[i][2] - 1 > b) b = F.force[i][2] - 1;
+                            }
+                        for (int i = 0; i < F.nfw; ++i)
+                            for (int r = r0; r <= r1; ++r) {
+                                const int16_t* wr = F.fwrow[i] + 2 * r;
+                                if (wr[0] < wr[1]) { if (wr[0] < a) a = wr[0]; if (wr[1] - 1 > b) b = wr[1] - 1; }
+                            }
+                        if (a > b) continue;
+                        int xa = l.xs, xb = l.xe;
+                        if (l.rc) {                             // taps clamp(ix−1) … clamp(ix+2) meet [a, b]
+                            auto ixat = [&](int x) { return ((((int32_t)ZX[x] << 4) - l.SX) >> 8); };
+                            int lo = l.xs, hi = l.xe;
+                            while (lo < hi) { const int mm = (lo + hi) >> 1; if (par_clampi(ixat(mm) + 2, 0, IMG_W - 1) >= a) hi = mm; else lo = mm + 1; }
+                            xa = lo; lo = xa; hi = l.xe;
+                            while (lo < hi) { const int mm = (lo + hi) >> 1; if (par_clampi(ixat(mm) - 1, 0, IMG_W - 1) > b) hi = mm; else lo = mm + 1; }
+                            xb = lo;
+                        }
+                        if (xb > xa) memset(chg + xa, 1, xb - xa);
+                    }
+                const bool same_view = K.kx == F.kx && K.ky == F.ky && K.f == f;
+                for (int j = 0; j < F.nl; ++j) {
+                    const Parallax::RowSig& o = O[j];
+                    const Parallax::RowSig& n = NS[j];
+                    if (!o.pres && !n.pres) continue;
+                    int a = 0, b = 0;
+                    if (o.pres != n.pres || o.rc != n.rc || o.xs != n.xs || o.xe != n.xe || o.fade != n.fade) {
+                        a = n.pres ? n.xs : o.xs; b = n.pres ? n.xe : o.xe;      // it came, went or changed reach:
+                        if (o.pres && n.pres) { if (o.xs < a) a = o.xs; if (o.xe > b) b = o.xe; }   // both stretches
+                    } else if (n.rc) {
+                        // a pixel's colour depends on the slide only to 1/64 px (the filter's phase); its
+                        // feathered edge, on the full 1/256 px
+                        const bool c = F.soft[j] ? (o.sx != n.sx || o.sy != n.sy)
+                                                 : (((-o.sx) >> 2) != ((-n.sx) >> 2) || ((-o.sy) >> 2) != ((-n.sy) >> 2));
+                        if (c) { a = n.xs; b = n.xe; }
+                    } else if (!same_view) {                    // tilting across the row: pixel by pixel
+                        const Plane& pl = *F.pl[j];
+                        for (int x = n.xs; x < n.xe; ++x) {
+                            const float d = plane_depth_at(pl, (float)x, (float)y);
+                            const float dn = d - f, dold = d - K.f;
+                            const int32_t SXn = (int32_t)(dn * F.kx * 256.0f), SYn = (int32_t)(dn * F.ky * 256.0f);
+                            const int32_t SXo = (int32_t)(dold * K.kx * 256.0f), SYo = (int32_t)(dold * K.ky * 256.0f);
+                            if (F.soft[j] ? (SXn != SXo || SYn != SYo)
+                                          : (((-SXn) >> 2) != ((-SXo) >> 2) || ((-SYn) >> 2) != ((-SYo) >> 2))) chg[x] = 1;
+                        }
+                    }
+                    if (b > a) memset(chg + a, 1, b - a);
+                }
+            }
+        }
         for (int x = x0; x < x1; ++x) {
+            if (reuse && !chg[x]) { o[x - x0] = F.front[y * IMG_W + x]; continue; }
             int rem = 256, ar = 0, ag = 0, ab = 0;
             for (int q = 0; q < na && rem > 0; ++q) {
-                const int j = act[q];
-                if (x < F.lx0[j] || x >= F.lx1[j]) continue;
-                int32_t SX, SY;
-                if (F.flat[j]) { SX = F.sx[j]; SY = F.sy[j]; }
-                else {
-                    float d = plane_depth_at(*F.pl[j], (float)x, (float)y) - f;
-                    SX = (int32_t)(d * F.kx * 256.0f); SY = (int32_t)(d * F.ky * 256.0f);
-                }
-                const int32_t QX = ((int32_t)F.P->zx[x] << 4) - SX, QY = zyq - SY;
-                const int ix = QX >> 8, iy = QY >> 8, fx = QX & 255, fy = QY & 255;
-                int a = 256;
-                if (F.soft[j]) {                        // sub-pixel coverage of the plane's (feathered) silhouette
-                    const int xa = par_clampi(ix, 0, IMG_W - 1), xb = par_clampi(ix + 1, 0, IMG_W - 1);
-                    const int ya = par_clampi(iy, 0, IMG_H - 1), yb = par_clampi(iy + 1, 0, IMG_H - 1);
-                    const uint8_t* S = F.soft[j];
-                    const int s00 = S[ya * IMG_W + xa], s10 = S[ya * IMG_W + xb], s01 = S[yb * IMG_W + xa], s11 = S[yb * IMG_W + xb];
-                    if (!(s00 | s10 | s01 | s11)) continue;
-                    if ((s00 & s10 & s01 & s11) != 255) {
-                        const int fd = F.fade[j];
-                        auto e = [fd](int v) { return v ? 256 - (((256 - (v == 255 ? 256 : v)) * fd) >> 8) : 0; };
-                        const int c00 = e(s00), c10 = e(s10), c01 = e(s01), c11 = e(s11);
-                        a = ((c00 * (256 - fx) + c10 * fx) * (256 - fy) + (c01 * (256 - fx) + c11 * fx) * fy) >> 16;
-                    }
-                    if (a <= 0) continue;
-                }
-                // colour: separable Catmull-Rom over the layer's fill
-                const int16_t* wx = W[fx >> 2];
-                const int32_t key = QY >> 2;
-                const int16_t* wy = W[key & 63];
-                int16_t* V = VB + j * 3 * IMG_W;
-                int32_t* K = KB + j * IMG_W;
+                const Lay& l = L[q];
+                if (x < l.xs || x >= l.xe) continue;
+                const int j = l.j;
                 const uint16_t* fill = F.fill[j];
+                int16_t* V = l.V;
+                int a = 256;
                 int R = 0, G = 0, B = 0;
-                for (int k = 0; k < 4; ++k) {
-                    const int wk = wx[k];
-                    if (!wk) continue;
-                    const int c = par_clampi(ix - 1 + k, 0, IMG_W - 1);
-                    if (K[c] != key) {
-                        int vr = 0, vg = 0, vb = 0;
-                        for (int r = 0; r < 4; ++r) {
-                            const int wr = wy[r];
-                            if (!wr) continue;
-                            const uint16_t v = fill[par_clampi(iy - 1 + r, 0, IMG_H - 1) * IMG_W + c];
-                            vr += wr * (v >> 11); vg += wr * ((v >> 5) & 63); vb += wr * (v & 31);
+                if (l.rc) {
+                    const int32_t QX = ((int32_t)ZX[x] << 4) - l.SX;
+                    const int ix = QX >> 8, fx = QX & 255;
+                    if (F.soft[j]) {                    // sub-pixel coverage of the plane's (feathered) silhouette
+                        int xa, xb;
+                        if ((unsigned)ix < (unsigned)(IMG_W - 1)) { xa = ix; xb = ix + 1; }
+                        else { xa = par_clampi(ix, 0, IMG_W - 1); xb = par_clampi(ix + 1, 0, IMG_W - 1); }
+                        const int s00 = l.sa[xa], s10 = l.sa[xb], s01 = l.sb[xa], s11 = l.sb[xb];
+                        if (!(s00 | s10 | s01 | s11)) continue;
+                        if ((s00 & s10 & s01 & s11) != 255) {
+                            const int fd = F.fade[j];
+                            const int c00 = par_soft_e(s00, fd), c10 = par_soft_e(s10, fd), c01 = par_soft_e(s01, fd), c11 = par_soft_e(s11, fd);
+                            a = ((c00 * (256 - fx) + c10 * fx) * (256 - l.fy) + (c01 * (256 - fx) + c11 * fx) * l.fy) >> 16;
                         }
-                        V[c] = (int16_t)vr; V[IMG_W + c] = (int16_t)vg; V[2 * IMG_W + c] = (int16_t)vb; K[c] = key;
+                        if (a <= 0) continue;
                     }
-                    R += wk * V[c]; G += wk * V[IMG_W + c]; B += wk * V[2 * IMG_W + c];
+                    // The source column grows with x along a row: the columns filtered so far this row are
+                    // exactly up to l.hi, so a pixel only filters the ones past it (no per-tap cache test).
+                    Lay& lm = L[q];
+                    if (lm.hi < ix - 2) lm.hi = ix - 2;
+                    const int16_t* wy = l.wy;
+                    const int wy0 = wy[0], wy1 = wy[1], wy2 = wy[2], wy3 = wy[3];
+                    while (lm.hi < ix + 2) {
+                        const int u = ++lm.hi;
+                        const int c = (unsigned)u < (unsigned)IMG_W ? u : par_clampi(u, 0, IMG_W - 1);
+                        const uint16_t v0 = l.rp[0][c], v1 = l.rp[1][c], v2 = l.rp[2][c], v3 = l.rp[3][c];
+                        V[c] = (int16_t)(wy0 * (v0 >> 11) + wy1 * (v1 >> 11) + wy2 * (v2 >> 11) + wy3 * (v3 >> 11));
+                        V[IMG_W + c] = (int16_t)(wy0 * ((v0 >> 5) & 63) + wy1 * ((v1 >> 5) & 63) + wy2 * ((v2 >> 5) & 63) + wy3 * ((v3 >> 5) & 63));
+                        V[2 * IMG_W + c] = (int16_t)(wy0 * (v0 & 31) + wy1 * (v1 & 31) + wy2 * (v2 & 31) + wy3 * (v3 & 31));
+                    }
+                    const int16_t* wx = W[fx >> 2];
+                    if (ix >= 1 && ix + 2 <= IMG_W - 1) {
+                        const int16_t* vr = V + ix - 1; const int16_t* vg = vr + IMG_W; const int16_t* vb = vg + IMG_W;
+                        R = wx[0] * vr[0] + wx[1] * vr[1] + wx[2] * vr[2] + wx[3] * vr[3];
+                        G = wx[0] * vg[0] + wx[1] * vg[1] + wx[2] * vg[2] + wx[3] * vg[3];
+                        B = wx[0] * vb[0] + wx[1] * vb[1] + wx[2] * vb[2] + wx[3] * vb[3];
+                    } else
+                        for (int k = 0; k < 4; ++k) {
+                            const int c = par_clampi(ix - 1 + k, 0, IMG_W - 1);
+                            R += wx[k] * V[c]; G += wx[k] * V[IMG_W + c]; B += wx[k] * V[2 * IMG_W + c];
+                        }
+                } else {                                // a ramp that tilts across the row: shift per pixel
+                    float d = plane_depth_at(*F.pl[j], (float)x, (float)y) - f;
+                    const int32_t SX = (int32_t)(d * F.kx * 256.0f), SY = (int32_t)(d * F.ky * 256.0f);
+                    const int32_t QX = ((int32_t)ZX[x] << 4) - SX, QY = zyq - SY;
+                    const int ix = QX >> 8, iy = QY >> 8, fx = QX & 255, fy = QY & 255;
+                    if (F.soft[j]) {
+                        const int xa = par_clampi(ix, 0, IMG_W - 1), xb = par_clampi(ix + 1, 0, IMG_W - 1);
+                        const int ya = par_clampi(iy, 0, IMG_H - 1), yb = par_clampi(iy + 1, 0, IMG_H - 1);
+                        const uint8_t* S = F.soft[j];
+                        const int s00 = S[ya * IMG_W + xa], s10 = S[ya * IMG_W + xb], s01 = S[yb * IMG_W + xa], s11 = S[yb * IMG_W + xb];
+                        if (!(s00 | s10 | s01 | s11)) continue;
+                        if ((s00 & s10 & s01 & s11) != 255) {
+                            const int fd = F.fade[j];
+                            const int c00 = par_soft_e(s00, fd), c10 = par_soft_e(s10, fd), c01 = par_soft_e(s01, fd), c11 = par_soft_e(s11, fd);
+                            a = ((c00 * (256 - fx) + c10 * fx) * (256 - fy) + (c01 * (256 - fx) + c11 * fx) * fy) >> 16;
+                        }
+                        if (a <= 0) continue;
+                    }
+                    // Its row position (and so the vertical taps) changes only every few pixels: the columns
+                    // filtered for the current one, lo … hi, are kept until it changes.
+                    Lay& lm = L[q];
+                    const int32_t key = QY >> 2;
+                    if (key != lm.key || ix - 1 < lm.lo || lm.hi < ix - 2) {
+                        if (key != lm.key) {
+                            lm.key = key; lm.wy = W[key & 63];
+                            for (int r = 0; r < 4; ++r) lm.rp[r] = fill + par_clampi(iy - 1 + r, 0, IMG_H - 1) * IMG_W;
+                        }
+                        lm.lo = ix - 1; lm.hi = ix - 2;
+                    }
+                    const int wy0 = lm.wy[0], wy1 = lm.wy[1], wy2 = lm.wy[2], wy3 = lm.wy[3];
+                    while (lm.hi < ix + 2) {
+                        const int u = ++lm.hi;
+                        const int c = (unsigned)u < (unsigned)IMG_W ? u : par_clampi(u, 0, IMG_W - 1);
+                        const uint16_t v0 = lm.rp[0][c], v1 = lm.rp[1][c], v2 = lm.rp[2][c], v3 = lm.rp[3][c];
+                        V[c] = (int16_t)(wy0 * (v0 >> 11) + wy1 * (v1 >> 11) + wy2 * (v2 >> 11) + wy3 * (v3 >> 11));
+                        V[IMG_W + c] = (int16_t)(wy0 * ((v0 >> 5) & 63) + wy1 * ((v1 >> 5) & 63) + wy2 * ((v2 >> 5) & 63) + wy3 * ((v3 >> 5) & 63));
+                        V[2 * IMG_W + c] = (int16_t)(wy0 * (v0 & 31) + wy1 * (v1 & 31) + wy2 * (v2 & 31) + wy3 * (v3 & 31));
+                    }
+                    const int16_t* wx = W[fx >> 2];
+                    for (int k = 0; k < 4; ++k) {
+                        const int c = par_clampi(ix - 1 + k, 0, IMG_W - 1);
+                        R += wx[k] * V[c]; G += wx[k] * V[IMG_W + c]; B += wx[k] * V[2 * IMG_W + c];
+                    }
                 }
                 R = par_clampi(R >> 8, 0, 31 << 8); G = par_clampi(G >> 8, 0, 63 << 8); B = par_clampi(B >> 8, 0, 31 << 8);
                 const int wgt = a * rem >> 8;           // front to back
@@ -602,8 +822,17 @@ inline void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, in
             const uint16_t c = (uint16_t)((par_clampi(r5, 0, 31) << 11) | (par_clampi(g6, 0, 63) << 5) | par_clampi(b5, 0, 31));
             o[x - x0] = (uint16_t)((c >> 8) | (c << 8));
         }
+        if (full) {                                     // the screen's row will be this frame's
+            Parallax::RowSig* O = F.P->rsig + y * (PLANE_MAX + 1);
+            for (int j = 0; j < F.nl; ++j) O[j] = NS[j];
+            for (int j = F.nl; j <= PLANE_MAX; ++j) O[j].pres = 0;
+            Parallax::RowKey& K = F.P->rkey[y];
+            K.kx = F.kx; K.ky = F.ky; K.f = f; K.ok = 1;
+        } else if (F.P->rkey) F.P->rkey[y].ok = 0;      // (part of it only: don't trust the row next time)
     }
 }
+// The screen no longer shows the last frame's rows (the plain photo went up, or something drew over it).
+inline void parallax_forget_screen(Parallax& P) { if (P.rkey) for (int y = 0; y < IMG_H; ++y) P.rkey[y].ok = 0; }
 
 // Where on the picture a tap on the screen lands (the nearest plane showing there).
 inline void parallax_to_content(const Parallax& P, int x, int y, int& qx, int& qy) {

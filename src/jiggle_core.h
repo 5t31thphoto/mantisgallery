@@ -27,6 +27,18 @@
 #include <stddef.h>
 #include <math.h>
 
+// Hot paths on the Core2 (the firmware builds with -Os): the per-pixel helpers below are always inlined
+// (a call per pixel costs more than the helper), and the per-pixel render loops (JIG_HOT) run from
+// internal RAM - instruction fetches then never go through the flash cache, which the PSRAM pictures
+// they stream through also share.
+#define JIG_INLINE inline __attribute__((always_inline))
+#if defined(ESP_PLATFORM) && !defined(MG_NO_IRAM_HOT)   // (~15 KB of IRAM; -DMG_NO_IRAM_HOT to keep them in flash)
+#include <esp_attr.h>
+#define JIG_HOT __attribute__((noinline)) IRAM_ATTR
+#else
+#define JIG_HOT __attribute__((noinline))
+#endif
+
 namespace jig {
 
 enum Shape : uint8_t { SHAPE_ROUND = 0, SHAPE_HALF = 1, SHAPE_TEAR = 2, SHAPE_COUNT = 3 };
@@ -793,13 +805,13 @@ inline void stage_frame(Zone* zs, int n) {
 // Pixels
 // ---------------------------------------------------------------------------------------------
 static constexpr uint32_t MASK_565X = 0x07E0F81Fu;
-inline uint32_t spread565(uint16_t p) { return ((uint32_t)p | ((uint32_t)p << 16)) & MASK_565X; }
-inline uint16_t pack565(uint32_t v) { return (uint16_t)((v | (v >> 16)) & 0xFFFFu); }
-inline uint16_t bswap16(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
-inline uint16_t rd(const uint16_t* p, bool swapped) { return swapped ? bswap16(*p) : *p; }
+JIG_INLINE uint32_t spread565(uint16_t p) { return ((uint32_t)p | ((uint32_t)p << 16)) & MASK_565X; }
+JIG_INLINE uint16_t pack565(uint32_t v) { return (uint16_t)((v | (v >> 16)) & 0xFFFFu); }
+JIG_INLINE uint16_t bswap16(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
+JIG_INLINE uint16_t rd(const uint16_t* p, bool swapped) { return swapped ? bswap16(*p) : *p; }
 
 // Bilinear sample at 8.8 fixed-point coordinates. Returns native RGB565.
-inline uint16_t sample_fx(const uint16_t* src, bool swapped, int32_t sx8, int32_t sy8) {
+JIG_INLINE uint16_t sample_fx(const uint16_t* src, bool swapped, int32_t sx8, int32_t sy8) {
     const int32_t maxx = ((IMG_W - 1) << 8) - 1, maxy = ((IMG_H - 1) << 8) - 1;
     if (sx8 < 0) sx8 = 0; else if (sx8 > maxx) sx8 = maxx;
     if (sy8 < 0) sy8 = 0; else if (sy8 > maxy) sy8 = maxy;
@@ -889,7 +901,7 @@ inline float fold_scale(Zone& z) {
 // Fast renderer: the rectangle [x0,x1)×[y0,y1) into `out` (stride x1−x0), display byte order.
 // Integer maths, one pass per zone over its row span, each pixel sampled once however many zones
 // overlap. `acc` must hold 2·IMG_W int32 of scratch.
-inline void render_rect(const uint16_t* src, bool src_swapped, uint16_t* out,
+inline JIG_HOT void render_rect(const uint16_t* src, bool src_swapped, uint16_t* out,
                         const Zone* zs, const int* ids, int n,
                         int x0, int y0, int x1, int y1, int32_t* acc) {
     int32_t* accx = acc;

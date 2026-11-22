@@ -605,14 +605,15 @@ inline void water_step(Water& w, float dt, const float dn[3], const float jolt[3
 // ---- render -------------------------------------------------------------------------------------
 // Fast and exact: everything smooth at cell scale is interpolated once per row; per pixel it's a few
 // adds, integer-phase table sines (one add per wave per pixel), and the bilinear sample of the photo.
-inline const int16_t* wsin_tab() {                  // sin, Q14, 1024 steps (+1 for the lerp)
-    static int16_t tab[1025];
-    static bool init = false;
-    if (!init) { for (int i = 0; i <= 1024; ++i) tab[i] = (int16_t)lrintf(16384.0f * sinf(6.2831853f * i / 1024.0f)); init = true; }
-    return tab;
+static int16_t s_wsin[1025];                        // sin, Q14, 1024 steps (+1 for the lerp)
+static bool s_wsin_ok = false;
+inline __attribute__((noinline)) const int16_t* wsin_tab() {
+    if (!s_wsin_ok) { for (int i = 0; i <= 1024; ++i) s_wsin[i] = (int16_t)lrintf(16384.0f * sinf(6.2831853f * i / 1024.0f)); s_wsin_ok = true; }
+    return s_wsin;
 }
-inline float wsin_u(uint32_t ph) {                  // ph: a full turn = 2^32
-    const int16_t* T = wsin_tab();
+JIG_INLINE float wsin_u(uint32_t ph) {                  // ph: a full turn = 2^32
+    if (__builtin_expect(!s_wsin_ok, 0)) wsin_tab();   // (built once, at start: a read, not a call, per sine)
+    const int16_t* T = s_wsin;
     const uint32_t i = ph >> 22;
     const int f = (int)((ph >> 12) & 1023);
     const int a = T[i], b = T[i + 1];
@@ -624,12 +625,12 @@ inline uint32_t wturns(float turns) {               // turns (any sign) → phas
 }
 inline float wsin(float a) { return wsin_u(wturns(a * 0.15915494f)); }
 
-inline uint16_t rgb565_mix(uint16_t a, uint16_t b, int t8) {   // t8: 0 → a, 256 → b
+JIG_INLINE uint16_t rgb565_mix(uint16_t a, uint16_t b, int t8) {   // t8: 0 → a, 256 → b
     int ar = a >> 11, ag = (a >> 5) & 63, ab = a & 31, br = b >> 11, bg = (b >> 5) & 63, bb = b & 31;
     int r = ar + (((br - ar) * t8) >> 8), g = ag + (((bg - ag) * t8) >> 8), bl = ab + (((bb - ab) * t8) >> 8);
     return (uint16_t)((r << 11) | (g << 5) | bl);
 }
-inline uint16_t rgb565_brighten(uint16_t c, float k) {          // toward white by k (0..1)
+JIG_INLINE uint16_t rgb565_brighten(uint16_t c, float k) {          // toward white by k (0..1)
     int r = c >> 11, g = (c >> 5) & 63, b = c & 31;
     r += (int)((31 - r) * k); g += (int)((63 - g) * k); b += (int)((31 - b) * k);
     return (uint16_t)((r << 11) | (g << 5) | b);
@@ -648,137 +649,189 @@ inline void water_clamp(const Water& w, int x, int y, float& ox, float& oy) {
 // out_swapped byte order — sampling the untouched photo `src` (src_swapped order). Only water pixels
 // are written.
 // lane: 0 or 1 — which core's scratch rows to use (two cores can render different rows at once).
-inline uint16_t rgb565_scale(uint16_t c, float f) {             // brightness × f (clamped)
+JIG_INLINE uint16_t rgb565_scale(uint16_t c, float f) {             // brightness × f (clamped)
     int r = (int)((c >> 11) * f), g = (int)(((c >> 5) & 63) * f), b = (int)((c & 31) * f);
     r = r > 31 ? 31 : r; g = g > 63 ? 63 : g; b = b > 31 ? 31 : b;
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
-inline void water_render(const Water& w, const uint16_t* src, bool src_swapped, uint16_t* out, bool out_swapped,
-                         int x0, int y0, int x1, int y1, int lane = 0) {
-    if (!w.edge) return;
-    constexpr int NC = IMG_W / WCELL + 4;
-    static float sRX[2][NC], sRY[2][NC], sGX[2][NC], sGY[2][NC], sA[2][NC], sB[2][NC], sC[2][NC];
-    lane &= 1;
-    float *rRX = sRX[lane], *rRY = sRY[lane], *rGX = sGX[lane], *rGY = sGY[lane], *rA = sA[lane], *rB = sB[lane], *rC = sC[lane];
-    const float t = w.t, al = w.alpha;
-    const float rk = W_RIP_K * wprm(w, WP_RIPPLE);
-    const float slx = w.sx * 0.5f, sly = w.sy * 0.5f;
+// Water is drawn in three steps: what holds for the whole frame (WFrame), for one row (WRow), and then
+// each pixel. water_render runs them over the picture; the depth view runs them for the pixels on screen,
+// sampling each at the exact spot the view slid it to (one resample - not water drawn, then resampled).
+constexpr int W_NC = IMG_W / WCELL + 4;
+struct WFrame {
+    float t, al, rk, slx, sly, hz, span_h, amb0, glint, light, foam_k;
+    bool ocean, river;
+    float tT, ospc, oA0;
+    float k1, k2; int mix8;
+    const float* sgx = nullptr;                      // (optional) the ripple field as it stands this frame,
+    const float* sgy = nullptr;                      //   blended between steps - held for the whole frame
+};
+// That snapshot: gw·gh blended slopes each, exactly as water_row_setup would blend them live.
+inline void water_snapshot(const Water& w, float* sgx, float* sgy) {
+    const float al = w.alpha;
+    for (int k = 0; k < w.gw * w.gh; ++k) {
+        sgx[k] = w.gxp[k] + (w.gx[k] - w.gxp[k]) * al;
+        sgy[k] = w.gyp[k] + (w.gy[k] - w.gyp[k]) * al;
+    }
+}
+struct WRow {
+    int y = -1, ry;                                  // the picture row it's for (-1: none yet)
+    const Water* w = nullptr;
+    float Aamb, inv_lam, half_lam, lam, oA, oA8, oAr, oAr1;
+    int32_t d1, d2, d3;
+    uint32_t b1, b2, b3;
+    float rRX[W_NC], rRY[W_NC], rGX[W_NC], rGY[W_NC], rA[W_NC], rB[W_NC], rC[W_NC];
+};
+inline void water_frame_setup(const Water& w, WFrame& F) {
+    F.t = w.t; F.al = w.alpha;
+    F.rk = W_RIP_K * wprm(w, WP_RIPPLE);
+    F.slx = w.sx * 0.5f; F.sly = w.sy * 0.5f;
     float hz = wprm(w, WP_HORIZON);
     if (hz < 0) hz = (w.ghz > -200.0f && w.ghz < (float)(w.by + w.bh)) ? w.ghz : (float)w.by;   // the grid's, if any
-    const float bottom = (float)(w.by + w.bh), span_h = bottom - hz > 1 ? bottom - hz : 1.0f;
-    const float amb0 = wprm(w, WP_AMB) * W_AMB_PX;
-    const float glint = wprm(w, WP_GLINT);
-    const float light = wprm(w, WP_LIGHT), foam_k = wprm(w, WP_FOAM);
-    const bool ocean = w.mode == W_OCEAN && w.od, river = w.mode == W_RIVER && w.fx;
+    F.hz = hz;
+    const float bottom = (float)(w.by + w.bh);
+    F.span_h = bottom - hz > 1 ? bottom - hz : 1.0f;
+    F.amb0 = wprm(w, WP_AMB) * W_AMB_PX;
+    F.glint = wprm(w, WP_GLINT);
+    F.light = wprm(w, WP_LIGHT); F.foam_k = wprm(w, WP_FOAM);
+    F.ocean = w.mode == W_OCEAN && w.od; F.river = w.mode == W_RIVER && w.fx;
     // ocean (per frame)
     const float oT = W_OCEAN_T / wprm(w, WP_SPEED);
     const float oenv = 1.0f + wprm(w, WP_SETS) * 0.6f * wsin(6.2831853f * w.set_ph);
-    const float oA0 = W_OCEAN_A * wprm(w, WP_SIZE) * oenv, ospc = wprm(w, WP_SPACING);
-    float tT = t / oT; tT -= floorf(tT);
-    const float c06 = 0.82533561f, s06 = 0.56464247f;            // cos 0.6, sin 0.6
+    F.oA0 = W_OCEAN_A * wprm(w, WP_SIZE) * oenv; F.ospc = wprm(w, WP_SPACING);
+    float tT = F.t / oT; tT -= floorf(tT);
+    F.tT = tT;
     // river (per frame)
     const float rsp = W_RIVER_PX * wprm(w, WP_SPEED) * W_RIVER_T;
-    float f1 = t / W_RIVER_T; f1 -= floorf(f1);
+    float f1 = F.t / W_RIVER_T; f1 -= floorf(f1);
     float f2 = f1 + 0.5f; f2 -= floorf(f2);
-    const float k1 = -(f1 - 0.5f) * rsp, k2 = -(f2 - 0.5f) * rsp;
-    const int mix8 = (int)(fabsf(2.0f * f1 - 1.0f) * 256.0f);
+    F.k1 = -(f1 - 0.5f) * rsp; F.k2 = -(f2 - 0.5f) * rsp;
+    F.mix8 = (int)(fabsf(2.0f * f1 - 1.0f) * 256.0f);
+}
+// per row: perspective, wave phases, and the cell fields blended between cell rows (y: a row of the water)
+inline void water_row_setup(const Water& w, const WFrame& F, int y, WRow& R) {
     const float TURN = 4294967296.0f / 6.2831853f;
+    R.y = y; R.ry = y - w.by; R.w = &w;
+    const float t = F.t, al = F.al;
+    float p = (y - F.hz) / F.span_h;
+    p = p < 0.15f ? 0.15f : (p > 1 ? 1 : p);
+    const float ip = 1.0f / p;
+    R.Aamb = F.amb0 * p;
+    R.d1 = (int32_t)(0.05f * ip * TURN); R.d2 = (int32_t)(-0.08f * ip * TURN); R.d3 = (int32_t)(0.07f * ip * TURN);
+    R.b1 = wturns((y * 0.13f * ip - 1.4f * t) * 0.15915494f);
+    R.b2 = wturns((y * 0.19f * ip - 2.1f * t + 1.7f) * 0.15915494f);
+    R.b3 = wturns((-y * 0.06f * ip + 1.2f * t) * 0.15915494f);
+    const float v = R.ry / (float)WCELL + 0.5f;
+    int j = (int)v; if (j > w.gh - 2) j = w.gh - 2;
+    float fy = v - j; fy = fy < 0 ? 0 : (fy > 1 ? 1 : fy);
+    const float gy0 = 1.0f - fy;
+    for (int i = 0; i < w.gw; ++i) {
+        const int ka = j * w.gw + i, kb = ka + w.gw;
+        float gxa, gxb, gya, gyb;
+        if (F.sgx) { gxa = F.sgx[ka]; gxb = F.sgx[kb]; gya = F.sgy[ka]; gyb = F.sgy[kb]; }
+        else {
+            gxa = w.gxp[ka] + (w.gx[ka] - w.gxp[ka]) * al; gxb = w.gxp[kb] + (w.gx[kb] - w.gxp[kb]) * al;
+            gya = w.gyp[ka] + (w.gy[ka] - w.gyp[ka]) * al; gyb = w.gyp[kb] + (w.gy[kb] - w.gyp[kb]) * al;
+        }
+        R.rGX[i] = gxa * gy0 + gxb * fy; R.rGY[i] = gya * gy0 + gyb * fy;
+        R.rRX[i] = R.rGX[i] * F.rk; R.rRY[i] = R.rGY[i] * F.rk;
+        if (F.ocean) { R.rA[i] = w.od[ka] * gy0 + w.od[kb] * fy; R.rB[i] = w.onx[ka] * gy0 + w.onx[kb] * fy; R.rC[i] = w.ony[ka] * gy0 + w.ony[kb] * fy; }
+        else if (F.river) { R.rA[i] = w.fx[ka] * gy0 + w.fx[kb] * fy; R.rB[i] = w.fy[ka] * gy0 + w.fy[kb] * fy; }
+    }
+    R.lam = w.oworld ? F.ospc : F.ospc * (p > 0.3f ? p : 0.3f);   // (on the surface: one spacing)
+    R.inv_lam = 1.0f / R.lam; R.half_lam = R.lam * 0.5f; R.oA = F.oA0 * p;
+    R.oA8 = R.oA * 0.8f; R.oAr = R.oA / W_OCEAN_A; R.oAr1 = R.oAr > 1 ? 1 : R.oAr;   // (per row, not per pixel)
+}
+// One water pixel (x, R.y), its colour (native RGB565). P1..P3: its wave phases (b + d·x). The picture is
+// sampled around (sx, sy): x, y themselves - or, on the depth view, where the view slid that pixel to.
+// at_pixel: (sx, sy) is exactly (x, y) (an unshifted pixel is then just read).
+JIG_INLINE uint16_t water_pixel(const Water& w, const WFrame& F, const WRow& R, int x, uint32_t P1, uint32_t P2, uint32_t P3,
+                                float sx, float sy, bool at_pixel, const uint16_t* src, bool src_swapped) {
+    const int y = R.y;
+    const float e = w.edge[R.ry * w.bw + x - w.bx] * (1.0f / 255.0f);
+    const float u = (x - w.bx) * (1.0f / WCELL) + 0.5f;
+    int i = (int)u; if (i > w.gw - 2) i = w.gw - 2;
+    const float fx = u - i, fx0 = 1.0f - fx;
+    const float gxr = R.rGX[i] * fx0 + R.rGX[i + 1] * fx, gyr = R.rGY[i] * fx0 + R.rGY[i + 1] * fx;
+    float shade = 1.0f - F.light * W_RIP_SHADE * gyr * (F.rk > 0 ? 1.0f : 0.0f);   // painted light (optional)
+    float foam = 0.0f;
+    float dx = R.Aamb * 0.35f * wsin_u(P3) + R.rRX[i] * fx0 + R.rRX[i + 1] * fx + F.slx;
+    float dy = R.Aamb * (0.6f * wsin_u(P1) + 0.4f * wsin_u(P2)) + R.rRY[i] * fx0 + R.rRY[i + 1] * fx + F.sly;
+    if (F.ocean) {
+        const float c06 = 0.82533561f, s06 = 0.56464247f;            // cos 0.6, sin 0.6
+        const float d = R.rA[i] * fx0 + R.rA[i + 1] * fx, nx = R.rB[i] * fx0 + R.rB[i + 1] * fx, ny = R.rC[i] * fx0 + R.rC[i + 1] * fx;
+        float q = d * R.inv_lam + F.tT;
+        q -= (float)(int)q;
+        const uint32_t U = (uint32_t)(q * 4294967296.0f);
+        const float sp_ = wsin_u(U), cp = wsin_u(U + 0x40000000u);
+        const float s2 = 2.0f * sp_ * cp * c06 - (cp * cp - sp_ * sp_) * s06;   // sin(2φ − 0.6)
+        dy -= R.oA8 * (sp_ + 0.35f * s2);
+        float push = R.oA * 0.6f * cp;
+        if (d < R.half_lam && sp_ > 0) push += R.oA8 * sp_ * (1.0f - d / R.half_lam);
+        dx += nx * push; dy += ny * push;
+        // optional painted light: the slope of the swell (d/dφ of its height) — backs lighter, faces darker
+        const float c2 = (cp * cp - sp_ * sp_) * c06 + 2.0f * sp_ * cp * s06;   // cos(2φ − 0.6)
+        shade += F.light * W_OCEAN_SHADE * R.oAr * (cp + 0.7f * c2);
+        // foam where the swells break near the shore line
+        const float zone = R.lam * 0.6f;
+        if (F.foam_k > 0 && d < zone && sp_ > 0.7f) foam = F.foam_k * (sp_ - 0.7f) * 3.3f * (1.0f - d / zone) * R.oAr1;
+    }
+    dx *= e; dy *= e;
+    const float lim = (float)w.dsafe[R.ry * w.bw + x - w.bx] - 1.0f;   // shorter shifts can't reach the bank
+    uint16_t c;
+    if (F.river) {
+        const float fxv = (R.rA[i] * fx0 + R.rA[i + 1] * fx) * e, fyv = (R.rB[i] * fx0 + R.rB[i + 1] * fx) * e;
+        float ax = dx + fxv * F.k1, ay = dy + fyv * F.k1, bx = dx + fxv * F.k2, by = dy + fyv * F.k2;
+        if (fabsf(ax) + fabsf(ay) >= lim) water_clamp(w, x, y, ax, ay);
+        if (fabsf(bx) + fabsf(by) >= lim) water_clamp(w, x, y, bx, by);
+        const uint16_t c1 = sample_fx(src, src_swapped, (int32_t)((sx + ax) * 256.0f), (int32_t)((sy + ay) * 256.0f));
+        const uint16_t c2 = sample_fx(src, src_swapped, (int32_t)((sx + bx) * 256.0f), (int32_t)((sy + by) * 256.0f));
+        c = rgb565_mix(c1, c2, F.mix8);
+    } else {
+        if (fabsf(dx) + fabsf(dy) >= lim) water_clamp(w, x, y, dx, dy);
+        if (dx == 0.0f && dy == 0.0f && at_pixel) c = src_swapped ? bswap16(src[y * IMG_W + x]) : src[y * IMG_W + x];
+        else c = sample_fx(src, src_swapped, (int32_t)((sx + dx) * 256.0f), (int32_t)((sy + dy) * 256.0f));
+    }
+    if (shade < 0.995f || shade > 1.005f) c = rgb565_scale(c, shade * e + (1.0f - e));
+    if (foam > 0.01f) c = rgb565_brighten(c, (foam > 0.85f ? 0.85f : foam) * e);
+    if (F.glint > 0) {                                   // light caught on a steep ripple
+        const float sl2 = gxr * gxr + gyr * gyr;
+        if (sl2 > 324.0f) {
+            const int lum = ((c >> 11) * 8 + ((c >> 5) & 63) * 4 + (c & 31) * 8) / 3;
+            if (lum > 120) {
+                float k = (sqrtf(sl2) - 18.0f) * (1.0f / 40.0f);
+                k = (k > 1 ? 1 : k) * F.glint * e * (lum * (1.0f / 255.0f));
+                c = rgb565_brighten(c, k);
+            }
+        }
+    }
+    return c;
+}
+// fr: the frame to draw (a snapshot taken earlier: the depth view draws one water moment a frame); else now.
+inline JIG_HOT void water_render(const Water& w, const uint16_t* src, bool src_swapped, uint16_t* out, bool out_swapped,
+                         int x0, int y0, int x1, int y1, int lane = 0, const WFrame* fr = nullptr) {
+    if (!w.edge) return;
+    static WRow sR[2];
+    WRow& R = sR[lane & 1];
+    WFrame Fnow;
+    if (!fr) water_frame_setup(w, Fnow);
+    const WFrame& F = fr ? *fr : Fnow;
     if (y0 < w.by) y0 = w.by;
     if (y1 > w.by + w.bh) y1 = w.by + w.bh;
     for (int y = y0; y < y1; ++y) {
         const int ry = y - w.by;
         const int s0 = w.sp_off[ry], s1 = w.sp_off[ry + 1];
         if (s0 == s1) continue;
-        // per row: perspective, wave phases, and the cell fields blended between cell rows
-        float p = (y - hz) / span_h;
-        p = p < 0.15f ? 0.15f : (p > 1 ? 1 : p);
-        const float ip = 1.0f / p, Aamb = amb0 * p;
-        const int32_t d1 = (int32_t)(0.05f * ip * TURN), d2 = (int32_t)(-0.08f * ip * TURN), d3 = (int32_t)(0.07f * ip * TURN);
-        const uint32_t b1 = wturns((y * 0.13f * ip - 1.4f * t) * 0.15915494f);
-        const uint32_t b2 = wturns((y * 0.19f * ip - 2.1f * t + 1.7f) * 0.15915494f);
-        const uint32_t b3 = wturns((-y * 0.06f * ip + 1.2f * t) * 0.15915494f);
-        const float v = ry / (float)WCELL + 0.5f;
-        int j = (int)v; if (j > w.gh - 2) j = w.gh - 2;
-        float fy = v - j; fy = fy < 0 ? 0 : (fy > 1 ? 1 : fy);
-        const float gy0 = 1.0f - fy;
-        for (int i = 0; i < w.gw; ++i) {
-            const int ka = j * w.gw + i, kb = ka + w.gw;
-            const float gxa = w.gxp[ka] + (w.gx[ka] - w.gxp[ka]) * al, gxb = w.gxp[kb] + (w.gx[kb] - w.gxp[kb]) * al;
-            const float gya = w.gyp[ka] + (w.gy[ka] - w.gyp[ka]) * al, gyb = w.gyp[kb] + (w.gy[kb] - w.gyp[kb]) * al;
-            rGX[i] = gxa * gy0 + gxb * fy; rGY[i] = gya * gy0 + gyb * fy;
-            rRX[i] = rGX[i] * rk; rRY[i] = rGY[i] * rk;
-            if (ocean) { rA[i] = w.od[ka] * gy0 + w.od[kb] * fy; rB[i] = w.onx[ka] * gy0 + w.onx[kb] * fy; rC[i] = w.ony[ka] * gy0 + w.ony[kb] * fy; }
-            else if (river) { rA[i] = w.fx[ka] * gy0 + w.fx[kb] * fy; rB[i] = w.fy[ka] * gy0 + w.fy[kb] * fy; }
-        }
-        const float lam = w.oworld ? ospc : ospc * (p > 0.3f ? p : 0.3f);   // (on the surface: one spacing)
-        const float inv_lam = 1.0f / lam, half_lam = lam * 0.5f, oA = oA0 * p;
-        const uint8_t* er = w.edge + ry * w.bw - w.bx;
-        const uint8_t* ds = w.dsafe + ry * w.bw - w.bx;
-        const uint16_t* srow = src + y * IMG_W;
+        water_row_setup(w, F, y, R);
         uint16_t* orow = out + y * IMG_W;
         for (int sidx = s0; sidx < s1; ++sidx) {
             int xa = w.sp[2 * sidx], xb = w.sp[2 * sidx + 1];
             if (xa < x0) xa = x0;
             if (xb > x1) xb = x1;
             if (xa >= xb) continue;
-            uint32_t P1 = b1 + (uint32_t)(d1 * xa), P2 = b2 + (uint32_t)(d2 * xa), P3 = b3 + (uint32_t)(d3 * xa);
-            for (int x = xa; x < xb; ++x, P1 += (uint32_t)d1, P2 += (uint32_t)d2, P3 += (uint32_t)d3) {
-                const float e = er[x] * (1.0f / 255.0f);
-                const float u = (x - w.bx) * (1.0f / WCELL) + 0.5f;
-                int i = (int)u; if (i > w.gw - 2) i = w.gw - 2;
-                const float fx = u - i, fx0 = 1.0f - fx;
-                const float gxr = rGX[i] * fx0 + rGX[i + 1] * fx, gyr = rGY[i] * fx0 + rGY[i + 1] * fx;
-                float shade = 1.0f - light * W_RIP_SHADE * gyr * (rk > 0 ? 1.0f : 0.0f);   // painted light (optional)
-                float foam = 0.0f;
-                float dx = Aamb * 0.35f * wsin_u(P3) + rRX[i] * fx0 + rRX[i + 1] * fx + slx;
-                float dy = Aamb * (0.6f * wsin_u(P1) + 0.4f * wsin_u(P2)) + rRY[i] * fx0 + rRY[i + 1] * fx + sly;
-                if (ocean) {
-                    const float d = rA[i] * fx0 + rA[i + 1] * fx, nx = rB[i] * fx0 + rB[i + 1] * fx, ny = rC[i] * fx0 + rC[i + 1] * fx;
-                    float q = d * inv_lam + tT;
-                    q -= (float)(int)q;
-                    const uint32_t U = (uint32_t)(q * 4294967296.0f);
-                    const float sp_ = wsin_u(U), cp = wsin_u(U + 0x40000000u);
-                    const float s2 = 2.0f * sp_ * cp * c06 - (cp * cp - sp_ * sp_) * s06;   // sin(2φ − 0.6)
-                    dy -= oA * 0.8f * (sp_ + 0.35f * s2);
-                    float push = oA * 0.6f * cp;
-                    if (d < half_lam && sp_ > 0) push += oA * 0.8f * sp_ * (1.0f - d / half_lam);
-                    dx += nx * push; dy += ny * push;
-                    // optional painted light: the slope of the swell (d/dφ of its height) — backs lighter, faces darker
-                    const float c2 = (cp * cp - sp_ * sp_) * c06 + 2.0f * sp_ * cp * s06;   // cos(2φ − 0.6)
-                    shade += light * W_OCEAN_SHADE * (oA / W_OCEAN_A) * (cp + 0.7f * c2);
-                    // foam where the swells break near the shore line
-                    const float zone = lam * 0.6f;
-                    if (foam_k > 0 && d < zone && sp_ > 0.7f) foam = foam_k * (sp_ - 0.7f) * 3.3f * (1.0f - d / zone) * (oA / W_OCEAN_A > 1 ? 1 : oA / W_OCEAN_A);
-                }
-                dx *= e; dy *= e;
-                const float lim = (float)ds[x] - 1.0f;           // shorter shifts can't reach the bank
-                uint16_t c;
-                if (river) {
-                    const float fxv = (rA[i] * fx0 + rA[i + 1] * fx) * e, fyv = (rB[i] * fx0 + rB[i + 1] * fx) * e;
-                    float ax = dx + fxv * k1, ay = dy + fyv * k1, bx = dx + fxv * k2, by = dy + fyv * k2;
-                    if (fabsf(ax) + fabsf(ay) >= lim) water_clamp(w, x, y, ax, ay);
-                    if (fabsf(bx) + fabsf(by) >= lim) water_clamp(w, x, y, bx, by);
-                    const uint16_t c1 = sample_fx(src, src_swapped, (int32_t)((x + ax) * 256.0f), (int32_t)((y + ay) * 256.0f));
-                    const uint16_t c2 = sample_fx(src, src_swapped, (int32_t)((x + bx) * 256.0f), (int32_t)((y + by) * 256.0f));
-                    c = rgb565_mix(c1, c2, mix8);
-                } else {
-                    if (fabsf(dx) + fabsf(dy) >= lim) water_clamp(w, x, y, dx, dy);
-                    if (dx == 0.0f && dy == 0.0f) c = src_swapped ? bswap16(srow[x]) : srow[x];
-                    else c = sample_fx(src, src_swapped, (int32_t)((x + dx) * 256.0f), (int32_t)((y + dy) * 256.0f));
-                }
-                if (shade < 0.995f || shade > 1.005f) c = rgb565_scale(c, shade * e + (1.0f - e));
-                if (foam > 0.01f) c = rgb565_brighten(c, (foam > 0.85f ? 0.85f : foam) * e);
-                if (glint > 0) {                                   // light caught on a steep ripple
-                    const float sl2 = gxr * gxr + gyr * gyr;
-                    if (sl2 > 324.0f) {
-                        const int lum = ((c >> 11) * 8 + ((c >> 5) & 63) * 4 + (c & 31) * 8) / 3;
-                        if (lum > 120) {
-                            float k = (sqrtf(sl2) - 18.0f) * (1.0f / 40.0f);
-                            k = (k > 1 ? 1 : k) * glint * e * (lum * (1.0f / 255.0f));
-                            c = rgb565_brighten(c, k);
-                        }
-                    }
-                }
+            uint32_t P1 = R.b1 + (uint32_t)R.d1 * (uint32_t)xa, P2 = R.b2 + (uint32_t)R.d2 * (uint32_t)xa, P3 = R.b3 + (uint32_t)R.d3 * (uint32_t)xa;
+            for (int x = xa; x < xb; ++x, P1 += (uint32_t)R.d1, P2 += (uint32_t)R.d2, P3 += (uint32_t)R.d3) {
+                const uint16_t c = water_pixel(w, F, R, x, P1, P2, P3, (float)x, (float)y, true, src, src_swapped);
                 orow[x] = out_swapped ? bswap16(c) : c;
             }
         }

@@ -732,6 +732,19 @@ class StudioTab(tk.Frame):
                         LIME if len(sw.arm) == SW.HIP_POINTS else YEL, bg=PANEL).pack(side="left")
             self._btn(hr, "Hips tool  H", lambda: self.set_tool("hips")).pack(side="left", padx=4)
             self._btn(hr, "Re-fit", lambda: self._do(self.st.fit_hips)).pack(side="left")
+            br = tk.Frame(f, bg=PANEL); br.pack(fill="x", pady=(4, 0))
+            self._label(br, "Seen from", FG, bg=PANEL).pack(side="left")
+            self._btn(br, "the front", lambda: self._do(lambda: self.st.set_back(False)), "" if sw.back else "on").pack(side="left", padx=(4, 1))
+            self._btn(br, "behind", lambda: self._do(lambda: self.st.set_back(True)), "on" if sw.back else "").pack(side="left", padx=1)
+        if sw.kind in ("cloth", "hair"):
+            ur = tk.Frame(f, bg=PANEL); ur.pack(fill="x", pady=(6, 0))
+            has = sw.under is not None
+            self._label(ur, "Under it: " + ("your layer ✓" if has else ("made up (skin, white bikini bottom)" if sw.kind == "cloth" else "made up from around it")),
+                        LIME if has else FG, bg=PANEL, wraplength=330).pack(fill="x")
+            ur2 = tk.Frame(f, bg=PANEL); ur2.pack(fill="x", pady=(2, 0))
+            self._btn(ur2, "Load what's under it…", self._load_under, "teal").pack(side="left")
+            if has:
+                self._btn(ur2, "Clear", lambda: self._do(self.st.clear_under)).pack(side="left", padx=4)
         if ng:
             self._btn(row, "Remove last", lambda: self._do(self.st.undo_guide)).pack(side="left", padx=4)
             self._btn(row, "Clear", lambda: self._do(self.st.clear_guides)).pack(side="left", padx=4)
@@ -741,6 +754,17 @@ class StudioTab(tk.Frame):
                 continue
             self._slider(f, label, lo, hi, 0.01, lambda k=key: sw.get(k), lambda v, k=key: self.st.set_sway(k, v))
         self._sway_help(self.sway_box)
+
+    def _load_under(self):
+        p = filedialog.askopenfilename(parent=self, title="What's under it: the same picture without it (your layer)",
+                                       filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All", "*.*")])
+        if not p:
+            return
+        if self._do(lambda: self.st.load_under(p)) is False:
+            messagebox.showerror("Under it", "Couldn't use that picture.", parent=self)
+            return
+        self._hint("Its fill now comes from your layer (laid out as the photo was). It's only used to make the fill - "
+                   "the .jig carries the fill, the layer itself isn't saved.")
 
     def _sway_help(self, parent):
         f = self._section(parent, "THE THREE KINDS")
@@ -821,14 +845,21 @@ class StudioTab(tk.Frame):
                                             initialfile=(Path(self.st.ed.mg_path).stem if self.st.ed.mg_path else "preview") + "_preview.gif")
         if not path:
             return
-        self._hint("Recording the preview (tilt, sway, shake, walk, dance)… it takes a little while.")
+        import mg_preview as MP
+        names = list(MP.SCRIPTS)
+        pick = simpledialog.askinteger("Record the preview", "Which motions?\n" + "\n".join(f"  {i + 1}. {n}" for i, n in enumerate(names)),
+                                       parent=self, initialvalue=1, minvalue=1, maxvalue=len(names))
+        if not pick:
+            return
+        script, secs = MP.SCRIPTS[names[pick - 1]]
+        self._hint(f"Recording the preview ({names[pick - 1]})… it takes a little while.")
         st = self.st
+        tilt, lean = float(self.tilt.get()), float(self.lean.get())        # (from where the controls are held)
 
         def work():
             try:
-                import mg_preview as MP
                 sim = st.sim()
-                fr = list(MP.frames(sim, seconds=17.0, fps=15))
+                fr = list(MP.frames(sim, script=script, seconds=secs, fps=15, tilt=tilt, lean=lean))
                 MP.write(path, fr, fps=15)
                 msg = f"Saved {len(fr)} frames: {path}"
             except Exception as ex:                          # (shown, never raised on the Tk thread)
@@ -1739,9 +1770,10 @@ class StudioTab(tk.Frame):
                 flat = [v * k for p in pts for v in p]
                 c.create_line(*flat, *flat[:2], fill="#ff6fae" if on else "#a0587a", width=2 if on else 1, dash=() if on else (3, 3), tags="ov")
                 if on:
-                    q = SW.bikini_poly(pts)                 # (safety: never skin here - a white bikini bottom)
-                    fq = [v * k for p in q for v in p]
-                    c.create_line(*fq, *fq[:2], fill="#ffffff", dash=(2, 2), width=1, tags="ov")
+                    if L.obj.under is None:                 # (safety: never skin here - a white bikini bottom)
+                        q = SW.bikini_poly(pts, L.obj.back)
+                        fq = [v * k for p in q for v in p]
+                        c.create_line(*fq, *fq[:2], fill="#ffffff", dash=(2, 2), width=1, tags="ov")
                     for i, (x, y) in enumerate(pts):
                         c.create_oval(x * k - 5, y * k - 5, x * k + 5, y * k + 5, fill="#000", outline="#ff6fae", width=2, tags="ov")
         for M in st.layers():                               # sway guides (the active one's)

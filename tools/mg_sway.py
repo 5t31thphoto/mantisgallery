@@ -46,6 +46,9 @@ ON_BODY_REVEAL = 0.3                # lying on the body: it moves at most this Ã
 BIND_MAX = 12.0                     # hair farther than this from every lock isn't carried (it stays)
 EXT_MAX = 6.0                       # a lock's strip runs at most this far past its tip
 FREE_SWING = math.radians(30)       # hanging free: at most about this far round from its pin
+PUSH_K = 45.0                       # a jiggling form under a skirt (a zone on her) drags the cloth on it along
+                                    # (per second: how fast the cloth there takes up the form's motion)
+HAIR_HOLD = 0.25                    # hair keeps a little more of its own shape (its curl, its springiness)
 CLOTH_HOLD = 0.1                    # a skirt holds its shape by gravity: its pull to the photo's pose scales with
                                     # how much of gravity still points down the picture (fabric's own stiffness: this floor)
 CLOTH_SWING = math.pi               # a skirt: no limit - turned upside down it falls right up (only her hips stop it)
@@ -72,13 +75,16 @@ class Sway:
     name: str = ""                          # the Studio's layer name
     on: str = ""                            # the figure it rests on / collides with (its layer name)
     arm: list = field(default_factory=list)  # cloth: her hips under it, lined up by you (HIP_POINTS points; [] = fitted)
+    back: bool = False                      # cloth: she's seen from behind (the bikini bottom's shape)
+    under: object = None                    # (Studio only, never saved) what's really under it: (H, W, 3) - its fill
+                                            #   comes from this instead (an artist's own layer of the same picture)
 
     def get(self, k):
         return self.prm.get(k, SDEF[k])
 
     def copy(self):
         return Sway(self.kind, None if self.mask is None else self.mask.copy(), [list(g) for g in self.guides], dict(self.prm),
-                    self.name, self.on, [tuple(p) for p in self.arm])
+                    self.name, self.on, [tuple(p) for p in self.arm], self.back, self.under)
 
     def ok(self):
         if self.mask is None or self.mask.sum() < 12 or not self.guides:
@@ -246,7 +252,7 @@ def fit_hips(skirt, body=None, waist=None):
             (ri, float(bot)), (ro, float(bot)), (hr, yh), (wb, float(top))]
 
 
-def bikini_zone(pts):
+def bikini_zone(pts, back=False):
     """Safety: the bikini area of the hips' outline - round the point between the legs (node 4), from a
     little above it down past it, as wide as the gap between the legs and a bit more. Wherever a skirt
     swinging away would show skin there, it shows a white bikini bottom instead (with pink polka dots).
@@ -254,30 +260,31 @@ def bikini_zone(pts):
     from PIL import Image, ImageDraw
     m = Image.new("L", (W, H), 0)
     if len(pts) == HIP_POINTS:
-        q = bikini_poly(pts)
+        q = bikini_poly(pts, back)
         ImageDraw.Draw(m).polygon(q, fill=1)
     return np.asarray(m, bool)
 
 
-def bikini_poly(pts):
+def bikini_poly(pts, back=False):
     """A bikini bottom on the hips' outline: its top edge low across the hips (at the hip line, the
     full width of the outline there), the sides curving in like leg openings, down to a narrow panel
-    just past the point between the legs (node 4)."""
+    just past the point between the legs (node 4). Seen from behind (back): the seat - its top a little
+    higher, the sides falling more steeply (a cheeky cut), a wider panel at the bottom."""
     (w0x, w0y), (h0x, h0y), (l0x, l0y), (lix, liy), (cx, cy), (rix, riy), (r0x, r0y), (h1x, h1y), (w1x, w1y) = pts
     hy = (h0y + h1y) / 2
-    ty = hy + 0.1 * max(2.0, cy - hy)                  # its top: just under the hip line
+    ty = hy + (-0.05 if back else 0.1) * max(2.0, cy - hy)   # its top: just under the hip line
     def side(ax, ay, bx, by):                          # the outline's x at height ty, along a side
         return ax + (bx - ax) * ((ty - ay) / (by - ay) if by != ay else 0.0)
     xl = side(h0x, h0y, l0x, l0y) + 1.0
     xr = side(h1x, h1y, r0x, r0y) - 1.0
     gap = max(3.0, rix - lix)
     by = cy + 0.5                                      # down to the point between the legs
-    wb = min(gap * 0.3 + 1.0, 3.0)                     # the narrow panel there
+    wb = min(gap * 0.6 + 2.0, 6.0) if back else min(gap * 0.3 + 1.0, 3.0)   # the panel there
     left, right = [], []
     for k in range(6):                                 # leg openings: steep at first, then in
         t = k / 5
         y = ty + (by - ty) * t
-        f = (1 - t) ** 1.6
+        f = (1 - t) ** (1.1 if back else 1.6)
         left.append((cx - wb - (cx - wb - xl) * f, y))
         right.append((cx + wb + (xr - cx - wb) * f, y))
     return left + right[::-1]
@@ -328,7 +335,7 @@ def skin_tone(photo, legs, body, above=None):
     return np.array([224.0, 172.0, 140.0], np.float32)
 
 
-def cloth_fill(photo, hole, forbid, skirt=None, body=None, hips=None):
+def cloth_fill(photo, hole, forbid, skirt=None, body=None, hips=None, back=False):
     """Behind a skirt, as it really is behind one (object permanence) - so it can swing, fly or fall
     right up (turned upside down) and what shows is always true:
     - inside the hips' outline (lined up by you): her body. Her legs and thighs in her own skin, each
@@ -357,30 +364,84 @@ def cloth_fill(photo, hole, forbid, skirt=None, body=None, hips=None):
         filled = inpaint_em(img, scene, forbid=np.asarray(forbid, bool) | bd | inside | sk)
         out[scene] = filled[scene]
     under_hem = legs.copy(); under_hem[:bot + 1] = False; under_hem[min(H, bot + 12):] = False
-    tone = skin_tone(img, under_hem, bd, above=top)
+    tone = skin_tone(img, under_hem, bd & ~np.asarray(forbid, bool), above=top)   # (never her hair, never another sway)
     inner = distance_transform_edt(inside)                   # (rounded: darker toward her outline)
-    biki = bikini_zone(pts)
+    biki = bikini_zone(pts, back)
     bases = np.tile(tone, (W, 1)).astype(np.float32)
-    for x in range(W):                                       # each column: her leg's own shade under the hem
+    shades = bases.copy()                                    # (behind: the leg right at the hem, shadow and all)
+    for x in range(W):                                       # each column: her leg's own shade below the hem
         col = np.nonzero(inside[:, x] & hole[:, x])[0]
         if len(col):
-            under = np.nonzero(legs[col.max() + 1:min(H, col.max() + 6), x])[0]
-            if len(under) and is_skin(img[col.max() + 1 + under[0], x]):
-                bases[x] = img[col.max() + 1 + under[0], x] * 0.6 + tone * 0.4
+            # a little way down the thigh (right under the hem lies the skirt's own shadow, gone once it lifts)
+            # (behind: her skin is the lit part of her thigh further down; the shadow the skirt casts right
+            #  under the hem is blended in only at the hem, so the fill joins the leg without a seam)
+            y0, y1 = (col.max() + 3, min(H, col.max() + 30)) if back else (col.max() + 3, min(H, col.max() + 14))
+            if y1 > y0:
+                px = img[y0:y1, x][legs[y0:y1, x]]
+                px = px[is_skin(px)] if len(px) else px
+                if back and len(px) >= 6:
+                    lum = px @ np.array([0.3, 0.59, 0.11], np.float32)
+                    px = px[lum >= np.median(lum)]
+                if len(px) >= 3:
+                    bases[x] = np.median(px, 0) if back else np.median(px, 0) * 0.6 + tone * 0.4
+            if back:
+                y0, y1 = col.max() + 1, min(H, col.max() + 4)
+                px = img[y0:y1, x][legs[y0:y1, x]] if y1 > y0 else img[0:0, 0]
+                shades[x] = np.median(px, 0) if len(px) else bases[x]
     k = np.ones(7) / 7                                       # (smoothed across: skin, not stripes)
     bases = np.stack([np.convolve(np.pad(bases[:, c], 3, mode="edge"), k, "valid") for c in range(3)], 1)
+    shades = np.stack([np.convolve(np.pad(shades[:, c], 3, mode="edge"), k, "valid") for c in range(3)], 1)
+    shape = _seat_shade(pts) if back else None
     for x in range(W):
         col = np.nonzero(inside[:, x] & hole[:, x])[0]
         if not len(col):
             continue
-        base = bases[x]
+        base, shd, ybot = bases[x], shades[x], col.max()
         for y in col:
-            if biki[y, x]:
-                out[y, x] = bikini_color(x, y)
-                continue
             d = inner[y, x]
-            out[y, x] = base * (0.82 if d < 1.5 else (0.92 if d < 3 else 1.0))
+            if shape is None:
+                if biki[y, x]:
+                    out[y, x] = bikini_color(x, y)
+                    continue
+                out[y, x] = base * (0.82 if d < 1.5 else (0.92 if d < 3 else 1.0))
+                continue
+            row = np.nonzero(inside[y])[0]                   # (rounded, softly, toward her sides only: the
+            dsd = min(x - row.min(), row.max() - x) if len(row) else d   #  bottom carries on into her legs)
+            k = shape(x, y) * (0.84 + 0.16 * min(1.0, dsd / 4.0))
+            if biki[y, x]:                                   # (the bikini wraps the same curves, half as deep)
+                out[y, x] = np.clip(np.asarray(bikini_color(x, y), np.float32) * (0.5 + 0.5 * k), 0, 255)
+                continue
+            u = min(1.0, (ybot - y) / 6.0)                   # into the hem's shadow over its last 6 px
+            u = u * u * (3 - 2 * u)
+            out[y, x] = np.clip((shd * (1 - u) + base * u) * k, 0, 255)
     return out
+
+
+def _seat_shade(pts):
+    """Her seat seen from behind, as light and shade on the skin colour: two rounded cheeks (lit toward
+    their middles), the crease between them, and each one's lower curve (the fold) where it meets the thigh.
+    All from the hip outline: hip line, the point between the legs, the outline's sides."""
+    (_, _), (h0x, h0y), (_, _), (_, _), (cx, cy), (_, _), (_, _), (h1x, h1y), (_, _) = pts
+    hy = (h0y + h1y) / 2.0
+    hgt = max(4.0, cy - hy)
+    cheeks = [((h0x + cx) / 2.0 + 0.5, max(2.5, (cx - h0x) / 2.0)), ((h1x + cx) / 2.0 - 0.5, max(2.5, (h1x - cx) / 2.0))]
+    ccy, rv = hy + hgt * 0.5, hgt * 0.62
+
+    def shade(x, y):
+        k = 1.0
+        if y < hy - 1:                                   # her lower back: just the faint line of the spine
+            return k - 0.06 * math.exp(-((x - cx) / 1.6) ** 2)
+        t = (y - (hy + hgt * 0.15)) / (hgt * 0.85)       # the crease, deepening downward
+        if t > 0:
+            k -= 0.24 * min(1.0, t) * math.exp(-((x - cx) / 1.2) ** 2)
+        for ccx, hw in cheeks:
+            u, v = (x - ccx) / hw, (y - ccy) / rv
+            k += 0.16 * max(0.0, 1.0 - (u * u + v * v)) ** 0.7 - 0.12 * min(1.0, u * u) ** 1.5   # plump, round: lit middle
+            if abs(u) < 1.15:                            # the fold: lowest under its middle
+                yf = cy - 2.0 - 2.2 * u * u
+                k -= 0.16 * math.exp(-((y - yf) / 1.2) ** 2)
+        return k
+    return shade
 
 
 def rest_body(body, masks):
@@ -575,6 +636,7 @@ class SwaySim:
         self.sdf = sdf if sdf is not None else body_sdf(body)
         self.body = body if body is not None else (self.sdf < 0 if self.sdf is not None else None)
         self.t = 0.0; self.acc = 0.0; self.awake = True; self.fade = 0.0
+        self.pushers = []                               # (cx, cy, r, vx, vy): forms jiggling under it (zones)
         {"hair": self._prep_hair, "cloth": self._prep_cloth, "pendant": self._prep_pendant}[sw.kind]()
         if sw.kind == "cloth":                          # her hips under it: lined up by you, else fitted
             self.arm = sw.arm if len(sw.arm) == HIP_POINTS else fit_hips(sw.mask, self.body, sw.guides[0] if sw.guides else None)
@@ -594,10 +656,13 @@ class SwaySim:
             pimg, have = plate
             if (self.hole & ~have).sum() == 0:          # (it has all of it: nothing to fill)
                 given = np.where(have[..., None], np.asarray(pimg, np.float32), self.photo)
-        if given is not None:
+        if sw.under is not None:                        # what's really under it, from your own layer
+            u = np.asarray(sw.under, np.float32)
+            self.plate = np.where(self.hole[..., None], u, self.photo)
+        elif given is not None:
             self.plate = given
         elif sw.kind == "cloth":
-            self.plate = cloth_fill(self.photo, self.hole, fb, self.moving, self.body, self.arm)
+            self.plate = cloth_fill(self.photo, self.hole, fb, self.moving, self.body, self.arm, sw.back)
         elif self.body is not None:                       # behind what lies on her is her; behind what hangs free is the scene
             onb = self.hole & self.body
             plate = inpaint_em(self.photo, self.hole & ~self.body, forbid=fb | self.body)
@@ -852,6 +917,12 @@ class SwaySim:
                 ext = a - (hold * kn)[:, None] * (r - x)
                 a[on] -= ext[on] * min(0.8, 1.5 * K["mu"])
                 xp[on] += (x[on] - xp[on]) * min(0.9, 8.0 * K["mu"] * h)
+            for pcx, pcy, pr, pvx, pvy in (self.pushers if cloth else ()):
+                # under it, a form jiggling (her seat, a zone): the cloth lying on it is carried along
+                wq = np.clip(1.0 - np.hypot(x[:, 0] - pcx, x[:, 1] - pcy) / (1.6 * pr), 0.0, 1.0)
+                if wq.any():
+                    a[:, 0] += PUSH_K * wq * (pvx - (x[:, 0] - xp[:, 0]) / h)
+                    a[:, 1] += PUSH_K * wq * (pvy - (x[:, 1] - xp[:, 1]) / h)
             new = x + (x - xp) * damp + a * h * h
             new[0] = r[0]
             xp[:] = x; x[:] = new
@@ -996,10 +1067,10 @@ class SwaySim:
                 g = sw * K["gain"]
                 fx = g * (G_PX * dn[0] - K["j"] * jolt[0])
                 hold = 1.0
-                if self.s.kind == "cloth":
+                if self.s.kind in ("cloth", "hair"):
                     # the photo's pose is held up by her (waist, hips) only while gravity points down the
                     # picture: that part of gravity is carried; the rest (sideways, upside down) pulls it
-                    hold = max(CLOTH_HOLD, dn[1])
+                    hold = max(CLOTH_HOLD if self.s.kind == "cloth" else HAIR_HOLD, dn[1])
                     fy = g * (G_PX * min(0.0, dn[1]) - K["j"] * jolt[1])
                 else:
                     fy = g * (G_PX * (dn[1] - m) - K["j"] * jolt[1])
@@ -1264,7 +1335,7 @@ def format_lines(sways, body=None, plates=None):
         for g in sw.guides[:GUIDE_MAX]:
             out.append("sguide " + " ".join(f"{int(round(x))},{int(round(y))}" for x, y in g[:16]))
         if sw.kind == "cloth" and len(sw.arm) == HIP_POINTS:
-            out.append("sarm " + " ".join(f"{int(round(x))},{int(round(y))}" for x, y in sw.arm))
+            out.append("sarm " + " ".join(f"{int(round(x))},{int(round(y))}" for x, y in sw.arm) + (" back" if sw.back else ""))
         out += _rows(sw.mask, "srow")
         if plates is not None and plates[i] is not None:
             img, hole = plates[i]
@@ -1306,7 +1377,8 @@ def parse_lines(lines):
             cur = Sway(tok[1], np.zeros((H, W), bool), [], prm, nm, on); sways.append(cur); plates.append(None); tgt = "sway"
         elif tok[0] == "sarm" and cur is not None and tgt == "sway":
             try:
-                pts = [tuple(float(v) for v in p.split(",")) for p in tok[1:]]
+                cur.back = "back" in tok[1:]
+                pts = [tuple(float(v) for v in p.split(",")) for p in tok[1:] if p != "back"]
                 if len(pts) == HIP_POINTS:
                     cur.arm = pts
             except ValueError:
