@@ -1330,7 +1330,8 @@ class WaterSim:
         w = self.w
         dt = min(dt, 0.1); self.t += dt
         sl = w.get("slosh") * (W_OCEAN_FEEL if w.mode == W_OCEAN else 1.0)    # an ocean only just feels them
-        tx, ty = sl * W_SLOSH_PX * dn[0], sl * W_SLOSH_PX * (dn[1] - 1.0) * 0.6
+        # toward the side that went down: tipped right, right; top edge away (dn[2] < 0), toward the top (far side)
+        tx, ty = sl * W_SLOSH_PX * dn[0], sl * W_SLOSH_PX * dn[2] * 0.6
         ax, ay = (tx - self.sx) * 10.0 - self.svx * 1.6, (ty - self.sy) * 10.0 - self.svy * 1.6
         kx, ky = ax * dt, ay * dt
         self.svx += kx; self.svy += ky; self.sx += self.svx * dt; self.sy += self.svy * dt
@@ -1415,7 +1416,7 @@ class WaterSim:
         a_ = self.alpha                                   # blended between the last two steps
         sgx = self._lerp(self.gxp + (self.gx - self.gxp) * a_, CX, CY)
         sgy = self._lerp(self.gyp + (self.gy - self.gyp) * a_, CX, CY)
-        dx = dx + sgx * rk + self.sx * 0.5; dy = dy + sgy * rk + self.sy * 0.5
+        dx = dx + sgx * rk - self.sx * 0.5; dy = dy + sgy * rk - self.sy * 0.5   # (shows x + d: the lean moves it by −d)
         slope = np.hypot(sgx, sgy)
         light, foam_k = w.get("light"), w.get("foam")
         shade = 1.0 - light * W_RIP_SHADE * sgy * (1.0 if rk > 0 else 0.0)     # painted light (optional)

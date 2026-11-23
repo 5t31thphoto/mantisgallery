@@ -29,6 +29,9 @@
 #include "jiggle_sway.h"
 #include <new>
 #include <SD.h>
+#if defined(ESP_PLATFORM) && !defined(MG_LCD_40MHZ)
+#include <driver/gpio.h>                       // (the LCD pins' drive strength)
+#endif
 #if defined(ESP_PLATFORM)
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -75,7 +78,8 @@ constexpr float    DANCE_ROOM = 0.5f;     // no kick while a zone is already thi
 constexpr float    DANCE_SWAY_ROOM = 3.0f;  // nor while hair / cloth / a pendant is this many px out
 constexpr uint32_t MIC_SR = 16000;
 constexpr size_t   MIC_N = 320;           // 20 ms chunks
-constexpr float    MIC_LEAD = 0.03f;      // beat lead for audio (spring swing − recording latency)
+constexpr float    MIC_LEAD = 0.05f;      // beat lead for audio: a chunk reaches the tracker ~a chunk after it's recorded
+constexpr int      MIC_BUFS = 3;          // M5Unified records into two queued slots: a third buffer to read from
 constexpr bool     USE_DMA = true;        // set false to push strips without DMA
 
 // ---- Rendering ---------------------------------------------------------------------------------
@@ -107,7 +111,8 @@ uint16_t* g_strip[2] = {nullptr, nullptr};
 bool g_dma = false;
 int32_t g_acc[2 * IMG_W];
 int32_t g_acc1[2 * IMG_W];               // the second core's row accumulator
-constexpr uint32_t LCD_WRITE_HZ = 40000000;   // display SPI write clock (raised to this if lower)
+constexpr uint32_t LCD_WRITE_HZ = 40000000;   // display SPI write clock (raised to this if lower) …
+constexpr uint32_t LCD_FAST_HZ = 80000000;    // … or this, if this unit's panel passes the check at boot
 
 Zone g_z[MAX_ZONES];
 bool g_shown[MAX_ZONES];                 // screen currently shows this zone displaced
@@ -131,9 +136,9 @@ char g_jig_path[320] = {0};
 MotionEcho g_motion_echo;                // repeating motion (jolts, rocking, tipping, twisting) → echo
 Rhythm   g_rhythm_mic;                   // beats from music (microphone) → dance
 AudioOnset g_onset;
-int16_t  g_mic_buf[MIC_N];
-bool     g_mic_on = false, g_mic_busy = false;
-uint32_t g_mic_at = 0;
+int16_t  g_mic_buf[MIC_BUFS][MIC_N];
+bool     g_mic_on = false;
+uint32_t g_mic_sub = 0, g_mic_done = 0;   // chunks handed to the microphone / analysed
 float    g_mic_hit = 0;                  // latest chunk's hit strength…
 float    g_mic_hold = 0;                 // …fed to the tracker for one chunk's worth of time (s)
 bool     g_mic_new = false;              // a chunk was just analysed
@@ -224,6 +229,13 @@ struct FrameClock {
     void soon() { open = false; next = millis(); }     // (draw at the next chance)
 };
 FrameClock g_clock;
+// Quality fallback (depth): a moving frame only gives up detail when it can't make 20 frames a second, and
+// only as much as it takes - first the soft filter for any slide (not just fast ones), then, while soft,
+// every other row drawn and copied down. At rest the picture is always drawn in full, sharp. Steps down at
+// once when a moving frame's work doesn't fit 50 ms; back up after 2 s of moving frames fitting 30 ms.
+constexpr uint32_t QG_FIT_MS = 50, QG_CALM_MS = 30;
+struct QualityGov { uint8_t lvl = 0; uint32_t calm0 = 0, t_last = 0; };
+QualityGov g_qg;
 struct RPiece {
     Rate& r; uint32_t u, t0;
     RPiece(Rate& r_, uint32_t u_) : r(r_), u(u_), t0(micros()) {}
@@ -365,6 +377,22 @@ void clear_sways() {
 }
 // Build hair / cloth / pendants: what they rest on (the body less them, plus their parts that lie on
 // it - mg_sway.rest_body), its distance field, then each one. (Before prepare_waters: that builds the layer.)
+// What the sways rest on (body lines, else the depth figures), with what they cover worked out
+// (sway_rest_body). True if there's any. nx/ny: scratch for that (none: as painted).
+bool sway_body_into(uint8_t* body, int16_t* nx, int16_t* ny, const Plane* pl, int np, const Sway* ss, int ns) {
+    bool anyb = false;
+    memset(body, 0, MASK_BYTES);
+    if (g_body) memcpy(body, g_body, MASK_BYTES);
+    else for (int k = 0; k < np; ++k)                   // (no body lines: the depth figures)
+        if (pl[k].mask) for (int b = 0; b < MASK_BYTES; ++b) body[b] |= pl[k].mask[b];
+    for (int b = 0; b < MASK_BYTES && !anyb; ++b) anyb = body[b] != 0;
+    if (anyb && nx && ny) {
+        const uint8_t* ms[SWAY_MAX];
+        for (int i = 0; i < ns; ++i) ms[i] = ss[i].mask;
+        sway_rest_body(body, ms, ns, nx, ny);
+    }
+    return anyb;
+}
 void prepare_sways() {
     if (g_sdf) { free(g_sdf); g_sdf = nullptr; }
     for (int i = 0; i < g_ns; ++i) sway_free_runtime(g_sway[i]);
@@ -376,30 +404,31 @@ void prepare_sways() {
     uint8_t* forbid = (uint8_t*)water_alloc(MASK_BYTES);
     bool anyb = false;
     if (body) {
-        memset(body, 0, MASK_BYTES);
-        if (g_body) memcpy(body, g_body, MASK_BYTES);
-        else for (int k = 0; k < g_par.n; ++k)          // (no body lines: the depth figures)
-            if (g_par.pl[k].mask) for (int b = 0; b < MASK_BYTES; ++b) body[b] |= g_par.pl[k].mask[b];
-        for (int b = 0; b < MASK_BYTES && !anyb; ++b) anyb = body[b] != 0;
-    }
-    if (anyb && nx && ny) {
-        const uint8_t* ms[SWAY_MAX];
-        for (int i = 0; i < g_ns; ++i) ms[i] = g_sway[i].mask;
-        sway_rest_body(body, ms, g_ns, nx, ny);
-        g_sdf = sway_body_sdf(body, water_alloc);
+        anyb = sway_body_into(body, nx, ny, g_par.pl, g_par.n, g_sway, g_ns);
+        if (anyb && nx && ny) g_sdf = sway_body_sdf(body, water_alloc);
     }
     if (nx) free(nx);
     if (ny) free(ny);
+    uint8_t* skb = nullptr;                             // (a skirt's fill: her hips under it - mg_sway.skirt_plate)
+    for (int i = 0; i < g_ns && !skb && body; ++i)
+        if (g_sway[i].kind == SK_CLOTH && g_sway[i].narm == 9) skb = (uint8_t*)water_alloc(MASK_BYTES);
     const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
     for (int i = 0; i < g_ns; ++i) {
         if (forbid) {                                   // (never filled from one another)
             memset(forbid, 0, MASK_BYTES);
             for (int j = 0; j < g_ns; ++j) if (j != i && g_sway[j].mask) for (int b = 0; b < MASK_BYTES; ++b) forbid[b] |= g_sway[j].mask[b];
         }
-        const bool ok = sway_prepare(g_sway[i], photo, g_swapped, anyb ? body : nullptr, g_sdf, forbid, water_alloc);
+        const uint8_t* fb = anyb ? body : nullptr;
+        if (skb && g_sway[i].kind == SK_CLOTH && g_sway[i].narm == 9) {
+            memcpy(skb, body, MASK_BYTES);
+            sway_hips_body(g_sway[i], skb);
+            fb = skb;
+        }
+        const bool ok = sway_prepare(g_sway[i], photo, g_swapped, fb, g_sdf, forbid, water_alloc);
         Serial.printf("jig: %s %d %s\n", sway_kind_info(g_sway[i].kind).label, i + 1, ok ? "ready" : "not ready (no memory, or nothing selected)");
     }
     if (forbid) free(forbid);
+    if (skb) free(skb);
     if (body) free(body);
 }
 bool any_sway_def() {
@@ -763,12 +792,13 @@ struct DirtyRects { int r[24][4]; int n = 0;
     }
 };
 
-// Draw every zone that moved (or must return to rest) — to the screen, or (parallax) into the content
-// buffer g_anim, noting where in `dr`.
-void draw_frame(DirtyRects* dr = nullptr) {
-    const bool to_anim = dr != nullptr;
-    stage_frame(g_z, g_n);
-    int ids[MAX_ZONES], nd = 0;
+// The zones the next frame draws (every one that moved, or must return to rest, and any resting one that
+// shares pixels with those) in overlapping groups - draw_frame draws them, and the flat picture's sways
+// leave the very pixels they cover to them (zone_cover).
+struct ZonePlan { int ids[MAX_ZONES]; int grp[MAX_ZONES]; int nd = 0; };
+void zone_plan(ZonePlan& P) {
+    int* ids = P.ids; int& nd = P.nd;
+    nd = 0;
     for (int i = 0; i < g_n; ++i)
         if (g_z[i].wmap && (g_z[i].awake || g_shown[i])) ids[nd++] = i;
     if (!nd) return;
@@ -785,7 +815,7 @@ void draw_frame(DirtyRects* dr = nullptr) {
     }
 
     // Group overlapping zones (tiny n: simple merge).
-    int grp[MAX_ZONES];
+    int* grp = P.grp;
     for (int i = 0; i < nd; ++i) grp[i] = i;
     for (int a = 0; a < nd; ++a)
         for (int b = a + 1; b < nd; ++b) {
@@ -794,21 +824,16 @@ void draw_frame(DirtyRects* dr = nullptr) {
             bool ov = !(A.bx >= B.bx + B.bw || B.bx >= A.bx + A.bw || A.by >= B.by + B.bh || B.by >= A.by + A.bh);
             if (ov) { int ga = grp[a], gb = grp[b]; for (int k = 0; k < nd; ++k) if (grp[k] == gb) grp[k] = ga; }
         }
-
-    uint32_t t0 = micros();
-    uint32_t px = 0;
-    const uint16_t* src = render_src();
-    bool src_swapped = render_src_swapped();
-    int cur = 0;
-    bool inflight = false;
-    if (!to_anim) M5.Display.startWrite();
-    for (int g = 0; g < nd; ++g) {
+}
+// Each strip of the plan: f(members, nm, xa, y, xb, ye) - its group, and the box it draws.
+template <class F> void zone_plan_strips(const ZonePlan& P, F&& f) {
+    for (int g = 0; g < P.nd; ++g) {
         int members[MAX_ZONES], nm = 0, y0 = IMG_H, y1 = 0;
         bool first = true;
-        for (int k = 0; k < nd; ++k) {
-            if (grp[k] != g) continue;
-            members[nm++] = ids[k];
-            const Zone& z = g_z[ids[k]];
+        for (int k = 0; k < P.nd; ++k) {
+            if (P.grp[k] != g) continue;
+            members[nm++] = P.ids[k];
+            const Zone& z = g_z[P.ids[k]];
             if (z.by < y0) y0 = z.by;
             if (z.by + z.bh > y1) y1 = z.by + z.bh;
             first = false;
@@ -818,24 +843,123 @@ void draw_frame(DirtyRects* dr = nullptr) {
             int ye = y + STRIP_ROWS < y1 ? y + STRIP_ROWS : y1;
             int xa, xb;
             if (!strip_extent(g_z, members, nm, y, ye, xa, xb)) continue;
-            StripJob job{src, src_swapped, g_strip[cur], members, nm, xa, xb, y};
-            par_rows(strip_rows, &job, y, ye);           // both cores, half the rows each
-            if (to_anim) {                               // into the content (display order → its order)
-                const int w = xb - xa;
-                for (int yy = y; yy < ye; ++yy) {
-                    const uint16_t* sr = g_strip[cur] + (yy - y) * w;
-                    uint16_t* dst = g_anim + yy * IMG_W + xa;
-                    if (g_anim_sw) memcpy(dst, sr, (size_t)w * 2);
-                    else for (int x = 0; x < w; ++x) dst[x] = bswap16(sr[x]);
-                }
-                dr->add(xa, y, xb, ye);
-                continue;
-            }
-            push_strip(xa, y, xb - xa, ye - y, g_strip[cur], inflight);
-            px += (uint32_t)(xb - xa) * (ye - y);
-            cur ^= 1;
+            f(members, nm, xa, y, xb, ye);
         }
     }
+}
+// The pixels the zones are sure to draw over next (the flat picture), per row: the shapes of the zones in
+// the plan - and, sending water, of each one over the water that's moving or held off its rest (they're all
+// drawn when the water is done). What's sent under them leaves those pixels to them, so the screen never
+// shows them unwarped for a moment (her rest pose flashing between frames). (A zone draws only what's
+// inside its shape: the rest of its strip is the layer as it is.)
+int16_t g_zcov_n[IMG_H];
+int16_t g_zcov[IMG_H][MAX_ZONES][2];
+void zone_cover(bool water) {
+    memset(g_zcov_n, 0, sizeof(g_zcov_n));
+    if (g_n <= 0) return;
+    bool in[MAX_ZONES] = {false};
+    ZonePlan P;
+    zone_plan(P);
+    for (int k = 0; k < P.nd; ++k) in[P.ids[k]] = true;
+    if (water)
+        for (int i = 0; i < g_n; ++i) {
+            const Zone& z = g_z[i];
+            if (in[i] || !z.wmap || !(z.awake || zone_displaced(z))) continue;
+            for (int k = 0; k < g_nw && !in[i]; ++k) {
+                const Water& w = g_wat[k];
+                in[i] = w.edge && !(z.bx >= w.bx + w.bw || w.bx >= z.bx + z.bw || z.by >= w.by + w.bh || w.by >= z.by + z.bh);
+            }
+        }
+    for (int i = 0; i < g_n; ++i) {
+        const Zone& z = g_z[i];
+        if (!in[i] || !z.wmap) continue;
+        for (int y = z.by; y < z.by + z.bh; ++y) {
+            const int sa = z.span[2 * (y - z.by)], sb = z.span[2 * (y - z.by) + 1];
+            if (sa >= sb || y < 0 || y >= IMG_H || g_zcov_n[y] >= MAX_ZONES) continue;
+            g_zcov[y][g_zcov_n[y]][0] = (int16_t)sa; g_zcov[y][g_zcov_n[y]][1] = (int16_t)sb; ++g_zcov_n[y];
+        }
+    }
+}
+// Send a box of the layer, all but what the zones cover (g_zcov): rows covered alike go as boxes.
+void push_layer_box(int x0, int y0, int x1, int y1, int& cur, bool& inflight) {
+    auto send = [&](int a0, int b0, int a1, int b1) {
+        const int ow = a1 - a0;
+        if (ow <= 0 || b1 <= b0) return;
+        uint16_t* out = g_strip[cur];
+        if (inflight && USE_DMA && g_dma) { M5.Display.waitDMA(); inflight = false; }
+        for (int yy = b0; yy < b1; ++yy) {
+            const uint16_t* row = g_layer + yy * IMG_W + a0;
+            uint16_t* o = out + (yy - b0) * ow;
+            if (g_layer_sw) memcpy(o, row, (size_t)ow * 2);
+            else for (int x = 0; x < ow; ++x) o[x] = bswap16(row[x]);
+        }
+        push_strip(a0, b0, ow, b1 - b0, out, inflight);
+        cur ^= 1;
+    };
+    if (x1 <= x0 || y1 <= y0) return;
+    bool cov = false;
+    for (int yy = y0; yy < y1 && !cov; ++yy)
+        for (int c = 0; c < g_zcov_n[yy] && !cov; ++c) cov = g_zcov[yy][c][0] < x1 && g_zcov[yy][c][1] > x0;
+    if (!cov) { send(x0, y0, x1, y1); return; }
+    auto same = [](int a, int b) {
+        if (g_zcov_n[a] != g_zcov_n[b]) return false;
+        for (int k = 0; k < g_zcov_n[a]; ++k) if (g_zcov[a][k][0] != g_zcov[b][k][0] || g_zcov[a][k][1] != g_zcov[b][k][1]) return false;
+        return true;
+    };
+    for (int r0 = y0; r0 < y1;) {
+        int r1 = r0 + 1;
+        while (r1 < y1 && same(r0, r1)) ++r1;
+        for (int x = x0; x < x1;) {
+            int nx = x1;                                // (the next covered stretch at or after x)
+            bool in = false;
+            for (int c = 0; c < g_zcov_n[r0]; ++c) {
+                const int a = g_zcov[r0][c][0], b = g_zcov[r0][c][1];
+                if (a <= x && b > x) { in = true; x = b; break; }
+                if (a > x && a < nx) nx = a;
+            }
+            if (in) continue;
+            send(x, r0, nx, r1);
+            x = nx;
+        }
+        r0 = r1;
+    }
+}
+
+// Draw every zone that moved (or must return to rest) — to the screen, or (parallax) into the content
+// buffer g_anim, noting where in `dr`.
+void draw_frame(DirtyRects* dr = nullptr) {
+    const bool to_anim = dr != nullptr;
+    stage_frame(g_z, g_n);
+    ZonePlan P;
+    zone_plan(P);
+    const int* ids = P.ids; const int nd = P.nd;
+    if (!nd) return;
+
+    uint32_t t0 = micros();
+    uint32_t px = 0;
+    const uint16_t* src = render_src();
+    bool src_swapped = render_src_swapped();
+    int cur = 0;
+    bool inflight = false;
+    if (!to_anim) M5.Display.startWrite();
+    zone_plan_strips(P, [&](const int* members, int nm, int xa, int y, int xb, int ye) {
+        StripJob job{src, src_swapped, g_strip[cur], members, nm, xa, xb, y};
+        par_rows(strip_rows, &job, y, ye);               // both cores, half the rows each
+        if (to_anim) {                                   // into the content (display order → its order)
+            const int w = xb - xa;
+            for (int yy = y; yy < ye; ++yy) {
+                const uint16_t* sr = g_strip[cur] + (yy - y) * w;
+                uint16_t* dst = g_anim + yy * IMG_W + xa;
+                if (g_anim_sw) memcpy(dst, sr, (size_t)w * 2);
+                else for (int x = 0; x < w; ++x) dst[x] = bswap16(sr[x]);
+            }
+            dr->add(xa, y, xb, ye);
+            return;
+        }
+        push_strip(xa, y, xb - xa, ye - y, g_strip[cur], inflight);
+        px += (uint32_t)(xb - xa) * (ye - y);
+        cur ^= 1;
+    });
     if (to_anim) { for (int k = 0; k < nd; ++k) g_shown[ids[k]] = false; return; }
     if (inflight) M5.Display.waitDMA();
     M5.Display.endWrite();
@@ -871,7 +995,7 @@ void water_job_begin(bool par) {                       // (each water as it stan
 }
 bool sway_redraw_run(bool budget);
 void sway_redraw_start(bool water_moved);
-void sway_push(const int* which, int nd);
+void sway_push(const int* which, int nd, bool water);
 int g_sj_nd();
 int g_sj_which(int k);
 // A water slice's work: its wet pixels (+ some per row). ym: where to split it between the two cores so
@@ -931,6 +1055,7 @@ bool water_job() {
     const uint32_t tail = (g_wj.nd ? g_c_swpush.us : 0) + (g_n > 0 ? g_c_zones.us : 0);
     int cur = 0;
     bool inflight = false;
+    if (g_wj.phase == 3) zone_cover(true);             // (the zones' pixels: theirs, drawn when it's done)
     M5.Display.startWrite();
     while (g_wj.phase == 3) {
         if (g_wj.wi >= g_nw) { g_wj.phase = 4; break; }
@@ -944,22 +1069,12 @@ bool water_job() {
         int xa, xb;
         water_rows_extent(w, y, ye, xa, xb);           // just the columns that hold water
         if (xa >= xb) continue;
-        uint16_t* out = g_strip[cur];
-        if (inflight && USE_DMA && g_dma) { M5.Display.waitDMA(); inflight = false; }
-        const int ow = xb - xa;
-        for (int yy = y; yy < ye; ++yy) {
-            const uint16_t* row = g_layer + yy * IMG_W + xa;
-            uint16_t* o = out + (yy - y) * ow;
-            if (g_layer_sw) memcpy(o, row, (size_t)ow * 2);
-            else for (int x = 0; x < ow; ++x) o[x] = bswap16(row[x]);
-        }
-        push_strip(xa, y, ow, ye - y, out, inflight);
-        cur ^= 1;
+        push_layer_box(xa, y, xb, ye, cur, inflight);
     }
     if (inflight) M5.Display.waitDMA();
     M5.Display.endWrite();
     if (g_wj.phase != 4) return false;
-    if (g_wj.nd) { Piece pc(g_c_swpush); sway_push(g_wj.which, g_wj.nd); }
+    if (g_wj.nd) { Piece pc(g_c_swpush); sway_push(g_wj.which, g_wj.nd, true); }
     g_wj.phase = 0;
     return true;
 }
@@ -1037,10 +1152,22 @@ void sway_redraw_start(bool water_moved) {
             const uint8_t* wm[WATER_MAX]; int nm = 0;     // (the water masks that are drawn: bit reads, no bounds tests)
             for (int w = 0; w < g_nw; ++w) if (g_wat[w].edge && g_wat[w].mask) wm[nm++] = g_wat[w].mask;
             const bool same = g_layer_sw == g_swapped;
-            for (int x = 0, i = y * IMG_W + h.ux0; x < n; ++x, ++i) {
+            // (eight pixels per mask byte: none wet → all put back, all wet → none, else bit by bit)
+            for (int x = 0, i = y * IMG_W + h.ux0; x < n;) {
+                if ((i & 7) == 0 && x + 8 <= n) {
+                    uint8_t wb = 0;
+                    for (int w = 0; w < nm; ++w) wb |= wm[w][i >> 3];
+                    if (wb == 0) {
+                        if (same) memcpy(d + x, sr + x, 16); else for (int k = 0; k < 8; ++k) d[x + k] = bswap16(sr[x + k]);
+                    } else if (wb != 0xFF)
+                        for (int k = 0; k < 8; ++k) if (!((wb >> k) & 1)) d[x + k] = same ? sr[x + k] : bswap16(sr[x + k]);
+                    x += 8; i += 8;
+                    continue;
+                }
                 bool wet = false;
                 for (int w = 0; w < nm && !wet; ++w) wet = (wm[w][i >> 3] >> (i & 7)) & 1;
                 if (!wet) d[x] = same ? sr[x] : bswap16(sr[x]);
+                ++x; ++i;
             }
         }
     }
@@ -1060,20 +1187,53 @@ void sway_redraw_start(bool water_moved) {
     }
     g_sj.on = true;
 }
+// The piece being drawn: about how much drawing each row holds (prefix sums: its triangles' spans, plus the
+// plate) - each slice is split between the cores where that halves, not at its middle row (a lock's rows are
+// dense, the rows around it empty: split at the middle, one core waited on the other a quarter of the time).
+int32_t g_swcost[IMG_H + 1];
+int g_swcost_i = -1;
+void sway_row_costs(const Sway& s, const SwDraw& D) {
+    static int32_t d[IMG_H + 1];                   // (static: off the loop task's stack; only it runs this)
+    memset(d, 0, sizeof(d));
+    for (int k = 0; k < D.nt; ++k) {
+        const SwTri& T = D.tris[k];
+        float ylo = T.dy[0], yhi = T.dy[0], xlo = T.dx[0], xhi = T.dx[0];
+        for (int v = 1; v < 3; ++v) {
+            ylo = fminf(ylo, T.dy[v]); yhi = fmaxf(yhi, T.dy[v]); xlo = fminf(xlo, T.dx[v]); xhi = fmaxf(xhi, T.dx[v]);
+        }
+        int y0 = (int)floorf(ylo), y1 = (int)ceilf(yhi) + 1;
+        if (y0 < 0) y0 = 0; if (y1 > IMG_H) y1 = IMG_H;
+        if (y0 >= y1) continue;
+        const int32_t w = (int32_t)(xhi - xlo) + 2;
+        d[y0] += w; d[y1] -= w;
+    }
+    int32_t run = 0;
+    g_swcost[0] = 0;
+    for (int y = 0; y < IMG_H; ++y) {
+        run += d[y];
+        const int32_t plate = (y >= s.ry0 && y < s.ry0 + s.rh) ? s.rw / 8 + 1 : 0;
+        g_swcost[y + 1] = g_swcost[y] + run + plate;
+    }
+}
 // Draw on (both cores, 24 rows at a time); budget: stop when this tick's time is up. True when done.
 bool sway_redraw_run(bool budget) {
     while (g_sj.on && g_sj.k < g_sj.tn) {
         const int i = g_sj.touch[g_sj.k];
         const Sway& s = g_sway[i];
         const int sy0 = s.y0 > g_sj.by0 ? s.y0 : g_sj.by0, sy1 = s.y1 < g_sj.by1 ? s.y1 : g_sj.by1;
-        if (g_sj.y < 0) g_sj.y = sy0;
+        if (g_sj.y < 0) { g_sj.y = sy0; g_swcost_i = -1; }
         if (g_sj.y >= sy1) { ++g_sj.k; g_sj.y = -1; continue; }
+        if (g_swcost_i != i) { sway_row_costs(s, *g_sdraw[i]); g_swcost_i = i; }
         const int ye = g_sj.y + 24 < sy1 ? g_sj.y + 24 : sy1;
         const uint32_t units = (uint32_t)((ye - g_sj.y + 1) / 2) * (uint32_t)(s.x1 - s.x0 + 16);   // (a core's half)
         if (budget && !fits(g_r_sway.est(units))) return false;
         RPiece pc(g_r_sway, units);
         SwayJob job{&s, g_sdraw[i]};
-        par_rows(sway_rows, &job, g_sj.y, ye);
+        int ym = g_sj.y + 1;                           // (where the slice's drawing halves)
+        const int32_t half = (g_swcost[ye] - g_swcost[g_sj.y]) / 2;
+        while (ym < ye - 1 && g_swcost[ym] - g_swcost[g_sj.y] < half) ++ym;
+        if (ye - g_sj.y < 2) ym = ye;
+        par_rows_at(sway_rows, &job, g_sj.y, ym, ye);
         g_sj.y = ye;
     }
     if (g_sj.on)
@@ -1085,28 +1245,18 @@ bool any_sway_due() {
     for (int i = 0; i < g_ns; ++i) if (sway_due(i, false)) return true;
     return false;
 }
-// Send the redrawn regions to the screen.
-void sway_push(const int* which, int nd) {
+// Send the redrawn regions to the screen - all but the pixels the zones draw right after (zone_cover): the
+// layer there is the picture unwarped, her rest pose, and sent first it showed for a moment every frame the
+// sway moved over a jiggling zone (the zone flickering between rest and its pose).
+void sway_push(const int* which, int nd, bool water) {
     int cur = 0;
     bool inflight = false;
+    zone_cover(water);
     M5.Display.startWrite();
     for (int k = 0; k < nd; ++k) {
         const Sway& h = g_sway[which[k]];
-        const int ow = h.ux1 - h.ux0;
-        if (ow <= 0) continue;
-        for (int y = h.uy0; y < h.uy1; y += STRIP_ROWS) {
-            const int ye = y + STRIP_ROWS < h.uy1 ? y + STRIP_ROWS : h.uy1;
-            uint16_t* out = g_strip[cur];
-            if (inflight && USE_DMA && g_dma) { M5.Display.waitDMA(); inflight = false; }
-            for (int yy = y; yy < ye; ++yy) {
-                const uint16_t* row = g_layer + yy * IMG_W + h.ux0;
-                uint16_t* o = out + (yy - y) * ow;
-                if (g_layer_sw) memcpy(o, row, (size_t)ow * 2);
-                else for (int x = 0; x < ow; ++x) o[x] = bswap16(row[x]);
-            }
-            push_strip(h.ux0, y, ow, ye - y, out, inflight);
-            cur ^= 1;
-        }
+        for (int y = h.uy0; y < h.uy1; y += STRIP_ROWS)
+            push_layer_box(h.ux0, y, h.ux1, y + STRIP_ROWS < h.uy1 ? y + STRIP_ROWS : h.uy1, cur, inflight);
     }
     if (inflight) M5.Display.waitDMA();
     M5.Display.endWrite();
@@ -1139,7 +1289,9 @@ void anim_sync() {                                     // g_anim ← the layer (
 }
 void prepare_parallax() {
     frame_reset();
+    g_qg = QualityGov();
     parallax_prepare(g_par, (const uint16_t*)g_img.getBuffer(), g_swapped, water_alloc, alloc_fast);
+    g_par.soft_any = g_par.half_rows = false;
     if (g_par.ready && g_n > 0) {
         if (!g_anim) g_anim = (uint16_t*)alloc_psram((size_t)IMG_W * IMG_H * 2);
     } else if (g_anim) { free(g_anim); g_anim = nullptr; }
@@ -1150,6 +1302,7 @@ void prepare_parallax() {
 }
 void clear_parallax() {
     frame_reset();
+    g_qg = QualityGov();
     parallax_free(g_par);
     g_par = Parallax();
     if (g_anim) { free(g_anim); g_anim = nullptr; }
@@ -1355,10 +1508,10 @@ void par_content_finish(uint32_t now, bool moved) {
         if (g_par.prm[PP_FOCUS] > 0.0f || par_ground(g_par) || !g_par.drawn) dr.add(0, 0, IMG_W, IMG_H);   // (the ground: all of it)
         else for (int k = 0; k < g_par.n; ++k) { int r[4]; parallax_plane_rect(g_par, k, r); dr.add(r[0], r[1], r[2], r[3]); }
     }
-    // A changed content pixel shows on screen up to 2 margins away (its slide, plus the zoom's offset toward
-    // the edges) - plus the filter's reach, inside the margin's slack.
+    // A changed content pixel shows on screen up to this many rows away (its slide, plus the zoom's offset
+    // toward the edges) - plus the filter's reach, inside the margin's slack.
     // (Whole rows: the render then redraws only the pixels it must and copies the rest from the screen.)
-    const int m = 2 * g_par.margin;
+    const int m = parallax_reach_rows(g_par);
     for (int i = 0; i < content.n; ++i) dr.add(0, content.r[i][1] - m, IMG_W, content.r[i][3] + m);
     if (moved) {
         DirtyRects wide;
@@ -1404,7 +1557,7 @@ void par_content_finish(uint32_t now, bool moved) {
 bool par_strip_renders(int y0, int y1) {
     const ParFrame& F = g_pj.F;
     if (!F.front || F.force_all || g_pj.v0[0] != g_par.dv[0] || g_pj.v0[1] != g_par.dv[1]) return true;
-    const int m = 2 * g_par.margin;
+    const int m = parallax_reach_rows(g_par);
     for (int i = 0; i < F.nforce; ++i) if (F.force[i][1] - m < y1 && F.force[i][3] + m > y0) return true;
     for (int i = 0; F.nfw && i < g_nw; ++i)          // (the waters, when they were redrawn)
         if (g_wat[i].edge && g_wat[i].by - m < y1 && g_wat[i].by + g_wat[i].bh + m > y0) return true;
@@ -1472,6 +1625,17 @@ void par_push(uint32_t now) {
     g_par.dsharp = g_pj.s0;
     g_par.drawn = true;
     g_clock.end(now);
+    if (g_pj.F.q < 256) {                           // (a moving frame: the fallback's measure)
+        const uint32_t need = g_clock.work + g_clock.work / 8 + 2;
+        if (need > QG_FIT_MS && g_qg.lvl < 2) {
+            if (now - g_qg.t_last > 300) { ++g_qg.lvl; g_qg.t_last = now; }
+            g_qg.calm0 = 0;
+        } else if (g_qg.lvl > 0 && need <= QG_CALM_MS) {
+            if (!g_qg.calm0) g_qg.calm0 = now | 1;
+            else if (now - g_qg.calm0 > 2000) { --g_qg.lvl; g_qg.calm0 = 0; g_qg.t_last = now; }
+        } else g_qg.calm0 = 0;
+        g_par.soft_any = g_qg.lvl >= 1; g_par.half_rows = g_qg.lvl >= 2;
+    }
     g_pf_us += g_pj.us; g_pf_px += g_pj.px; ++g_pf_frames;
     if (now - g_pf_t0 >= 3000) {
         if (g_pf_frames)
@@ -1538,11 +1702,13 @@ int      e_np = 0, e_pi = -1;
 float    e_pprm[PP_COUNT];
 bool     e_pgrid = false;               // the ground grid (Grid tool in depth mode)
 float    e_gq[8];
-const float DEPTHS[] = {0.15f, 0.3f, 0.5f, 0.7f, 0.9f};
+const float DEPTHS[] = {0.0f, 0.15f, 0.3f, 0.5f, 0.7f, 0.9f};   // by hand: 0 = the sky (as far as it goes: stays put)
+constexpr int N_DEPTHS = sizeof(DEPTHS) / sizeof(DEPTHS[0]);
 Sway*    e_s = nullptr;                  // working copies of hair / cloth / pendants (PSRAM: begin())
 Sway*    e_sdflt = nullptr;              // (the dimmed guides one gets when none are drawn)
 int      e_ns = 0, e_si = -1;
 bool     e_smode = false;                // editing hanging things
+int      e_hipdrag = -1;                 // a skirt's hip point being dragged (guide tool)
 bool     e_stroke = false;               // a hair lock being drawn (root → tip, in e_px / e_py)
 bool e_gmode = false;                         // fitting the ground grid (shared by water and depth)
 bool e_mm() { return e_wmode || e_dmode || e_smode || e_gmode; }   // editing a mask (water area, depth plane, hanging thing)
@@ -1620,6 +1786,18 @@ void e_dab(int x, int y) {
 void e_draw();
 Plane* e_plane() { return (e_pi >= 0 && e_pi < e_np) ? &e_p[e_pi] : nullptr; }
 Sway* e_sway() { return (e_si >= 0 && e_si < e_ns) ? &e_s[e_si] : nullptr; }
+// A skirt's hips fitted to it and her legs under its hem (the editor's planes and sways). False: no skirt painted.
+bool fit_skirt_hips(Sway& h) {
+    uint8_t* body = (uint8_t*)water_alloc(MASK_BYTES);
+    int16_t* nx = (int16_t*)water_alloc((size_t)IMG_W * IMG_H * 2);
+    int16_t* ny = (int16_t*)water_alloc((size_t)IMG_W * IMG_H * 2);
+    const bool anyb = body && sway_body_into(body, nx, ny, e_p, e_np, e_s, e_ns);
+    if (nx) free(nx);
+    if (ny) free(ny);
+    const bool ok = sway_fit_hips(h, anyb ? body : nullptr);
+    if (body) free(body);
+    return ok;
+}
 bool e_new_sway() {
     if (e_ns >= SWAY_MAX) return false;
     Sway& h = e_s[e_ns];
@@ -1957,6 +2135,18 @@ void e_tint_sways(M5Canvas& c) {
             c.fillCircle((int)g->gx[k][0], (int)g->gy[k][0], 3, col);
         }
     }
+    if (h->kind == SK_CLOTH && h->narm == 9) {                                   // a skirt: her hips (pink), its points
+        constexpr uint16_t C_PINK = 0xFB56;
+        for (int a = 0; a < 9; ++a) {
+            const int b = (a + 1) % 9;
+            c.drawWideLine(h->armx[a], h->army[a], h->armx[b], h->army[b], 3.0f, C_BLACK);
+            c.drawWideLine(h->armx[a], h->army[a], h->armx[b], h->army[b], 1.5f, C_PINK);
+        }
+        for (int a = 0; a < 9; ++a) {
+            c.fillCircle(h->armx[a], h->army[a], a == e_hipdrag ? 5 : 4, C_BLACK);
+            c.fillCircle(h->armx[a], h->army[a], a == e_hipdrag ? 4 : 3, C_PINK);
+        }
+    }
     if (e_stroke)                                                                // the lock being drawn
         for (int k = 1; k < e_pn; ++k) c.drawWideLine(e_px[k - 1], e_py[k - 1], e_px[k], e_py[k], 1.5f, C_LIME);
 }
@@ -2051,6 +2241,7 @@ const char* context_hint() {
             const Sway* h = e_sway();
             if (!h || h->kind == SK_HAIR) return "Drag each lock, root to tip  -  A undo";
             if (h->kind == SK_PENDANT) return "Tap where it hangs from  -  A clear";
+            if (h->narm == 9 && h->ng > 0 && h->gn[0] >= 2) return "Folds: tap  -  hips: drag the pink points";
             return (h->ng == 0 || h->gn[0] < 2) ? "Tap both ends of the waistband  -  A undo" : "Tap the folds (optional)  -  A undo";
         }
         default:       return "Tap around it  -  A undo  -  C fill (fitted)";
@@ -2181,6 +2372,7 @@ void e_draw() {
         char pl[32], dp[16];
         snprintf(pl, sizeof(pl), "Plane %d/%d", e_pi + 1, e_np);
         if (e_pgrid && p && !p->fixed) snprintf(dp, sizeof(dp), "On ground");
+        else if (p && p->depth <= 0.0f) snprintf(dp, sizeof(dp), "Sky");
         else snprintf(dp, sizeof(dp), "Depth %.2f", p ? p->depth : 0.0f);
         const bool drift = e_pprm[PP_AMBIENT] > 0.0f;
         const char* lbl[TB2D_N] = {wtool_label(e_wtool), pl, dp, drift ? "Drift: on" : "Drift: off", "Del"};
@@ -2199,7 +2391,8 @@ void e_draw() {
         else snprintf(it, sizeof(it), "Item %d/%d", e_si + 1, e_ns);
         const float s = h ? h->prm[SP_SWING] : 1.0f;
         snprintf(sw, sizeof(sw), "Swing: %s", s < 0.75f ? "low" : (s < 1.3f ? "mid" : "high"));
-        const char* lbl[TB2S_N] = {wtool_label(e_wtool), it, h ? sway_kind_info(h->kind).label : "-", sw, "Del"};
+        const char* kl = !h ? "-" : (h->kind == SK_CLOTH && h->narm == 9 ? "Skirt" : sway_kind_info(h->kind).label);
+        const char* lbl[TB2S_N] = {wtool_label(e_wtool), it, kl, sw, "Del"};
         for (int i = 0; i < TB2S_N; ++i) {
             bar_button(c, 1, i, TB2S_N, false, true);
             c.setTextColor(C_TEXT);
@@ -2463,9 +2656,14 @@ void e_bar_tap(int x, int y, uint32_t held) {
             else if (e_ns > 0) e_si = (e_si + 1) % e_ns;
             e_pn = 0; e_glive = false; e_stroke = false;
             break;
-        case 2:                                   // hair → cloth → pendant (its guides start over)
-            if (h) {
+        case 2:                                   // hair → cloth → skirt → pendant (its guides start over; a skirt
+            if (h) {                              //  keeps the cloth's)
+                if (h->kind == SK_CLOTH && h->narm != 9 && fit_skirt_hips(*h)) {
+                    toast("Skirt: drag the pink hip points onto her (Tool)");
+                    break;
+                }
                 h->kind = (uint8_t)((h->kind + 1) % SK_COUNT);
+                h->narm = 0;
                 h->ng = 0; memset(h->gn, 0, sizeof(h->gn));
                 h->lax = h->lay = h->lbx = h->lby = -1;
                 toast(h->kind == SK_HAIR ? "Hair: draw its locks (Tool)" : (h->kind == SK_CLOTH ? "Cloth: its waistband (Tool)" : "Pendant: its pin (Tool)"));
@@ -2504,14 +2702,17 @@ void e_bar_tap(int x, int y, uint32_t held) {
             break;
         case 2:                                   // its depth: far → near
             // its depth: with a grid it stands where it meets the ground, or (tap on) set by hand
-            // 0.15 … 0.9, then back on the ground. Without a grid: by hand only.
+            // Sky (0), 0.15 … 0.9, then back on the ground. Without a grid: by hand only.
             if (p) {
-                if (e_pgrid && !p->fixed) { p->fixed = true; p->depth = DEPTHS[0]; toast("Depth by hand (it doesn't stand on the ground)"); }
+                if (e_pgrid && !p->fixed) { p->fixed = true; p->depth = DEPTHS[0]; toast("Sky: as far as it goes (depth by hand)"); }
                 else {
                     int k = 0;
-                    while (k < 5 && DEPTHS[k] < p->depth - 0.01f) ++k;
-                    if (e_pgrid && k >= 4) { p->fixed = false; toast("Stands on the ground: depth from where it meets it"); }
-                    else p->depth = DEPTHS[(k + 1) % 5];
+                    while (k < N_DEPTHS && DEPTHS[k] < p->depth - 0.01f) ++k;
+                    if (e_pgrid && k >= N_DEPTHS - 1) { p->fixed = false; toast("Stands on the ground: depth from where it meets it"); }
+                    else {
+                        p->depth = DEPTHS[(k + 1) % N_DEPTHS];
+                        if (p->depth == 0.0f) toast("Sky: as far as it goes");
+                    }
                     if (!e_pgrid) p->fixed = false;
                 }
                 p->ramp = false;
@@ -2605,7 +2806,11 @@ void e_image_tap(int x, int y, uint32_t held) {
                 toast("Pinned - it swings from here");
             } else if (h && h->kind == SK_CLOTH) {
                 if (h->ng == 0) { h->ng = 1; h->gn[0] = 1; h->gx[0][0] = (float)x; h->gy[0][0] = (float)y; toast("Now the waistband's other end"); }
-                else if (h->gn[0] < 2) { h->gn[0] = 2; h->gx[0][1] = (float)x; h->gy[0][1] = (float)y; toast("Waistband set - tap folds, or done"); }
+                else if (h->gn[0] < 2) {
+                    h->gn[0] = 2; h->gx[0][1] = (float)x; h->gy[0][1] = (float)y;
+                    if (h->narm == 9) fit_skirt_hips(*h);   // (a skirt: its hips fitted to the waistband)
+                    toast("Waistband set - tap folds, or done");
+                }
                 else if (h->ng < SG_MAX) { h->gn[h->ng] = 1; h->gx[h->ng][0] = (float)x; h->gy[h->ng][0] = (float)y; ++h->ng; toast("Fold marked"); }
                 else toast("That's the most folds");
             } else toast("Drag along the lock, from its root to its tip");
@@ -2692,6 +2897,48 @@ void e_scale_button(Btn& b, uint32_t& next, int dir, uint32_t now) {
 // ================================================================================================
 // Public API
 // ================================================================================================
+#if defined(ESP_PLATFORM) && !defined(MG_LCD_40MHZ)   // (-DMG_LCD_40MHZ: never try 80)
+bool g_lcd_fast = false;                         // running the LCD at 80 MHz (checked once, at boot)
+// Write a test strip at the current (fast) clock and read it back at the slow read clock: true if it all
+// came back. Its old pixels are put back afterwards. Compared on each colour's upper bits: a panel's
+// readback may round the lowest one, a link that can't keep up garbles far more than that.
+// (Patterns: every bit flipping each pixel - the hardest for the wire - and a scrambled one.)
+bool lcd_check(int W, int H, int passes) {
+    const int N = W * H;
+    uint16_t* keep = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint16_t* pat = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    uint16_t* back = (uint16_t*)heap_caps_malloc(N * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    bool ok = keep && pat && back;
+    if (ok) M5.Display.readRect(0, 0, W, H, (lgfx::swap565_t*)keep);
+    const uint16_t MASK = 0xDEF7;                  // (0xF7DE - R, G, B upper bits - as it sits byte-swapped)
+    uint32_t r = 0x9E3779B9u ^ millis();
+    for (int pass = 0; ok && pass < passes; ++pass) {
+        for (int i = 0; i < N; ++i) {
+            const int q = pass % 3;
+            if (q == 0) pat[i] = (uint16_t)(((i + (i / W) + pass) & 1) ? 0xAAAA : 0x5555);
+            else if (q == 1) pat[i] = (uint16_t)(((i + pass) & 1) ? 0xFFFF : 0x0000);
+            else { r ^= r << 13; r ^= r >> 17; r ^= r << 5; pat[i] = (uint16_t)r; }
+        }
+        M5.Display.pushImage(0, 0, W, H, (const lgfx::swap565_t*)pat);
+        memset(back, 0, N * 2);
+        M5.Display.readRect(0, 0, W, H, (lgfx::swap565_t*)back);
+        for (int i = 0; i < N && ok; ++i) ok = (back[i] & MASK) == (pat[i] & MASK);
+    }
+    if (keep) M5.Display.pushImage(0, 0, W, H, (const lgfx::swap565_t*)keep);
+    if (keep) free(keep);
+    if (pat) free(pat);
+    if (back) free(back);
+    return ok;
+}
+void lcd_clock(uint32_t hz) {
+    auto* bus = static_cast<lgfx::Bus_SPI*>(M5.Display.getPanel()->getBus());
+    if (!bus) return;
+    auto cfg = bus->config();
+    cfg.freq_write = hz; bus->config(cfg); bus->init();
+    gpio_set_drive_capability(GPIO_NUM_18, hz > 40000000 ? GPIO_DRIVE_CAP_3 : GPIO_DRIVE_CAP_2);   // (sharper edges)
+    gpio_set_drive_capability(GPIO_NUM_23, hz > 40000000 ? GPIO_DRIVE_CAP_3 : GPIO_DRIVE_CAP_2);
+}
+#endif
 
 bool begin() {
     if (!g_sway) {                                     // (hair / cloth / pendants: ~7 KB each - PSRAM, not DRAM)
@@ -2740,17 +2987,28 @@ bool begin() {
     par_tab();                                        // parallax filter weights (likewise)
     par_start();
 #if defined(ESP_PLATFORM)
-    {   // display write clock: make sure it's at LCD_WRITE_HZ (M5GFX normally sets 40 MHz on the Core2)
+    {   // display write clock: 80 MHz if this unit's panel takes it (checked), else 40 (M5GFX's Core2 default).
+        // Clock and data (GPIO 18, 23) are the SPI port's own direct pins, so the ESP32 can drive them at
+        // 80 MHz; whether a given panel and its flex cable keep up varies, so it's tested, not assumed:
+        // worst-case bit patterns written fast, read back slowly, compared. One wrong pixel: 40 MHz.
         auto* bus = static_cast<lgfx::Bus_SPI*>(M5.Display.getPanel()->getBus());
         if (bus && M5.getBoard() == m5::board_t::board_M5StackCore2) {
             auto cfg = bus->config();
             const uint32_t was = cfg.freq_write;
-            if (was < LCD_WRITE_HZ) {
+#if !defined(MG_LCD_40MHZ)
+            lcd_clock(LCD_FAST_HZ);
+            g_lcd_fast = lcd_check(160, 8, 6);
+            if (!g_lcd_fast) lcd_clock(was > LCD_WRITE_HZ ? was : LCD_WRITE_HZ);
+            Serial.printf("jig: LCD SPI write %u Hz (was %u; 80 MHz check %s)\n", g_lcd_fast ? (unsigned)LCD_FAST_HZ : (unsigned)(was > LCD_WRITE_HZ ? was : LCD_WRITE_HZ),
+                          (unsigned)was, g_lcd_fast ? "passed" : "failed");
+#else
+            if (was < LCD_WRITE_HZ) {                  // (as it always was: at least 40 MHz)
                 cfg.freq_write = LCD_WRITE_HZ;
                 bus->config(cfg);
                 bus->init();
             }
             Serial.printf("jig: LCD SPI write %u Hz (was %u)\n", (unsigned)cfg.freq_write, (unsigned)was);
+#endif
         }
     }
 #endif
@@ -2936,31 +3194,44 @@ void play_tick(uint32_t now, bool may_draw) {
     if (want_mic && !g_mic_on) {
         if (M5.Speaker.isEnabled()) M5.Speaker.end(); // Core2: mic and speaker share one I2S port
         g_mic_on = M5.Mic.isEnabled() || M5.Mic.begin();
-        g_mic_busy = false;
+        g_mic_sub = g_mic_done = 0;
         g_onset = AudioOnset();                       // learn this room afresh (the beat tracker unlocks by itself)
         Serial.printf("jig: dance on, microphone %s\n", g_mic_on ? "listening" : "unavailable");
     } else if (!want_mic && g_mic_on) {
-        for (int k = 0; k < 40 && M5.Mic.isRecording(); ++k) delay(1);   // (let the last chunk finish)
+        for (int k = 0; k < 60 && M5.Mic.isRecording(); ++k) delay(1);   // (let the queued chunks finish: two, 20 ms each)
         M5.Mic.end();
-        g_mic_on = false; g_mic_busy = false;
+        g_mic_on = false; g_mic_sub = g_mic_done = 0;
         Serial.println("jig: dance off, microphone off");
     }
-    if (g_mic_on) {                                   // record-and-poll, one 20 ms chunk at a time
-        if (!g_mic_busy) {
-            g_mic_busy = M5.Mic.record(g_mic_buf, MIC_N, MIC_SR);
-            g_mic_at = now;
-        } else if (now - g_mic_at >= 18 && M5.Mic.isRecording() == 0) {
-            g_mic_hit = g_onset.process(g_mic_buf, MIC_N, MIC_SR);
-            g_mic_hold = (float)MIC_N / MIC_SR;
+    if (g_mic_on) {
+        // Recording without gaps: M5Unified records queued 20 ms chunks back to back in two slots, so the queue
+        // is topped up whenever it has room (isRecording() < 2), from three buffers in turn. A chunk is complete
+        // once two newer ones have been queued behind it (the newest found a free slot, so the oldest had
+        // finished - M5Stack's Core2 microphone example reads its buffers the same way).
+        float hit = 0;
+        int got = 0;
+        for (int k = 0; k < 2 && M5.Mic.isRecording() < 2; ++k) {
+            if (!M5.Mic.record(g_mic_buf[g_mic_sub % MIC_BUFS], MIC_N, MIC_SR)) break;
+            ++g_mic_sub;
+            if (g_mic_sub - g_mic_done >= (uint32_t)MIC_BUFS) {
+                const float h = g_onset.process(g_mic_buf[g_mic_done % MIC_BUFS], MIC_N, MIC_SR);
+                if (h > hit) hit = h;
+                ++g_mic_done; ++got;
+            }
+        }
+        if (got) {
+            g_mic_hit = hit;
+            g_mic_hold = (float)(got * MIC_N) / MIC_SR;
             g_mic_new = true;
-            g_mic_busy = M5.Mic.record(g_mic_buf, MIC_N, MIC_SR);
-            g_mic_at = now;
         }
         float on = g_mic_hold > 0 ? (dt < g_mic_hold ? 1.0f : g_mic_hold / dt) : 0.0f;
         mic_beat = g_rhythm_mic.update(dt, 0, 0, g_mic_hit * on, 0, 0, 1);
         g_mic_hold -= dt;
     }
-    const bool music = g_mic_on && g_onset.music() && g_rhythm_mic.steady();
+    // Music = a steady beat: the tracker locked onto a dance tempo and its recent beats keep landing on hits
+    // (talking, a fan, knocks or a clock never do). Not the loudness over the room's level: that's learnt from
+    // whatever is playing when dance is switched on - music already playing then was never "louder" than it.
+    const bool music = g_mic_on && g_rhythm_mic.steady();
     g_dance = music ? (g_dance + dt < 1.0f ? g_dance + dt : 1.0f) : (g_dance - dt * 0.5f > 0.0f ? g_dance - dt * 0.5f : 0.0f);
     if (music != g_was_music) {
         g_was_music = music;
@@ -3087,14 +3358,14 @@ void play_tick(uint32_t now, bool may_draw) {
     if (g_sw_send) {
         if (!fits(g_c_swpush.us + (g_n > 0 ? g_c_zones.us : 0))) return;
         g_sw_send = false;
-        { Piece pc(g_c_swpush); sway_push(g_sj.which, g_sj.nd); }
-        under = true;
-        for (int k = 0; k < g_sj.nd; ++k)              // zones over them draw on top
-            for (int i = 0; i < g_n; ++i) {
+        for (int k = 0; k < g_sj.nd; ++k)              // zones over them draw on top (known first: the sways
+            for (int i = 0; i < g_n; ++i) {            //  leave them their pixels)
                 const Sway& h = g_sway[g_sj.which[k]];
                 const Zone& z = g_z[i];
                 if (z.wmap && regions_meet(z.bx, z.by, z.bx + z.bw, z.by + z.bh, h.ux0, h.uy0, h.ux1, h.uy1)) { g_shown[i] = true; any = true; }
             }
+        { Piece pc(g_c_swpush); sway_push(g_sj.which, g_sj.nd, false); }
+        under = true;
     }
     static bool s_zone_skipped = false;                 // (the zones next tick - but never two ticks running)
     if (!under && !s_zone_skipped && any && !fits(g_c_zones)) { s_zone_skipped = true; return; }
@@ -3239,6 +3510,16 @@ void editor_tick(uint32_t now) {
             }
             if (!t_bar && e_mm() && e_wtool == WT_SMART) { e_bx = -1; e_mark(td.x, td.y); e_dirty = true; }
             if (!t_bar && e_mm() && e_wtool == WT_GRID) e_grid_press(td.x, td.y);
+            e_hipdrag = -1;
+            if (!t_bar && e_smode && e_wtool == WT_LINE && e_sway() && e_sway()->kind == SK_CLOTH && e_sway()->narm == 9) {
+                const Sway& hs = *e_sway();                // a skirt's hip point under the finger (12 px): drag it
+                int best = 145;
+                for (int a = 0; a < 9; ++a) {
+                    const int dx = hs.armx[a] - td.x, dy = hs.army[a] - td.y;
+                    if (dx * dx + dy * dy < best) { best = dx * dx + dy * dy; e_hipdrag = a; }
+                }
+                if (e_hipdrag >= 0) e_dirty = true;
+            }
             if (!t_bar && e_smode && e_wtool == WT_LINE && e_sway() && e_sway()->kind == SK_HAIR) {   // a lock: root here
                 e_stroke = true; e_pn = 1; e_px[0] = (int16_t)td.x; e_py[0] = (int16_t)td.y;
             }
@@ -3250,6 +3531,12 @@ void editor_tick(uint32_t now) {
                 }
                 if (e_wtool == WT_SMART && (td.x != t_lx || td.y != t_ly)) { e_mark(td.x, td.y); e_dirty = true; }
                 if (e_wtool == WT_GRID && t_moved && (td.x != t_lx || td.y != t_ly)) { e_grid_drag(td.x - t_lx, td.y - t_ly); e_dirty = true; }
+                if (e_hipdrag >= 0 && e_sway()) {     // a skirt's hip point follows the finger
+                    Sway& hs = *e_sway();
+                    hs.armx[e_hipdrag] = (int16_t)(td.x < 0 ? 0 : (td.x >= IMG_W ? IMG_W - 1 : td.x));
+                    hs.army[e_hipdrag] = (int16_t)(td.y < 0 ? 0 : (td.y >= IMG_H ? IMG_H - 1 : td.y));
+                    e_dirty = true;
+                }
                 if (e_stroke && e_pn < 32) {          // (a point every few px along the lock)
                     const int dx = td.x - e_px[e_pn - 1], dy = td.y - e_py[e_pn - 1];
                     if (dx * dx + dy * dy >= 25) { e_px[e_pn] = (int16_t)td.x; e_py[e_pn] = (int16_t)td.y; ++e_pn; e_dirty = true; }
@@ -3272,7 +3559,9 @@ void editor_tick(uint32_t now) {
         }
     } else if (t_down) {
         t_down = false;
-        if (e_stroke) {                       // a lock drawn: kept (at most 16 points along it)
+        if (e_hipdrag >= 0) {                 // a hip point let go (not a tap: no fold marked)
+            e_hipdrag = -1; e_dirty = true;
+        } else if (e_stroke) {                // a lock drawn: kept (at most 16 points along it)
             e_stroke = false;
             Sway* h = e_sway();
             if (t_moved && h && e_pn >= 2) {

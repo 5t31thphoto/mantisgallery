@@ -94,6 +94,8 @@ struct Sway {
     int  rx0 = 0, ry0 = 0, rw = 0, rh = 0;    // its buffers' rect
     int8_t*   own = nullptr;                  // per pixel: rod / panel carrying it (−1 none)
     uint8_t*  hole = nullptr;                 // what it uncovers (the plate shows there)
+    uint16_t* hrow = nullptr;                 // …as runs per row (fixed once prepared): row r's are
+    int16_t*  hrun = nullptr;                 //   hrun[2·hrow[r] …): (x0, x1) pairs, buffer columns
     uint8_t*  alpha = nullptr;                // edge alpha (0..255)
     uint16_t* plate = nullptr;                // what's behind (native RGB565)
     uint16_t* photo = nullptr;                // the photo here (native)
@@ -122,8 +124,9 @@ struct Sway {
 };
 
 inline void sway_free_runtime(Sway& s) {
-    void* bufs[] = {s.own, s.hole, s.alpha, s.plate, s.photo, s.texd, s.c8, s.t8, s.solid, s.hipl, s.hipr};
+    void* bufs[] = {s.own, s.hole, s.alpha, s.plate, s.photo, s.texd, s.c8, s.t8, s.solid, s.hipl, s.hipr, s.hrow, s.hrun};
     for (void* b : bufs) if (b) free(b);
+    s.hrow = nullptr; s.hrun = nullptr;
     s.own = nullptr; s.hole = nullptr; s.alpha = nullptr; s.plate = s.photo = s.texd = nullptr; s.c8 = s.t8 = nullptr;
     s.hipl = s.hipr = nullptr; s.solid = nullptr;
     s.ready = false;
@@ -713,6 +716,118 @@ inline void sw_fill(Sway& s, const uint8_t* body, const uint8_t* fb, int16_t* nx
     }
 }
 
+// A skirt's hip outline fitted to it (mg_sway.fit_hips): a start you then line up. Points round it: waist L,
+// hip L, left leg outer (at the hem), left leg inner, between the legs, right leg inner, right leg outer,
+// hip R, waist R. Its waistband's ends if set, its legs under the hem (body) if known, else body proportions.
+inline bool sway_fit_hips(Sway& s, const uint8_t* body) {
+    if (!s.mask) return false;
+    auto bit = [](const uint8_t* m, int x, int y) { const int i = y * IMG_W + x; return ((m[i >> 3] >> (i & 7)) & 1) != 0; };
+    int top = -1, bot = -1, xa = IMG_W, xb = -1;
+    for (int y = 0; y < IMG_H; ++y)
+        for (int x = 0; x < IMG_W; ++x)
+            if (bit(s.mask, x, y)) { if (top < 0) top = y; bot = y; if (x < xa) xa = x; if (x > xb) xb = x; }
+    if (top < 0) return false;
+    float wa, wb;
+    if (s.gn[0] >= 2) {                                 // (the waistband you set: its two ends)
+        float ax = s.gx[0][0], ay = s.gy[0][0], bx = s.gx[0][1], by = s.gy[0][1];
+        if (bx < ax) { std::swap(ax, bx); std::swap(ay, by); }
+        wa = ax; wb = bx; top = (int)lroundf(std::min(ay, by));
+    } else {
+        int lo = IMG_W, hi = -1;
+        for (int y = top; y < std::min(IMG_H, top + std::max(2, (bot - top) / 10)); ++y)
+            for (int x = 0; x < IMG_W; ++x) if (bit(s.mask, x, y)) { lo = std::min(lo, x); hi = std::max(hi, x); }
+        wa = (float)lo; wb = (float)hi;
+    }
+    // her legs right under the hem (body, not skirt): the two widest runs of columns
+    bool cols[IMG_W] = {false};
+    if (body)
+        for (int y = bot + 1; y < std::min(IMG_H, bot + 8); ++y)
+            for (int x = std::max(0, xa - 2); x < std::min(IMG_W, xb + 3); ++x)
+                if (bit(body, x, y) && !bit(s.mask, x, y)) cols[x] = true;
+    int ra[2] = {0, 0}, rb[2] = {-1, -1}, nr = 0;      // (the two longest runs ≥ 2, later ones winning ties)
+    for (int x = 0; x < IMG_W;) {
+        if (!cols[x]) { ++x; continue; }
+        const int a = x;
+        while (x < IMG_W && cols[x]) ++x;
+        const int len = x - a;
+        if (len < 2) continue;
+        if (nr < 2) { ra[nr] = a; rb[nr] = x - 1; ++nr; }
+        else {
+            const int l0 = rb[0] - ra[0] + 1, l1 = rb[1] - ra[1] + 1;
+            const int k = (l0 < l1 || (l0 == l1 && ra[0] < ra[1])) ? 0 : 1;   // replace the shorter (the earlier on a tie)
+            if (len >= (k == 0 ? l0 : l1)) { ra[k] = a; rb[k] = x - 1; }
+        }
+    }
+    if (nr == 2 && ra[1] < ra[0]) { std::swap(ra[0], ra[1]); std::swap(rb[0], rb[1]); }
+    const float c = (wa + wb) / 2, w = wb - wa;
+    float lo, li, ri, ro;
+    if (nr == 2) { lo = (float)ra[0]; li = (float)rb[0]; ri = (float)ra[1]; ro = (float)rb[1]; }
+    else if (nr == 1) { lo = (float)ra[0]; ro = (float)rb[0]; li = ri = (lo + ro) / 2; }
+    else { lo = c - w * 0.4f; ro = c + w * 0.4f; li = c - w * 0.05f; ri = c + w * 0.05f; }
+    // body proportions: the hip line about 0.4 waist-widths under the waist, the point between the legs about
+    // 0.85 (well above the hem of anything knee-length)
+    const float yh = std::min(top + w * 0.4f, top + (bot - top) * 0.45f);
+    const float hl = std::min(wa, lo) - w * 0.06f, hr = std::max(wb, ro) + w * 0.06f;
+    const float yc = std::min(top + w * 0.85f, bot - 2.0f);
+    const float px[9] = {wa, hl, lo, li, (li + ri) / 2, ri, ro, hr, wb};
+    const float py[9] = {(float)top, yh, (float)bot, (float)bot, yc, (float)bot, (float)bot, yh, (float)top};
+    for (int k = 0; k < 9; ++k) {
+        s.armx[k] = (int16_t)std::max(0L, std::min((long)IMG_W - 1, lrintf(px[k])));   // (as the Studio saves them:
+        s.army[k] = (int16_t)std::max(0L, std::min((long)IMG_H - 1, lrintf(py[k])));   //  round half to even)
+    }
+    s.narm = 9;
+    return true;
+}
+// A skirt's hip outline across row y: where it crosses the row's middle, sorted (even-odd: inside between
+// pairs). n of them.
+inline int sw_hips_xs(const Sway& s, int y, float* xs) {
+    const float yc = y + 0.5f;
+    int n = 0;
+    for (int a = 0; a < 9; ++a) {
+        const int b = (a + 1) % 9;
+        const float ya = s.army[a], yb = s.army[b];
+        if ((ya <= yc) == (yb <= yc)) continue;
+        xs[n++] = s.armx[a] + (yc - ya) * (s.armx[b] - s.armx[a]) / (yb - ya);
+    }
+    std::sort(xs, xs + n);
+    return n;
+}
+inline bool sw_hips_in(const float* xs, int n, int x) {
+    const float xc = x + 0.5f;
+    bool in = false;
+    for (int k = 0; k + 1 < n; k += 2) in |= xc >= xs[k] && xc < xs[k + 1];
+    return in;
+}
+// Her body under a skirt (mg_sway.hips_mask / cloth_fill): across the skirt's rows and columns, the body
+// is what's inside its hip outline - the rest there is the scene beside her. Other pixels as they were.
+inline void sway_hips_body(const Sway& s, uint8_t* m) {
+    if (s.kind != SK_CLOTH || s.narm != 9 || !s.mask || !m) return;
+    int top = -1, bot = -1;
+    bool cols[IMG_W] = {false};
+    for (int y = 0; y < IMG_H; ++y)
+        for (int x = 0; x < IMG_W; ++x)
+            if (bget_(s.mask, y * IMG_W + x)) { if (top < 0) top = y; bot = y; cols[x] = true; }
+    for (int y = std::max(top, 0); y <= bot; ++y) {
+        float xs[9];
+        const int n = sw_hips_xs(s, y, xs);
+        for (int x = 0; x < IMG_W; ++x) {
+            if (!cols[x]) continue;
+            const int i = y * IMG_W + x;
+            if (sw_hips_in(xs, n, x)) m[i >> 3] |= (uint8_t)(1 << (i & 7)); else m[i >> 3] &= (uint8_t)~(1 << (i & 7));
+        }
+    }
+}
+// Skin-coloured (mg_sway.is_skin: YCbCr box, Chai & Ngan 1999)
+inline bool sw_is_skin(float r, float g, float b) {
+    const float cr = 128 + 0.5f * r - 0.4187f * g - 0.0813f * b;
+    const float cb = 128 - 0.1687f * r - 0.3313f * g + 0.5f * b;
+    return cr >= 136 && cr <= 173 && cb >= 77 && cb <= 124 && r > g && r > b + 10;
+}
+// The median of each channel (np.median: the middle one, or the mean of the middle two). n > 0; sorts v.
+inline float sw_median(float* v, int n) {
+    std::sort(v, v + n);
+    return (n & 1) ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2]);
+}
 // Safety: the bikini area of a skirt's hip outline (mg_sway.bikini_poly) - round the point between the
 // legs. Where the fill behind a swinging skirt would show skin there, a white bikini bottom with pink
 // polka dots shows instead.
@@ -744,6 +859,173 @@ inline uint16_t sw_bikini_color(int x, int y) {
     const float gx = (x % 6) - 2.5f, gy = (y % 6) - 2.5f;
     return gx * gx + gy * gy <= 2.0f ? sw_pack(255, 150, 190) : sw_pack(238, 238, 238);
 }
+// Her seat seen from behind (mg_sway._seat_shade), as light and shade on the skin colour: two rounded cheeks
+// (lit toward their middles), the crease between them, and each one's lower curve (the fold) where it meets
+// the thigh. All from the hip outline: hip line, the point between the legs, the outline's sides.
+inline float sw_seat_shade(const Sway& s, float x, float y) {
+    const float h0x = s.armx[1], h0y = s.army[1], cx = s.armx[4], cy = s.army[4], h1x = s.armx[7], h1y = s.army[7];
+    const float hy = (h0y + h1y) / 2.0f, hgt = std::max(4.0f, cy - hy);
+    const float ccx[2] = {(h0x + cx) / 2.0f + 0.5f, (h1x + cx) / 2.0f - 0.5f};
+    const float hw[2] = {std::max(2.5f, (cx - h0x) / 2.0f), std::max(2.5f, (h1x - cx) / 2.0f)};
+    const float ccy = hy + hgt * 0.5f, rv = hgt * 0.62f;
+    float k = 1.0f;
+    if (y < hy - 1) return k - 0.06f * expf(-((x - cx) / 1.6f) * ((x - cx) / 1.6f));   // her lower back: the spine
+    const float t = (y - (hy + hgt * 0.15f)) / (hgt * 0.85f);                         // the crease, deepening down
+    if (t > 0) k -= 0.24f * std::min(1.0f, t) * expf(-((x - cx) / 1.2f) * ((x - cx) / 1.2f));
+    for (int c = 0; c < 2; ++c) {
+        const float u = (x - ccx[c]) / hw[c], v = (y - ccy) / rv;
+        k += 0.16f * powf(std::max(0.0f, 1.0f - (u * u + v * v)), 0.7f) - 0.12f * powf(std::min(1.0f, u * u), 1.5f);
+        if (fabsf(u) < 1.15f) {                                                       // the fold: lowest under its middle
+            const float yf = cy - 2.0f - 2.2f * u * u;
+            k -= 0.16f * expf(-((y - yf) / 1.2f) * ((y - yf) / 1.2f));
+        }
+    }
+    return k;
+}
+// A skirt's fill inside its hip outline (mg_sway.cloth_fill): her legs and thighs in her own skin.
+// From the front: each column carried up from her leg a little under the hem (else her skin tone),
+// smoothed across, rounded off darker toward the outline. From behind (arm_back): the lit part of her
+// thigh further down, her seat's light and shade (sw_seat_shade), and right at the hem the shadow the skirt
+// casts on her leg blended in over the last 6 px, so the fill joins the leg without a seam; the bikini there
+// takes the same curves, half as deep. Not where the Studio sent a fill. Goes on after the bikini (which is
+// always there - from behind, only shaded here). body: as for sw_fill (her hips inside the outline);
+// forbid: the other sways.
+inline void sw_skirt_skin(Sway& s, const uint16_t* photo, bool psw, const uint8_t* body, const uint8_t* forbid) {
+    if (s.kind != SK_CLOTH || s.narm != 9 || !s.mask || !photo) return;
+    int top = -1, bot = -1;
+    for (int y = 0; y < IMG_H && top < 0; ++y) for (int x = 0; x < IMG_W; ++x) if (bget_(s.mask, y * IMG_W + x)) { top = y; break; }
+    for (int y = IMG_H - 1; y >= 0 && bot < 0; --y) for (int x = 0; x < IMG_W; ++x) if (bget_(s.mask, y * IMG_W + x)) { bot = y; break; }
+    if (top < 0) return;
+    auto rgb = [&](int X, int Y, float& r, float& g, float& b) {
+        uint16_t v = photo[Y * IMG_W + X];
+        if (psw) v = (uint16_t)((v >> 8) | (v << 8));
+        sw_unpack(v, r, g, b);
+    };
+    auto hole = [&](int X, int Y) {                     // (its hole: only inside its buffers)
+        const int x = X - s.rx0, y = Y - s.ry0;
+        return x >= 0 && y >= 0 && x < s.rw && y < s.rh && s.hole[y * s.rw + x];
+    };
+    auto legs = [&](int X, int Y) {
+        const int i = Y * IMG_W + X;
+        return body && bget_(body, i) && !bget_(s.mask, i) && !hole(X, Y);
+    };
+    std::vector<float> xs((size_t)IMG_H * 9);           // the outline's crossings, every row
+    std::vector<uint8_t> nxs(IMG_H);
+    for (int y = 0; y < IMG_H; ++y) nxs[y] = (uint8_t)sw_hips_xs(s, y, &xs[(size_t)y * 9]);
+    auto inside = [&](int X, int Y) { return X >= 0 && Y >= 0 && X < IMG_W && Y < IMG_H && sw_hips_in(&xs[(size_t)Y * 9], nxs[Y], X); };
+    // her skin tone: her skin above the skirt (never another sway), else her legs under its hem, else a default
+    float tone[3] = {224.0f, 172.0f, 140.0f};
+    {
+        uint32_t hist[3][256];
+        bool done = false;
+        for (int pass = 0; pass < 2 && !done; ++pass) {
+            memset(hist, 0, sizeof(hist));
+            int cnt = 0;
+            const int y0 = pass == 0 ? 0 : bot + 1, y1 = pass == 0 ? top : std::min(IMG_H, bot + 12);
+            for (int Y = y0; Y < y1; ++Y)
+                for (int X = 0; X < IMG_W; ++X) {
+                    const int i = Y * IMG_W + X;
+                    if (pass == 0 ? !(body && bget_(body, i) && !(forbid && bget_(forbid, i))) : !legs(X, Y)) continue;
+                    float r, g, b; rgb(X, Y, r, g, b);
+                    if (!sw_is_skin(r, g, b)) continue;
+                    ++hist[0][(int)r]; ++hist[1][(int)g]; ++hist[2][(int)b]; ++cnt;
+                }
+            if (cnt < 12) continue;
+            for (int c = 0; c < 3; ++c) {               // (the median, from the counts: the values are whole)
+                auto nth = [&](int k) { int acc = 0; for (int v = 0; v < 256; ++v) { acc += (int)hist[c][v]; if (acc > k) return v; } return 255; };
+                tone[c] = (cnt & 1) ? (float)nth(cnt / 2) : 0.5f * (nth(cnt / 2 - 1) + nth(cnt / 2));
+            }
+            done = true;
+        }
+    }
+    // each column: her leg's own shade below the hem (behind: also the leg right at the hem, shadow and all)
+    const bool back = s.arm_back;
+    std::vector<float> base((size_t)IMG_W * 3), shade((size_t)IMG_W * 3);
+    std::vector<int16_t> cmax(IMG_W, -1);
+    for (int X = 0; X < IMG_W; ++X) {
+        for (int c = 0; c < 3; ++c) base[X * 3 + c] = shade[X * 3 + c] = tone[c];
+        int cm = -1;
+        for (int Y = IMG_H - 1; Y >= 0 && cm < 0; --Y) if (inside(X, Y) && hole(X, Y)) cm = Y;
+        cmax[X] = (int16_t)cm;
+        if (cm < 0) continue;
+        // a little way down the thigh (right under the hem lies the skirt's own shadow, gone once it lifts);
+        // behind: the lit part of her thigh further down (the brighter half of it)
+        const int y0 = cm + 3, y1 = std::min(IMG_H, cm + (back ? 30 : 14));
+        float v[3][32]; int n = 0;
+        for (int Y = y0; Y < y1; ++Y) {
+            if (!legs(X, Y)) continue;
+            float r, g, b; rgb(X, Y, r, g, b);
+            if (!sw_is_skin(r, g, b)) continue;
+            v[0][n] = r; v[1][n] = g; v[2][n] = b; ++n;
+        }
+        if (back && n >= 6) {
+            float lu[32], tl[32];
+            for (int k = 0; k < n; ++k) lu[k] = tl[k] = v[0][k] * 0.3f + v[1][k] * 0.59f + v[2][k] * 0.11f;
+            const float med = sw_median(tl, n);
+            int m = 0;
+            for (int k = 0; k < n; ++k) if (lu[k] >= med) { v[0][m] = v[0][k]; v[1][m] = v[1][k]; v[2][m] = v[2][k]; ++m; }
+            n = m;
+        }
+        if (n >= 3) for (int c = 0; c < 3; ++c) base[X * 3 + c] = back ? sw_median(v[c], n) : sw_median(v[c], n) * 0.6f + tone[c] * 0.4f;
+        if (back) {                                     // (the leg right at the hem: shadow and all, any colour)
+            float w[3][4]; int m = 0;
+            for (int Y = cm + 1; Y < std::min(IMG_H, cm + 4); ++Y) {
+                if (!legs(X, Y)) continue;
+                float r, g, b; rgb(X, Y, r, g, b);
+                w[0][m] = r; w[1][m] = g; w[2][m] = b; ++m;
+            }
+            for (int c = 0; c < 3; ++c) shade[X * 3 + c] = m ? sw_median(w[c], m) : base[X * 3 + c];
+        }
+    }
+    std::vector<float> sm((size_t)IMG_W * 3), sh((size_t)IMG_W * 3);   // (smoothed across: skin, not stripes - 7 wide, edges held)
+    for (int X = 0; X < IMG_W; ++X)
+        for (int c = 0; c < 3; ++c) {
+            float a = 0, d = 0;
+            for (int k = -3; k <= 3; ++k) {
+                const int j = std::max(0, std::min(IMG_W - 1, X + k)) * 3 + c;
+                a += base[j]; d += shade[j];
+            }
+            sm[X * 3 + c] = a / 7; sh[X * 3 + c] = d / 7;
+        }
+    float qx[SW_BIKINI_N], qy[SW_BIKINI_N];
+    const bool biki = sw_bikini_poly(s, qx, qy);
+    for (int i = 0; i < s.rw * s.rh; ++i) {
+        if (!s.hole[i]) continue;
+        const int X = s.rx0 + i % s.rw, Y = s.ry0 + i / s.rw;
+        if (!inside(X, Y) || (s.pdef_ok && s.pdef_has && bget_(s.pdef_has, Y * IMG_W + X))) continue;
+        const bool bz = biki && sw_in_poly(qx, qy, SW_BIKINI_N, X + 0.5f, Y + 0.5f);
+        if (back) {
+            const float* row = &xs[(size_t)Y * 9];          // (rounded, softly, toward her sides only: the bottom
+            int ra = IMG_W, rb = -1;                        //  carries on into her legs)
+            for (int x = 0; x < IMG_W; ++x) if (sw_hips_in(row, nxs[Y], x)) { ra = std::min(ra, x); rb = x; }
+            const float dsd = rb >= 0 ? (float)std::min(X - ra, rb - X) : 0.0f;
+            const float k = sw_seat_shade(s, (float)X, (float)Y) * (0.84f + 0.16f * std::min(1.0f, dsd / 4.0f));
+            if (bz) {                                       // (the bikini wraps the same curves, half as deep)
+                float r, g, b; sw_unpack(sw_bikini_color(X, Y), r, g, b);
+                const float f = 0.5f + 0.5f * k;
+                s.plate[i] = sw_pack(std::min(255.0f, std::max(0.0f, r * f)), std::min(255.0f, std::max(0.0f, g * f)), std::min(255.0f, std::max(0.0f, b * f)));
+                continue;
+            }
+            float u = std::min(1.0f, (cmax[X] - Y) / 6.0f);   // into the hem's shadow over its last 6 px
+            u = u * u * (3 - 2 * u);
+            float c3[3];
+            for (int c = 0; c < 3; ++c) c3[c] = std::min(255.0f, std::max(0.0f, (sh[X * 3 + c] * (1 - u) + sm[X * 3 + c] * u) * k));
+            s.plate[i] = sw_pack(c3[0], c3[1], c3[2]);
+            continue;
+        }
+        if (bz) continue;                                   // (front: the bikini as it is)
+        int d2 = 9;                                     // (how far in: the nearest pixel outside it, within 3)
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx) {
+                const int x = X + dx, y = Y + dy;
+                if (x < 0 || y < 0 || x >= IMG_W || y >= IMG_H || inside(x, y)) continue;
+                d2 = std::min(d2, dx * dx + dy * dy);
+            }
+        const float k = d2 <= 2 ? 0.82f : (d2 < 9 ? 0.92f : 1.0f);   // (d < 1.5, d < 3)
+        s.plate[i] = sw_pack(sm[X * 3] * k, sm[X * 3 + 1] * k, sm[X * 3 + 2] * k);
+    }
+}
+
 
 // Edge alpha and carried colour (mg_sway.matte): the outline pixel and two rings past it split
 // c = a·H + (1 − a)·B, H = nearest solid pixel of it, B = what's behind (the plate).
@@ -866,6 +1148,7 @@ inline bool sway_prepare(Sway& s, const uint16_t* photo, bool psw, const uint8_t
                 if (sw_in_poly(qx, qy, SW_BIKINI_N, X + 0.5f, Y + 0.5f)) s.plate[i] = sw_bikini_color(X, Y);
             }
     }
+    sw_skirt_skin(s, photo, psw, body, forbid);         // (a skirt: her legs inside its hip outline)
     sw_matte(s, moving, nx, ny, tmp, d2, tx, ty);
     if (s.kind != SK_PENDANT) {                         // the rings past it belong to its nearest lock / panel
         uint8_t* seed = tmp;
@@ -939,6 +1222,31 @@ inline bool sway_prepare(Sway& s, const uint16_t* photo, bool psw, const uint8_t
                 s.hipl[y] = lo <= hi ? (int16_t)lroundf(lo) : (int16_t)-1;
                 s.hipr[y] = lo <= hi ? (int16_t)lroundf(hi) : (int16_t)-1;
             }
+    }
+    {   // what it uncovers as runs per row (sway_draw_rows puts the plate back a run at a time; without the
+        // memory, a pixel at a time)
+        size_t nr = 0;
+        for (int r = 0; r < s.rh; ++r)
+            for (int x = 0; x < s.rw; ++x) if (s.hole[r * s.rw + x] && (x == 0 || !s.hole[r * s.rw + x - 1])) ++nr;
+        s.hrow = (uint16_t*)alloc((size_t)(s.rh + 1) * 2);
+        s.hrun = nr <= 0xFFFF ? (int16_t*)alloc((nr ? nr : 1) * 4) : nullptr;
+        if (!s.hrow || !s.hrun) {
+            if (s.hrow) free(s.hrow);
+            if (s.hrun) free(s.hrun);
+            s.hrow = nullptr; s.hrun = nullptr;
+        } else {
+            size_t k = 0;
+            for (int r = 0; r < s.rh; ++r) {
+                s.hrow[r] = (uint16_t)k;
+                for (int x = 0; x < s.rw;) {
+                    if (!s.hole[r * s.rw + x]) { ++x; continue; }
+                    const int x0 = x;
+                    while (x < s.rw && s.hole[r * s.rw + x]) ++x;
+                    s.hrun[2 * k] = (int16_t)x0; s.hrun[2 * k + 1] = (int16_t)x; ++k;
+                }
+            }
+            s.hrow[s.rh] = (uint16_t)k;
+        }
     }
     s.t = s.acc = s.fade = 0; s.disp = 0; s.awake = true; s.drawn = false;
     s.lx0 = s.rx0; s.ly0 = s.ry0; s.lx1 = s.rx0 + s.rw; s.ly1 = s.ry0 + s.rh;
@@ -1226,8 +1534,20 @@ JIG_INLINE void sw_put(uint16_t* out, bool osw, int X, int Y, uint16_t v) { out[
 JIG_INLINE float sw_al(const uint8_t* AL, int i, float keep, float fade) { return AL[i] ? keep + AL[i] * (1.0f / 255.0f) * fade : 0.0f; }
 JIG_HOT void sway_draw_rows(const Sway& s, const SwDraw& D, uint16_t* out, bool osw, int ya, int yb) {
     if (!s.ready) return;
-    for (int y = std::max(ya, s.ry0); y < std::min(yb, s.ry0 + s.rh); ++y)
-        for (int x = 0; x < s.rw; ++x) { const int i = (y - s.ry0) * s.rw + x; if (s.hole[i]) sw_put(out, osw, s.rx0 + x, y, s.plate[i]); }
+    for (int y = std::max(ya, s.ry0); y < std::min(yb, s.ry0 + s.rh); ++y) {
+        const int r = y - s.ry0;
+        if (s.hrun) {                                 // (its runs: copied straight, or swapped as they go)
+            for (int k = s.hrow[r]; k < s.hrow[r + 1]; ++k) {
+                const int x0 = s.hrun[2 * k], n = s.hrun[2 * k + 1] - x0;
+                uint16_t* d = out + y * IMG_W + s.rx0 + x0;
+                const uint16_t* p = s.plate + r * s.rw + x0;
+                if (!osw) memcpy(d, p, (size_t)n * 2);
+                else for (int x = 0; x < n; ++x) d[x] = (uint16_t)((p[x] >> 8) | (p[x] << 8));
+            }
+            continue;
+        }
+        for (int x = 0; x < s.rw; ++x) { const int i = r * s.rw + x; if (s.hole[i]) sw_put(out, osw, s.rx0 + x, y, s.plate[i]); }
+    }
     const SwTri* tris = D.tris; const int* order = D.order; const int nt = D.nt;
     const float fade = s.fade, keep = 1.0f - fade;
     const bool hair = s.kind == SK_HAIR;

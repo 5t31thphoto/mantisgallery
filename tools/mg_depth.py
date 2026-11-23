@@ -301,10 +301,15 @@ class DepthPreview:
             take = p.mask & (dk > dep)
             owner[take] = k + 1; dep[take] = dk[take]
         self.owner = owner
-        f, A = P.get("focus"), P.get("amount")
-        m = max([abs(p.drange()[0] - f) for p in self.planes] + [abs(p.drange()[1] - f) for p in self.planes] + [f]
-                + ([1.0 - f] if self.gr else []))
-        self.margin = int(math.ceil(m * A * max(1.0, P.get("vert")) * 1.05)) + 3
+        f, A, vert, amb = P.get("focus"), P.get("amount"), P.get("vert"), P.get("ambient")
+        # the view: a full tilt (1, through the soft limit) plus the idle drift, at most ambient·(0.55 + 0.22)
+        # across and ambient·(0.40 + 0.15) up / down (step's two sines each way)
+        vx, vy = 1.0 + (0.55 + 0.22) * amb, 1.0 + (0.40 + 0.15) * amb
+        # how far two layers slide apart (a nearer one uncovering what's behind it): their depths differ by at
+        # most the nearest depth there is (the background is 0)
+        span = max([p.drange()[1] for p in self.planes] + ([1.0] if self.gr else [0.0]))
+        self.margin = int(math.ceil(max(span * A * vx, span * A * vert * vy))) + 3
+
         deep = self.margin + 4
         # fills: each layer's colours continued past its edge (mirrored across the nearest own pixel)
         self.fill = []
@@ -335,19 +340,27 @@ class DepthPreview:
         self.soft = [soften(c) for c in cov]
         self.order = sorted(range(len(self.planes)), key=lambda k: -dhi[k])
         self.X, self.Y = X, Y
-        self.zoom = 1.0 + 2.0 * (self.margin - 3 + 1) / W if self.gr else 1.0
+        # no zoom: the photo's own pixels at rest; past the photo's edge a slide reads it mirrored (_mir)
+        self.zoom = 1.0
         self.ZX = (X - W * 0.5) / self.zoom + W * 0.5
         self.ZY = (Y - H * 0.5) / self.zoom + H * 0.5
         self.gd = np.clip(self.gr[0] + self.gr[1] * X + self.gr[2] * Y, 0, 1) if self.gr else None
 
     @staticmethod
-    def _shift(img, sx, sy):
-        """img sampled at (x − sx, y − sy), bilinear, edges clamped. sx, sy scalars."""
+    def _mir(i, n):
+        """source indices past the photo's edge read it mirrored about that edge (… 1, 0 | 0, 1 …), as the Core2's
+        par_mirror: what a slide uncovers there lines up with the photo"""
+        i = np.where(i < 0, -1 - i, np.where(i >= n, 2 * n - 1 - i, i))
+        return np.clip(i, 0, n - 1)
+
+    @classmethod
+    def _shift(cls, img, sx, sy):
+        """img sampled at (x − sx, y − sy), bilinear, mirrored past the edges. sx, sy scalars."""
         ix, iy = math.floor(sx), math.floor(sy)
         fx, fy = sx - ix, sy - iy
 
-        def sl(a, ox, oy):              # a[y − oy, x − ox] with clamping
-            ys = np.clip(np.arange(H) - oy, 0, H - 1); xs = np.clip(np.arange(W) - ox, 0, W - 1)
+        def sl(a, ox, oy):              # a[y − oy, x − ox], mirrored past the edges
+            ys = cls._mir(np.arange(H) - oy, H); xs = cls._mir(np.arange(W) - ox, W)
             return a[ys][:, xs]
         a00 = sl(img, ix, iy); a10 = sl(img, ix + 1, iy); a01 = sl(img, ix, iy + 1); a11 = sl(img, ix + 1, iy + 1)
         # sampling at x − sx = (x − ix) − fx: between x − ix − 1 (weight fx) and x − ix (1 − fx)
@@ -363,7 +376,7 @@ class DepthPreview:
 
     @classmethod
     def _shift4(cls, img, sx, sy, q):
-        """img (H, W, 3) sampled at (x − sx, y − sy) with the colour filter (_taps), separable, edges clamped."""
+        """img (H, W, 3) sampled at (x − sx, y − sy) with the colour filter (_taps), separable, mirrored past the edges."""
         if q <= 0:
             return cls._shift(img, sx, sy)
         # sample position x − sx = (x − ix − 1) + (1 − fx): taps at x − ix − 2 … x − ix + 1, phase 1 − fx
@@ -373,24 +386,24 @@ class DepthPreview:
         if ty >= 1.0: iy, ty = iy - 1, 0.0
         wx, wy = cls._taps(tx, q), cls._taps(ty, q)
         xs = np.arange(W); ys = np.arange(H)
-        h = sum(w * img[:, np.clip(xs - ix - 2 + k, 0, W - 1)] for k, w in enumerate(wx))
-        out = sum(w * h[np.clip(ys - iy - 2 + k, 0, H - 1)] for k, w in enumerate(wy))
+        h = sum(w * img[:, cls._mir(xs - ix - 2 + k, W)] for k, w in enumerate(wx))
+        out = sum(w * h[cls._mir(ys - iy - 2 + k, H)] for k, w in enumerate(wy))
         return np.clip(out, 0, 255)
 
     @classmethod
     def _sample4(cls, a, qx, qy, q):
-        """a (H, W, 3) sampled at per-pixel (qx, qy) (clamped inside) with the colour filter (_taps)."""
+        """a (H, W, 3) sampled at per-pixel (qx, qy) with the colour filter (_taps), mirrored past the edges."""
         ix, iy = np.floor(qx).astype(np.int32), np.floor(qy).astype(np.int32)
         tx, ty = qx - ix, qy - iy
         if q <= 0:
             fx, fy = tx[..., None], ty[..., None]
-            x1, y1 = np.minimum(ix + 1, W - 1), np.minimum(iy + 1, H - 1)
-            return (a[iy, ix] * (1 - fx) + a[iy, x1] * fx) * (1 - fy) + (a[y1, ix] * (1 - fx) + a[y1, x1] * fx) * fy
+            x0, x1, y0, y1 = cls._mir(ix, W), cls._mir(ix + 1, W), cls._mir(iy, H), cls._mir(iy + 1, H)
+            return (a[y0, x0] * (1 - fx) + a[y0, x1] * fx) * (1 - fy) + (a[y1, x0] * (1 - fx) + a[y1, x1] * fx) * fy
         wx, wy = cls._taps(tx, q), cls._taps(ty, q)
         out = 0.0
         for m in range(4):
-            yy = np.clip(iy - 1 + m, 0, H - 1)
-            row = sum(wx[k][..., None] * a[yy, np.clip(ix - 1 + k, 0, W - 1)] for k in range(4))
+            yy = cls._mir(iy - 1 + m, H)
+            row = sum(wx[k][..., None] * a[yy, cls._mir(ix - 1 + k, W)] for k in range(4))
             out = out + wy[m][..., None] * row
         return np.clip(out, 0, 255)
 
@@ -413,15 +426,16 @@ class DepthPreview:
         out = np.zeros((H, W, 3), np.float32)
         rem = np.ones((H, W), np.float32)
         layers = [k + 1 for k in self.order] + [0]
-        if self.gr is not None:                      # ground grid: every layer through the zoom, ground per pixel
+        if self.gr is not None:                      # ground grid: the ground per pixel
             for lid in layers:
                 src = np.where((self.owner == lid)[..., None], cont, self.fill[lid])
                 d = (self.gd if lid == 0 else np.float32(self.planes[lid - 1].depth)) - f
-                qx = np.clip(self.ZX - d * kx, 0, W - 1.001); qy = np.clip(self.ZY - d * ky, 0, H - 1.001)
-                ix, iy = qx.astype(np.int32), qy.astype(np.int32); fx, fy = (qx - ix)[..., None], (qy - iy)[..., None]
+                qx = self.ZX - d * kx; qy = self.ZY - d * ky
+                ix, iy = np.floor(qx).astype(np.int32), np.floor(qy).astype(np.int32); fx, fy = (qx - ix)[..., None], (qy - iy)[..., None]
+                x0, x1, y0, y1 = self._mir(ix, W), self._mir(ix + 1, W), self._mir(iy, H), self._mir(iy + 1, H)
                 def g(a):
                     a = a if a.ndim == 3 else a[..., None]
-                    return (a[iy, ix] * (1 - fx) + a[iy, ix + 1] * fx) * (1 - fy) + (a[iy + 1, ix] * (1 - fx) + a[iy + 1, ix + 1] * fx) * fy
+                    return (a[y0, x0] * (1 - fx) + a[y0, x1] * fx) * (1 - fy) + (a[y1, x0] * (1 - fx) + a[y1, x1] * fx) * fy
                 c = self._sample4(src, qx, qy, sharp)
                 a = np.ones((H, W), np.float32) if lid == 0 else g(self._alpha(lid - 1, kx, ky))[..., 0]
                 wgt = a * rem
@@ -434,12 +448,13 @@ class DepthPreview:
                 p = self.planes[lid - 1]
                 if p.ramp:                        # per pixel: shift by the depth here
                     d = p.depth_at(self.X, self.Y) - f
-                    qx = np.clip(self.X - d * kx, 0, W - 1.001); qy = np.clip(self.Y - d * ky, 0, H - 1.001)
-                    ix, iy = qx.astype(np.int32), qy.astype(np.int32); fx, fy = qx - ix, qy - iy
+                    qx = self.X - d * kx; qy = self.Y - d * ky
+                    ix, iy = np.floor(qx).astype(np.int32), np.floor(qy).astype(np.int32); fx, fy = qx - ix, qy - iy
+                    x0, x1, y0, y1 = self._mir(ix, W), self._mir(ix + 1, W), self._mir(iy, H), self._mir(iy + 1, H)
                     def g(a):
                         a = a if a.ndim == 3 else a[..., None]
-                        t = a[iy, ix] * (1 - fx[..., None]) + a[iy, ix + 1] * fx[..., None]
-                        b = a[iy + 1, ix] * (1 - fx[..., None]) + a[iy + 1, ix + 1] * fx[..., None]
+                        t = a[y0, x0] * (1 - fx[..., None]) + a[y0, x1] * fx[..., None]
+                        b = a[y1, x0] * (1 - fx[..., None]) + a[y1, x1] * fx[..., None]
                         return t * (1 - fy[..., None]) + b * fy[..., None]
                     c, a = self._sample4(src, qx, qy, sharp), g(self._alpha(lid - 1, kx, ky))[..., 0]
                 else:

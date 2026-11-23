@@ -23,7 +23,8 @@ namespace jig {
 
 constexpr int PLANE_MAX = 4;
 constexpr float PAR_RECENTER_S = 2.5f;     // a held tilt eases back to centre over this
-constexpr float PAR_BIAS_S = 3.0f;         // gyro bias learnt while still
+constexpr float PAR_BIAS_S = 3.0f;         // gyro bias learnt while the turn rate holds steady …
+constexpr float PAR_STEADY_DPS = 1.0f;     // … its ½ s average within this of its 2 s one (deg/s)
 constexpr float PAR_DEAD_DPS = 0.6f;       // gyro noise floor: slower than this isn't a turn
 constexpr float PAR_SOFT_PXS = 10.0f;      // the view sliding faster than this (px/s): the soft filter …
 constexpr float PAR_SHARP_PXS = 4.0f;      // … slower (the idle drift, settling): sharp
@@ -75,6 +76,8 @@ struct Parallax {
     // ---- runtime
     bool      ready = false;
     uint8_t*  owner = nullptr;            // per pixel: 0 = background, k+1 = plane k
+    uint16_t* orow = nullptr;             // owner as runs per row (fixed while the scene plays): row y's are
+    int16_t*  orun = nullptr;             //   orun[2·orow[y] …): (end x, owner) pairs, each from the last end
     uint16_t* bg_fill = nullptr;
     int16_t*  vrow = nullptr;             // per core, per layer: source columns filtered top to bottom (R, G, B)
     struct RowSig { int32_t sx, sy; int16_t xs, xe, fade; uint8_t pres, rc; };
@@ -84,12 +87,16 @@ struct Parallax {
     int       order[PLANE_MAX];           // nearest first
     int       margin = 0;
     Plane     gp;                         // the ground's depth field (grid): 1 at the nearest ground, 0 at the horizon
-    float     zoom = 1.0f;                // a touch of zoom so sliding never shows past the photo's edges
+    float     zoom = 1.0f;                // 1: none (past the photo's edges the render mirrors it; kept for the maps)
     int16_t   zx[IMG_W], zy[IMG_H];       // where each screen column / row samples before sliding (×16)
     // view (screen units: +x = near planes slide right, +y = down; 1 = full slide)
     float th[2] = {0, 0}, bias[2] = {0, 0}, v[2] = {0, 0}, vv[2] = {0, 0}, t = 0;
+    float rf[2] = {0, 0}, rs[2] = {0, 0};  // the gyro rates averaged over ½ s and 2 s (bias learning)
+    bool  rinit = false;
     float dv[2] = {0, 0};                 // view the screen was last drawn with
     float sharp = 1, dsharp = 1;          // the filter: 1 = sharp (Catmull-Rom), 0 = soft (bilinear); as last drawn
+    bool  soft_any = false;               // quality fallback (the frame governor sets these when moving frames run
+    bool  half_rows = false;              //   late): the soft filter for any slide; while soft, every other row
     bool  drawn = false;
     Parallax() { for (int i = 0; i < PP_COUNT; ++i) prm[i] = pparam_info((uint8_t)i).dflt; }
 };
@@ -132,7 +139,10 @@ inline void parallax_free_runtime(Parallax& P) {
     if (P.vrow) free(P.vrow);
     if (P.rsig) free(P.rsig);
     if (P.rkey) free(P.rkey);
+    if (P.orow) free(P.orow);
+    if (P.orun) free(P.orun);
     P.owner = nullptr; P.bg_fill = nullptr; P.vrow = nullptr; P.rsig = nullptr; P.rkey = nullptr; P.ready = false;
+    P.orow = nullptr; P.orun = nullptr;
 }
 inline void parallax_free(Parallax& P) {
     parallax_free_runtime(P);
@@ -270,18 +280,21 @@ inline bool par_runs(Plane& p, void* (*alloc)(size_t)) {
     return true;
 }
 
+// The view (P.v) is a full tilt (1, through the soft limit) plus the idle drift, which adds at most
+// ambient·(0.55 + 0.22) across and ambient·(0.40 + 0.15) up / down - parallax_step's two sines each way.
+constexpr float PAR_DRIFT_X = 0.55f + 0.22f, PAR_DRIFT_Y = 0.40f + 0.15f;   // (keep in step with parallax_step)
+inline float par_vmax_x(const Parallax& P) { return 1.0f + PAR_DRIFT_X * P.prm[PP_AMBIENT]; }
+inline float par_vmax_y(const Parallax& P) { return 1.0f + PAR_DRIFT_Y * P.prm[PP_AMBIENT]; }
+// The most two layers slide apart (px) - how far a nearer one can uncover what's behind it: their depths
+// differ by at most the nearest depth there is (the background is 0).
 inline int parallax_max_shift(const Parallax& P) {
-    float f = P.prm[PP_FOCUS], m = 0;
-    for (int k = 0; k < P.n; ++k) {
-        float a = fabsf(P.pl[k].dlo - f), b = fabsf(P.pl[k].dhi - f);
-        if (a > m) m = a;
-        if (b > m) m = b;
-    }
-    if (f > m) m = f;                                // the background, if it's not the pinned depth
-    if (par_ground(P) && 1.0f - f > m) m = 1.0f - f; // the ground, nearest to the horizon
-    float vert = P.prm[PP_VERT] > 1.0f ? P.prm[PP_VERT] : 1.0f;
-    return (int)ceilf(m * P.prm[PP_AMOUNT] * vert * 1.05f);
+    float m = par_ground(P) ? 1.0f : 0.0f;
+    for (int k = 0; k < P.n; ++k) if (P.pl[k].dhi > m) m = P.pl[k].dhi;
+    const float ax = m * P.prm[PP_AMOUNT] * par_vmax_x(P), ay = m * P.prm[PP_AMOUNT] * P.prm[PP_VERT] * par_vmax_y(P);
+    return (int)ceilf(ax > ay ? ax : ay);
 }
+// Rows a content change can move on screen: the most a layer slides, plus the zoom's push toward the edges.
+inline int parallax_reach_rows(const Parallax& P) { return P.margin + (int)ceilf(IMG_H * 0.5f * (P.zoom - 1.0f)); }
 
 // Build everything the renderer needs. `photo` is the picture (sw = byte-swapped).
 // fast_alloc: for the render's per-core filter scratch (touched ~20× a pixel): internal RAM on the Core2.
@@ -365,6 +378,31 @@ inline bool parallax_prepare(Parallax& P, const uint16_t* photo, bool sw, void* 
             }
             P.owner[y * IMG_W + x] = (uint8_t)best;
         }
+    {   // …as runs per row (parallax_sync_content: each run a straight copy into its owner's fill). Without the
+        // memory it goes pixel by pixel.
+        size_t nr = 0;
+        for (int y = 0; y < IMG_H; ++y)
+            for (int x = 0; x < IMG_W; ++x) if (x + 1 == IMG_W || P.owner[y * IMG_W + x + 1] != P.owner[y * IMG_W + x]) ++nr;
+        P.orow = (uint16_t*)(fast_alloc ? fast_alloc((IMG_H + 1) * 2) : nullptr);
+        if (!P.orow) P.orow = (uint16_t*)alloc((IMG_H + 1) * 2);
+        P.orun = nr <= 0xFFFF ? (int16_t*)(fast_alloc ? fast_alloc(nr * 4) : nullptr) : nullptr;
+        if (!P.orun && nr <= 0xFFFF) P.orun = (int16_t*)alloc(nr * 4);
+        if (!P.orow || !P.orun) {
+            if (P.orow) free(P.orow);
+            if (P.orun) free(P.orun);
+            P.orow = nullptr; P.orun = nullptr;
+        } else {
+            size_t k = 0;
+            for (int y = 0; y < IMG_H; ++y) {
+                P.orow[y] = (uint16_t)k;
+                for (int x = 0; x < IMG_W; ++x)
+                    if (x + 1 == IMG_W || P.owner[y * IMG_W + x + 1] != P.owner[y * IMG_W + x]) {
+                        P.orun[2 * k] = (int16_t)(x + 1); P.orun[2 * k + 1] = P.owner[y * IMG_W + x]; ++k;
+                    }
+            }
+            P.orow[IMG_H] = (uint16_t)k;
+        }
+    }
     P.margin = parallax_max_shift(P) + 3;
     par_fill(P.owner, 0, photo, sw, P.bg_fill, nx, ny);
     for (int k = 0; k < P.n; ++k) {
@@ -409,7 +447,9 @@ inline bool parallax_prepare(Parallax& P, const uint16_t* photo, bool sw, void* 
         }
     }
     free(nx); free(ny);
-    P.zoom = par_ground(P) ? 1.0f + 2.0f * (float)(parallax_max_shift(P) + 1) / IMG_W : 1.0f;
+    // No zoom: the photo's own pixels at rest (and whole-pixel slides copied straight through). Where a slide
+    // uncovers past the photo's edge, the render reads it mirrored there (par_mirror), lined up with the edge.
+    P.zoom = 1.0f;
     for (int x = 0; x < IMG_W; ++x) P.zx[x] = (int16_t)lroundf(((x - IMG_W * 0.5f) / P.zoom + IMG_W * 0.5f) * 16.0f);
     for (int y = 0; y < IMG_H; ++y) P.zy[y] = (int16_t)lroundf(((y - IMG_H * 0.5f) / P.zoom + IMG_H * 0.5f) * 16.0f);
     P.ready = true;
@@ -424,11 +464,20 @@ inline bool parallax_step(Parallax& P, float dt, float rate_x, float rate_y, boo
     P.t += dt;
     const float D2R = 0.017453293f;
     if (have) {
-        const float kb = 1.0f - expf(-dt / PAR_BIAS_S);
-        if (fabsf(rate_x - P.bias[0]) < 3.0f && fabsf(rate_y - P.bias[1]) < 3.0f) {   // still: learn the gyro's offset
-            P.bias[0] += (rate_x - P.bias[0]) * kb;
-            P.bias[1] += (rate_y - P.bias[1]) * kb;
+        // The gyro's offset: a still Core2 reads several deg/s (it differs per unit and drifts with warmth). It's
+        // learnt whenever the turn rate holds steady - its ½ s average no longer moving against its 2 s one: a
+        // hand holding the Core2 only jitters about no turn, a turn you make speeds up and slows down - whatever
+        // the offset's size (an offset nothing learns reads as a steady turn: the view pinned near its limit).
+        const float rt[2] = {rate_x, rate_y};
+        if (!P.rinit) { for (int a = 0; a < 2; ++a) P.rf[a] = P.rs[a] = rt[a]; P.rinit = true; }
+        const float kf = 1.0f - expf(-dt / 0.5f), ks = 1.0f - expf(-dt / 2.0f), kb = 1.0f - expf(-dt / PAR_BIAS_S);
+        bool steady = true;
+        for (int a = 0; a < 2; ++a) {
+            P.rf[a] += (rt[a] - P.rf[a]) * kf;
+            P.rs[a] += (rt[a] - P.rs[a]) * ks;
+            steady = steady && fabsf(P.rf[a] - P.rs[a]) < PAR_STEADY_DPS;
         }
+        if (steady) for (int a = 0; a < 2; ++a) P.bias[a] += (P.rs[a] - P.bias[a]) * kb;
         auto dead = [](float r) { return fabsf(r) < PAR_DEAD_DPS ? 0.0f : (r > 0 ? r - PAR_DEAD_DPS : r + PAR_DEAD_DPS); };
         P.th[0] += dead(rate_y - P.bias[1]) * D2R * dt;   // right edge away → near planes slide right
         P.th[1] += -dead(rate_x - P.bias[0]) * D2R * dt;  // top edge away → near planes slide up
@@ -465,7 +514,8 @@ inline bool parallax_step(Parallax& P, float dt, float rate_x, float rate_y, boo
     // The filter: soft (bilinear - far less work) while your hand slides the view, sharp again (Catmull-Rom)
     // as it slows to the idle drift or stops - eased, so the picture firms up rather than snapping sharp.
     const float speed = (fabsf(P.vv[0]) + fabsf(P.vv[1])) * A;   // px/s, the most a plane slides
-    if (speed > PAR_SOFT_PXS) P.sharp = P.sharp - dt / PAR_SOFT_S > 0 ? P.sharp - dt / PAR_SOFT_S : 0.0f;
+    const float soft_px = P.soft_any ? PAR_SHARP_PXS + 1.0f : PAR_SOFT_PXS;   // (fallback: soft for any slide)
+    if (speed > soft_px) P.sharp = P.sharp - dt / PAR_SOFT_S > 0 ? P.sharp - dt / PAR_SOFT_S : 0.0f;
     else if (speed < PAR_SHARP_PXS) P.sharp = P.sharp + dt / PAR_SHARP_S < 1 ? P.sharp + dt / PAR_SHARP_S : 1.0f;
     float moved = (fabsf(P.v[0] - P.dv[0]) + fabsf(P.v[1] - P.dv[1])) * A;
     // Your hand moving it: every 1/128 px of the nearest plane's slide is drawn. Only the idle drift
@@ -523,6 +573,7 @@ struct ParFrame {
     int32_t sx[PLANE_MAX + 1], sy[PLANE_MAX + 1];       // flat: shift, Q8
     const Plane* pl[PLANE_MAX + 1];
     int lx0[PLANE_MAX + 1], lx1[PLANE_MAX + 1], ly0[PLANE_MAX + 1], ly1[PLANE_MAX + 1];   // screen box it can show in
+    bool  half = false;                                // fallback, while soft: every other row drawn, copied down
     int16_t q;                                         // the filter: 0 = soft (bilinear), 256 = sharp (Catmull-Rom) …
     int16_t W[64][4];                                  // … the 4-tap weights in between (q > 0; Q8, sum 256)
     // Reuse (set by the caller): the screen as it stands (as the render writes it), and where the content
@@ -541,6 +592,7 @@ inline void parallax_frame(ParFrame& F, const Parallax& P, const uint16_t* anim,
     parallax_k(P, F.kx, F.ky);
     {                                                  // the filter, as sharp as P.sharp: bilinear eased toward Catmull-Rom
         F.q = (int16_t)(P.sharp * 256.0f + 0.5f);
+        F.half = P.half_rows && F.q == 0;
         const auto& CR = par_w();
         for (int i = 0; i < 64; ++i) {
             const int bl[4] = {0, 256 - 4 * i, 4 * i, 0};
@@ -577,15 +629,20 @@ inline void parallax_frame(ParFrame& F, const Parallax& P, const uint16_t* anim,
             const int32_t a2 = (int32_t)((p.dlo - f) * F.ky * 256.0f), c2 = (int32_t)((p.dhi - f) * F.ky * 256.0f);
             sxl = (a < c ? a : c) - 256; sxh = (a < c ? c : a) + 256; syl = (a2 < c2 ? a2 : c2) - 256; syh = (a2 < c2 ? c2 : a2) + 256;
         }
-        // a sample at Q = z·16 − S reads soft at ⌊Q⌋ and ⌊Q⌋+1: it can be non-zero for Q in [(x0−1)·256, x1·256)
+        // a sample at Q = z·16 − S reads soft at ⌊Q⌋ and ⌊Q⌋+1: it can be non-zero for Q in [(x0−1)·256, x1·256) -
+        // or past the picture's edge, where it reads it mirrored, in the box's mirror image there
+        auto meets = [](int32_t qa, int32_t qb, int b0, int b1, int n) {
+            return (qb >= (b0 - 2) * 256 && qa < (b1 + 1) * 256) || (qb >= (-b1 - 2) * 256 && qa < (-b0 + 1) * 256) ||
+                   (qb >= (2 * n - b1 - 2) * 256 && qa < (2 * n - b0 + 1) * 256);
+        };
         int x0 = IMG_W, x1 = 0, y0 = IMG_H, y1 = 0;
         for (int x = 0; x < IMG_W; ++x) {
             const int32_t qa = ((int32_t)P.zx[x] << 4) - sxh, qb = ((int32_t)P.zx[x] << 4) - sxl;
-            if (qb >= (p.x0 - 2) * 256 && qa < (p.x1 + 1) * 256) { if (x < x0) x0 = x; x1 = x + 1; }
+            if (meets(qa, qb, p.x0, p.x1, IMG_W)) { if (x < x0) x0 = x; x1 = x + 1; }
         }
         for (int y = 0; y < IMG_H; ++y) {
             const int32_t qa = ((int32_t)P.zy[y] << 4) - syh, qb = ((int32_t)P.zy[y] << 4) - syl;
-            if (qb >= (p.y0 - 2) * 256 && qa < (p.y1 + 1) * 256) { if (y < y0) y0 = y; y1 = y + 1; }
+            if (meets(qa, qb, p.y0, p.y1, IMG_H)) { if (y < y0) y0 = y; y1 = y + 1; }
         }
         F.lx0[j] = x0; F.lx1[j] = x1; F.ly0[j] = y0; F.ly1[j] = y1;
     }
@@ -593,9 +650,36 @@ inline void parallax_frame(ParFrame& F, const Parallax& P, const uint16_t* anim,
 
 // The content changed in a rect (water, zones): copy it into the fill of the layer owning each pixel, so
 // the renderer reads one source per layer (its fill: own pixels live, the continuation past its edge).
+// n pixels, byte-swapped, two at a time (one 32-bit load, swap and store; d and s share their alignment).
+typedef uint32_t __attribute__((__may_alias__)) par_u32a;
+JIG_INLINE void par_swap_copy(uint16_t* d, const uint16_t* s, int n) {
+    if (n > 0 && ((uintptr_t)d & 2)) { *d++ = (uint16_t)((*s >> 8) | (*s << 8)); ++s; --n; }
+    par_u32a* d4 = (par_u32a*)d; const par_u32a* s4 = (const par_u32a*)s;
+    for (; n >= 2; n -= 2) { const uint32_t v = *s4++; *d4++ = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); }
+    if (n) { const uint16_t v = *(const uint16_t*)s4; *(uint16_t*)d4 = (uint16_t)((v >> 8) | (v << 8)); }
+}
 inline void parallax_sync_content(Parallax& P, const uint16_t* anim, bool sw, int x0, int y0, int x1, int y1) {
     if (!P.ready || !anim) return;
     if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > IMG_W) x1 = IMG_W; if (y1 > IMG_H) y1 = IMG_H;
+    if (P.orun && ((((uintptr_t)anim) & 3) == 0)) {   // the owner's runs: a straight copy each
+        for (int y = y0; y < y1; ++y) {
+            const uint16_t* src = anim + y * IMG_W;
+            const int16_t* r = P.orun + 2 * P.orow[y];
+            const int16_t* re = P.orun + 2 * P.orow[y + 1];
+            for (int a = 0; r < re; r += 2) {
+                const int b = r[0], lo = a > x0 ? a : x0, hi = b < x1 ? b : x1;
+                if (lo < hi) {
+                    uint16_t* d = (r[1] ? P.pl[r[1] - 1].fill : P.bg_fill) + y * IMG_W;
+                    if (!sw) memcpy(d + lo, src + lo, (size_t)(hi - lo) * 2);
+                    else if ((((uintptr_t)d) & 3) == 0) par_swap_copy(d + lo, src + lo, hi - lo);
+                    else for (int x = lo; x < hi; ++x) d[x] = (uint16_t)((src[x] >> 8) | (src[x] << 8));
+                }
+                if (b >= x1) break;
+                a = b;
+            }
+        }
+        return;
+    }
     for (int y = y0; y < y1; ++y)
         for (int x = x0; x < x1; ++x) {
             const int i = y * IMG_W + x;
@@ -607,6 +691,21 @@ inline void parallax_sync_content(Parallax& P, const uint16_t* anim, bool sw, in
 }
 
 JIG_INLINE int par_clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+// A source column (row) past the picture's edge reads it mirrored about that edge (… 1, 0 | 0, 1 …): what a
+// slide uncovers there lines up with the picture instead of smearing its edge pixels. (Once: no slide reaches a
+// whole picture past it - clamped if one ever did.)
+JIG_INLINE int par_mirror(int v, int n) {
+    if ((unsigned)v < (unsigned)n) return v;
+    v = v < 0 ? -1 - v : 2 * n - 1 - v;
+    return v < 0 ? 0 : (v >= n ? n - 1 : v);
+}
+// The lowest and highest of par_mirror over [a, b] (it falls past either edge, rises inside).
+inline void par_mirror_span(int a, int b, int n, int& lo, int& hi) {
+    const int ma = par_mirror(a, n), mb = par_mirror(b, n);
+    lo = ma < mb ? ma : mb; hi = ma > mb ? ma : mb;
+    if (a < 0 && b >= 0) lo = 0;
+    if (a <= n - 1 && b > n - 1) hi = n - 1;
+}
 
 // A feathered edge's coverage, faded in while the plane has barely slid (fd: 0 … 256).
 JIG_INLINE int par_soft_e(int v, int fd) { return v ? 256 - (((256 - (v == 255 ? 256 : v)) * fd) >> 8) : 0; }
@@ -654,7 +753,7 @@ struct ParLay {
     int iy, fy;
     const int16_t* wy;
     const uint8_t* sa; const uint8_t* sb;           // soft rows ⌊Q⌋ and ⌊Q⌋+1
-    const uint16_t* rp[4];                          // fill rows iy−1 … iy+2 (clamped)
+    const uint16_t* rp[4];                          // fill rows iy−1 … iy+2 (mirrored past the edge)
     int16_t* V;
     int lo, hi;                                     // the source columns filtered (for the current row position)
     ParStep tx, ty; bool fxp;                       // a tilting one: its shift along the row (fxp: stepped)
@@ -676,7 +775,7 @@ JIG_INLINE void par_solid(const ParFrame& F, ParLay& l, const int16_t (*W)[4], b
         if (soft ? ((fx >> 3) | (l.fy >> 3)) == 0 : ((fx >> 2) | (l.fy >> 2)) == 0) {
             const uint16_t* r = l.rp[1];
             for (int x = x0; x < x1; ++x) {
-                const uint16_t v = r[par_clampi(x + d, 0, IMG_W - 1)];
+                const uint16_t v = r[par_mirror(x + d, IMG_W)];
                 o[x - x0] = (uint16_t)((v >> 8) | (v << 8));
             }
             return;
@@ -686,14 +785,14 @@ JIG_INLINE void par_solid(const ParFrame& F, ParLay& l, const int16_t (*W)[4], b
             const uint32_t gx = (uint32_t)fx >> 3, gy = (uint32_t)l.fy >> 3;
             const uint16_t* r0 = l.rp[1]; const uint16_t* r1 = l.rp[2];
             int x = x0;
-            while (x < x1 && (unsigned)(x + d) >= (unsigned)(IMG_W - 1)) {   // (left of the picture: clamped)
+            while (x < x1 && (unsigned)(x + d) >= (unsigned)(IMG_W - 1)) {   // (left of the picture: mirrored)
                 int R, G, B;
-                par_bilin(r0, r1, par_clampi(x + d, 0, IMG_W - 1), par_clampi(x + d + 1, 0, IMG_W - 1), fx, l.fy, R, G, B);
+                par_bilin(r0, r1, par_mirror(x + d, IMG_W), par_mirror(x + d + 1, IMG_W), fx, l.fy, R, G, B);
                 const uint16_t c = (uint16_t)(((R >> 16) << 11) | ((G >> 16) << 5) | (B >> 16));
                 o[x - x0] = (uint16_t)((c >> 8) | (c << 8));
                 ++x;
             }
-            int xm = x1 - d < IMG_W - 1 ? x1 : IMG_W - 1 - d;   // (pixels reading inside: ix + 1 ≤ IMG_W − 1)
+            const int xm = x1 + d < IMG_W - 1 ? x1 : IMG_W - 1 - d;   // (pixels reading inside: x + d + 1 ≤ IMG_W − 1)
             if (xm > x) {
                 uint32_t a0 = spread565(r0[x + d]), a1 = spread565(r1[x + d]);
                 for (; x < xm; ++x) {
@@ -705,9 +804,9 @@ JIG_INLINE void par_solid(const ParFrame& F, ParLay& l, const int16_t (*W)[4], b
                     a0 = n0; a1 = n1;
                 }
             }
-            for (; x < x1; ++x) {                       // (right of the picture: clamped)
+            for (; x < x1; ++x) {                       // (right of the picture: mirrored)
                 int R, G, B;
-                par_bilin(r0, r1, par_clampi(x + d, 0, IMG_W - 1), par_clampi(x + d + 1, 0, IMG_W - 1), fx, l.fy, R, G, B);
+                par_bilin(r0, r1, par_mirror(x + d, IMG_W), par_mirror(x + d + 1, IMG_W), fx, l.fy, R, G, B);
                 const uint16_t c = (uint16_t)(((R >> 16) << 11) | ((G >> 16) << 5) | (B >> 16));
                 o[x - x0] = (uint16_t)((c >> 8) | (c << 8));
             }
@@ -720,8 +819,8 @@ JIG_INLINE void par_solid(const ParFrame& F, ParLay& l, const int16_t (*W)[4], b
             const int32_t QX = ((int32_t)ZX[x] << 4) - l.SX;
             const int ix = QX >> 8, fx = QX & 255;
             if (soft) {
-                const int xa = (unsigned)ix < (unsigned)(IMG_W - 1) ? ix : par_clampi(ix, 0, IMG_W - 1);
-                const int xb = (unsigned)ix < (unsigned)(IMG_W - 1) ? ix + 1 : par_clampi(ix + 1, 0, IMG_W - 1);
+                const int xa = (unsigned)ix < (unsigned)(IMG_W - 1) ? ix : par_mirror(ix, IMG_W);
+                const int xb = (unsigned)ix < (unsigned)(IMG_W - 1) ? ix + 1 : par_mirror(ix + 1, IMG_W);
                 par_bilin(l.rp[1], l.rp[2], xa, xb, fx, l.fy, R, G, B);
             } else {
                 if (l.hi < ix - 2) l.hi = ix - 2;
@@ -729,7 +828,7 @@ JIG_INLINE void par_solid(const ParFrame& F, ParLay& l, const int16_t (*W)[4], b
                 const int wy0 = wy[0], wy1 = wy[1], wy2 = wy[2], wy3 = wy[3];
                 while (l.hi < ix + 2) {
                     const int u = ++l.hi;
-                    const int c = (unsigned)u < (unsigned)IMG_W ? u : par_clampi(u, 0, IMG_W - 1);
+                    const int c = (unsigned)u < (unsigned)IMG_W ? u : par_mirror(u, IMG_W);
                     const uint16_t v0 = l.rp[0][c], v1 = l.rp[1][c], v2 = l.rp[2][c], v3 = l.rp[3][c];
                     V[c] = (int16_t)(wy0 * (v0 >> 11) + wy1 * (v1 >> 11) + wy2 * (v2 >> 11) + wy3 * (v3 >> 11));
                     V[IMG_W + c] = (int16_t)(wy0 * ((v0 >> 5) & 63) + wy1 * ((v1 >> 5) & 63) + wy2 * ((v2 >> 5) & 63) + wy3 * ((v3 >> 5) & 63));
@@ -743,7 +842,7 @@ JIG_INLINE void par_solid(const ParFrame& F, ParLay& l, const int16_t (*W)[4], b
                     B = wx[0] * vb[0] + wx[1] * vb[1] + wx[2] * vb[2] + wx[3] * vb[3];
                 } else
                     for (int k = 0; k < 4; ++k) {
-                        const int c = par_clampi(ix - 1 + k, 0, IMG_W - 1);
+                        const int c = par_mirror(ix - 1 + k, IMG_W);
                         R += wx[k] * V[c]; G += wx[k] * V[IMG_W + c]; B += wx[k] * V[2 * IMG_W + c];
                     }
             }
@@ -757,21 +856,21 @@ JIG_INLINE void par_solid(const ParFrame& F, ParLay& l, const int16_t (*W)[4], b
             const int32_t QX = ((int32_t)ZX[x] << 4) - SX, QY = zyq - SY;
             const int ix = QX >> 8, iy = QY >> 8, fx = QX & 255, fy = QY & 255;
             if (soft) {
-                const int ya = par_clampi(iy, 0, IMG_H - 1), yb = par_clampi(iy + 1, 0, IMG_H - 1);
-                par_bilin(fill + ya * IMG_W, fill + yb * IMG_W, par_clampi(ix, 0, IMG_W - 1), par_clampi(ix + 1, 0, IMG_W - 1), fx, fy, R, G, B);
+                const int ya = par_mirror(iy, IMG_H), yb = par_mirror(iy + 1, IMG_H);
+                par_bilin(fill + ya * IMG_W, fill + yb * IMG_W, par_mirror(ix, IMG_W), par_mirror(ix + 1, IMG_W), fx, fy, R, G, B);
             } else {
                 const int32_t key = QY >> 2;
                 if (key != l.key || ix - 1 < l.lo || l.hi < ix - 2) {
                     if (key != l.key) {
                         l.key = key; l.wy = W[key & 63];
-                        for (int r = 0; r < 4; ++r) l.rp[r] = fill + par_clampi(iy - 1 + r, 0, IMG_H - 1) * IMG_W;
+                        for (int r = 0; r < 4; ++r) l.rp[r] = fill + par_mirror(iy - 1 + r, IMG_H) * IMG_W;
                     }
                     l.lo = ix - 1; l.hi = ix - 2;
                 }
                 const int wy0 = l.wy[0], wy1 = l.wy[1], wy2 = l.wy[2], wy3 = l.wy[3];
                 while (l.hi < ix + 2) {
                     const int u = ++l.hi;
-                    const int c = (unsigned)u < (unsigned)IMG_W ? u : par_clampi(u, 0, IMG_W - 1);
+                    const int c = (unsigned)u < (unsigned)IMG_W ? u : par_mirror(u, IMG_W);
                     const uint16_t v0 = l.rp[0][c], v1 = l.rp[1][c], v2 = l.rp[2][c], v3 = l.rp[3][c];
                     V[c] = (int16_t)(wy0 * (v0 >> 11) + wy1 * (v1 >> 11) + wy2 * (v2 >> 11) + wy3 * (v3 >> 11));
                     V[IMG_W + c] = (int16_t)(wy0 * ((v0 >> 5) & 63) + wy1 * ((v1 >> 5) & 63) + wy2 * ((v2 >> 5) & 63) + wy3 * ((v3 >> 5) & 63));
@@ -785,7 +884,7 @@ JIG_INLINE void par_solid(const ParFrame& F, ParLay& l, const int16_t (*W)[4], b
                     B = wx[0] * vb[0] + wx[1] * vb[1] + wx[2] * vb[2] + wx[3] * vb[3];
                 } else
                     for (int k = 0; k < 4; ++k) {
-                        const int c = par_clampi(ix - 1 + k, 0, IMG_W - 1);
+                        const int c = par_mirror(ix - 1 + k, IMG_W);
                         R += wx[k] * V[c]; G += wx[k] * V[IMG_W + c]; B += wx[k] * V[2 * IMG_W + c];
                     }
             }
@@ -816,6 +915,12 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
     Lay L[PLANE_MAX + 1];
     for (int y = y0; y < y1; ++y) {
         uint16_t* o = out + (y - y0) * ow;
+        if (F.half && (y & 1) && y > y0) {             // fallback: the row above, again (all of it sent; and not
+            memcpy(o, o - ow, (size_t)ow * 2);          //  the exact row - the next frame works it out afresh)
+            if (rng) { rng[2 * (y - y0)] = (int16_t)x0; rng[2 * (y - y0) + 1] = (int16_t)x1; }
+            if (F.P->rkey) F.P->rkey[y].ok = 0;
+            continue;
+        }
         int na = 0;
         const int32_t zyq = (int32_t)F.P->zy[y] << 4;
         for (int j = 0; j < F.nl; ++j) {
@@ -835,9 +940,9 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                 }
                 const int32_t QY = zyq - l.SY;
                 l.iy = QY >> 8; l.fy = QY & 255; l.key = QY >> 2; l.wy = W[l.key & 63];
-                for (int r = 0; r < 4; ++r) l.rp[r] = F.fill[j] + par_clampi(l.iy - 1 + r, 0, IMG_H - 1) * IMG_W;
+                for (int r = 0; r < 4; ++r) l.rp[r] = F.fill[j] + par_mirror(l.iy - 1 + r, IMG_H) * IMG_W;
                 if (F.soft[j]) {
-                    const int ya = par_clampi(l.iy, 0, IMG_H - 1), yb = par_clampi(l.iy + 1, 0, IMG_H - 1);
+                    const int ya = par_mirror(l.iy, IMG_H), yb = par_mirror(l.iy + 1, IMG_H);
                     l.sa = F.soft[j] + ya * IMG_W; l.sb = F.soft[j] + yb * IMG_W;
                     // its silhouette's reach on these two source rows: outside it every sample reads 0
                     const int16_t* sp = par_soft_spans(F.soft[j]);
@@ -847,12 +952,17 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                     // the source column grows with x: first x whose right sample reaches lo, last whose left
                     // sample is still ≤ hi
                     auto ixat = [&](int x) { return ((((int32_t)ZX[x] << 4) - l.SX) >> 8); };
+                    const int xs0 = l.xs, xe0 = l.xe;
                     int a = l.xs, b = l.xe;
                     while (a < b) { const int m = (a + b) >> 1; if (par_clampi(ixat(m) + 1, 0, IMG_W - 1) >= lo) b = m; else a = m + 1; }
                     l.xs = a;
                     a = l.xs; b = l.xe;
                     while (a < b) { const int m = (a + b) >> 1; if (par_clampi(ixat(m), 0, IMG_W - 1) > hi) b = m; else a = m + 1; }
                     l.xe = a;
+                    // past the picture's edge the samples read it mirrored (par_mirror): from there they reach
+                    // columns up to −1 − ix (left) / down to 2W − 2 − ix (right) - keep that end if they can reach it
+                    if (ixat(xs0) < 0 && lo <= -ixat(xs0)) l.xs = xs0;
+                    if (ixat(xe0 - 1) + 1 > IMG_W - 1 && hi >= 2 * IMG_W - 2 - ixat(xe0 - 1)) l.xe = xe0;
                     if (l.xs >= l.xe) continue;
                 }
             }
@@ -897,7 +1007,7 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                             }
                             r0 = (ia < ib ? ia : ib) - 1; r1 = (ia < ib ? ib : ia) + 2;
                         }
-                        r0 = par_clampi(r0, 0, IMG_H - 1); r1 = par_clampi(r1, 0, IMG_H - 1);
+                        { int m0, m1; par_mirror_span(r0, r1, IMG_H, m0, m1); r0 = m0; r1 = m1; }   // (the rows read: mirrored)
                         int a = IMG_W, b = -1;                  // content columns that changed on those rows
                         for (int i = 0; i < F.nforce; ++i)
                             if (F.force[i][1] <= r1 && F.force[i][3] > r0) {
@@ -911,13 +1021,17 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                             }
                         if (a > b) continue;
                         int xa = l.xs, xb = l.xe;
-                        if (l.rc) {                             // taps clamp(ix−1) … clamp(ix+2) meet [a, b]
+                        if (l.rc) {                             // taps ix−1 … ix+2 meet [a, b]
                             auto ixat = [&](int x) { return ((((int32_t)ZX[x] << 4) - l.SX) >> 8); };
                             int lo = l.xs, hi = l.xe;
                             while (lo < hi) { const int mm = (lo + hi) >> 1; if (par_clampi(ixat(mm) + 2, 0, IMG_W - 1) >= a) hi = mm; else lo = mm + 1; }
                             xa = lo; lo = xa; hi = l.xe;
                             while (lo < hi) { const int mm = (lo + hi) >> 1; if (par_clampi(ixat(mm) - 1, 0, IMG_W - 1) > b) hi = mm; else lo = mm + 1; }
                             xb = lo;
+                            // (taps past the picture's edge read it mirrored: up to column −ix at the left, down
+                            // to 2W − 3 − ix at the right)
+                            if (ixat(l.xs) - 1 < 0 && a <= -ixat(l.xs)) xa = l.xs;
+                            if (ixat(l.xe - 1) + 2 > IMG_W - 1 && b >= 2 * IMG_W - 3 - ixat(l.xe - 1)) xb = l.xe;
                         }
                         if (xb > xa) memset(chg + xa, 1, xb - xa);
                     }
@@ -974,7 +1088,7 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
             // Its soft rows ⌊Q⌋, ⌊Q⌋+1 as runs, both at once: a pixel reads columns ix, ix + 1 of both - it's
             // hidden where all four are 0, solid where all four are 255.
             const Plane& pl = *F.pl[j];
-            const int ya = par_clampi(l.iy, 0, IMG_H - 1), yb = par_clampi(l.iy + 1, 0, IMG_H - 1);
+            const int ya = par_mirror(l.iy, IMG_H), yb = par_mirror(l.iy + 1, IMG_H);
             const int16_t* ra = pl.runs + 2 * pl.roff[ya]; const int16_t* rae = pl.runs + 2 * pl.roff[ya + 1];
             const int16_t* rb = pl.runs + 2 * pl.roff[yb]; const int16_t* rbe = pl.runs + 2 * pl.roff[yb + 1];
             auto ixat = [&](int x) { return ((((int32_t)ZX[x] << 4) - l.SX) >> 8); };
@@ -1037,7 +1151,7 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                         if (F.soft[j]) {                    // sub-pixel coverage of the plane's (feathered) silhouette
                             int xa, xb;
                             if ((unsigned)ix < (unsigned)(IMG_W - 1)) { xa = ix; xb = ix + 1; }
-                            else { xa = par_clampi(ix, 0, IMG_W - 1); xb = par_clampi(ix + 1, 0, IMG_W - 1); }
+                            else { xa = par_mirror(ix, IMG_W); xb = par_mirror(ix + 1, IMG_W); }
                             const int s00 = l.sa[xa], s10 = l.sa[xb], s01 = l.sb[xa], s11 = l.sb[xb];
                             if (!(s00 | s10 | s01 | s11)) continue;
                             if ((s00 & s10 & s01 & s11) != 255) {
@@ -1048,8 +1162,8 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                             if (a <= 0) continue;
                         }
                         if (soft) {                         // soft (the view sliding fast): bilinear
-                            const int xa = (unsigned)ix < (unsigned)(IMG_W - 1) ? ix : par_clampi(ix, 0, IMG_W - 1);
-                            const int xb = (unsigned)ix < (unsigned)(IMG_W - 1) ? ix + 1 : par_clampi(ix + 1, 0, IMG_W - 1);
+                            const int xa = (unsigned)ix < (unsigned)(IMG_W - 1) ? ix : par_mirror(ix, IMG_W);
+                            const int xb = (unsigned)ix < (unsigned)(IMG_W - 1) ? ix + 1 : par_mirror(ix + 1, IMG_W);
                             par_bilin(l.rp[1], l.rp[2], xa, xb, fx, l.fy, R, G, B);
                         } else {
                             // The source column grows with x along a row: the columns filtered so far this row are
@@ -1060,7 +1174,7 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                             const int wy0 = wy[0], wy1 = wy[1], wy2 = wy[2], wy3 = wy[3];
                             while (lm.hi < ix + 2) {
                                 const int u = ++lm.hi;
-                                const int c = (unsigned)u < (unsigned)IMG_W ? u : par_clampi(u, 0, IMG_W - 1);
+                                const int c = (unsigned)u < (unsigned)IMG_W ? u : par_mirror(u, IMG_W);
                                 const uint16_t v0 = l.rp[0][c], v1 = l.rp[1][c], v2 = l.rp[2][c], v3 = l.rp[3][c];
                                 V[c] = (int16_t)(wy0 * (v0 >> 11) + wy1 * (v1 >> 11) + wy2 * (v2 >> 11) + wy3 * (v3 >> 11));
                                 V[IMG_W + c] = (int16_t)(wy0 * ((v0 >> 5) & 63) + wy1 * ((v1 >> 5) & 63) + wy2 * ((v2 >> 5) & 63) + wy3 * ((v3 >> 5) & 63));
@@ -1074,7 +1188,7 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                                 B = wx[0] * vb[0] + wx[1] * vb[1] + wx[2] * vb[2] + wx[3] * vb[3];
                             } else
                                 for (int k = 0; k < 4; ++k) {
-                                    const int c = par_clampi(ix - 1 + k, 0, IMG_W - 1);
+                                    const int c = par_mirror(ix - 1 + k, IMG_W);
                                     R += wx[k] * V[c]; G += wx[k] * V[IMG_W + c]; B += wx[k] * V[2 * IMG_W + c];
                                 }
                         }
@@ -1088,8 +1202,8 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                         const int32_t QX = ((int32_t)ZX[x] << 4) - SX, QY = zyq - SY;
                         const int ix = QX >> 8, iy = QY >> 8, fx = QX & 255, fy = QY & 255;
                         if (F.soft[j]) {
-                            const int xa = par_clampi(ix, 0, IMG_W - 1), xb = par_clampi(ix + 1, 0, IMG_W - 1);
-                            const int ya = par_clampi(iy, 0, IMG_H - 1), yb = par_clampi(iy + 1, 0, IMG_H - 1);
+                            const int xa = par_mirror(ix, IMG_W), xb = par_mirror(ix + 1, IMG_W);
+                            const int ya = par_mirror(iy, IMG_H), yb = par_mirror(iy + 1, IMG_H);
                             const uint8_t* S = F.soft[j];
                             const int s00 = S[ya * IMG_W + xa], s10 = S[ya * IMG_W + xb], s01 = S[yb * IMG_W + xa], s11 = S[yb * IMG_W + xb];
                             if (!(s00 | s10 | s01 | s11)) continue;
@@ -1101,8 +1215,8 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                             if (a <= 0) continue;
                         }
                         if (soft) {                         // soft (the view sliding fast): bilinear
-                            const int ya = par_clampi(iy, 0, IMG_H - 1), yb = par_clampi(iy + 1, 0, IMG_H - 1);
-                            par_bilin(fill + ya * IMG_W, fill + yb * IMG_W, par_clampi(ix, 0, IMG_W - 1), par_clampi(ix + 1, 0, IMG_W - 1), fx, fy, R, G, B);
+                            const int ya = par_mirror(iy, IMG_H), yb = par_mirror(iy + 1, IMG_H);
+                            par_bilin(fill + ya * IMG_W, fill + yb * IMG_W, par_mirror(ix, IMG_W), par_mirror(ix + 1, IMG_W), fx, fy, R, G, B);
                         } else {
                             // Its row position (and so the vertical taps) changes only every few pixels: the columns
                             // filtered for the current one, lo … hi, are kept until it changes.
@@ -1111,14 +1225,14 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                             if (key != lm.key || ix - 1 < lm.lo || lm.hi < ix - 2) {
                                 if (key != lm.key) {
                                     lm.key = key; lm.wy = W[key & 63];
-                                    for (int r = 0; r < 4; ++r) lm.rp[r] = fill + par_clampi(iy - 1 + r, 0, IMG_H - 1) * IMG_W;
+                                    for (int r = 0; r < 4; ++r) lm.rp[r] = fill + par_mirror(iy - 1 + r, IMG_H) * IMG_W;
                                 }
                                 lm.lo = ix - 1; lm.hi = ix - 2;
                             }
                             const int wy0 = lm.wy[0], wy1 = lm.wy[1], wy2 = lm.wy[2], wy3 = lm.wy[3];
                             while (lm.hi < ix + 2) {
                                 const int u = ++lm.hi;
-                                const int c = (unsigned)u < (unsigned)IMG_W ? u : par_clampi(u, 0, IMG_W - 1);
+                                const int c = (unsigned)u < (unsigned)IMG_W ? u : par_mirror(u, IMG_W);
                                 const uint16_t v0 = lm.rp[0][c], v1 = lm.rp[1][c], v2 = lm.rp[2][c], v3 = lm.rp[3][c];
                                 V[c] = (int16_t)(wy0 * (v0 >> 11) + wy1 * (v1 >> 11) + wy2 * (v2 >> 11) + wy3 * (v3 >> 11));
                                 V[IMG_W + c] = (int16_t)(wy0 * ((v0 >> 5) & 63) + wy1 * ((v1 >> 5) & 63) + wy2 * ((v2 >> 5) & 63) + wy3 * ((v3 >> 5) & 63));
@@ -1126,7 +1240,7 @@ JIG_HOT void parallax_render(const ParFrame& F, uint16_t* out, int x0, int y0, i
                             }
                             const int16_t* wx = W[fx >> 2];
                             for (int k = 0; k < 4; ++k) {
-                                const int c = par_clampi(ix - 1 + k, 0, IMG_W - 1);
+                                const int c = par_mirror(ix - 1 + k, IMG_W);
                                 R += wx[k] * V[c]; G += wx[k] * V[IMG_W + c]; B += wx[k] * V[2 * IMG_W + c];
                             }
                         }

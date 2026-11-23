@@ -91,6 +91,9 @@ struct Water {
     float *sgx = nullptr, *sgy = nullptr;        // the blend as it stood when this frame began (water_snapshot)
     uint8_t* cin = nullptr;                      // cell is water
     int8_t *cnx = nullptr, *cny = nullptr;       // outward normal at the water's edge (else 0)
+    int32_t* bank = nullptr;                     // the edge cells (cnx | cny), listed once …
+    float* bank_k = nullptr;                     // … and how hard each throws a wave (far banks smaller: √(2·pax))
+    int nbank = 0;
     float *fx = nullptr, *fy = nullptr;          // river: flow (px/s) per cell
     float *od = nullptr, *onx = nullptr, *ony = nullptr;   // ocean: distance to shore, unit toward it
     float t = 0, sx = 0, sy = 0, svx = 0, svy = 0, rain_acc = 0, set_ph = 0;
@@ -208,8 +211,9 @@ inline void* water_default_alloc(size_t n) { return malloc(n); }
 
 inline void water_free_runtime(Water& w) {
     void* ps[] = {w.edge, w.dsafe, w.sp_off, w.sp, w.h0, w.h1, w.gx, w.gy, w.gxp, w.gyp, w.sgx, w.sgy, w.cin, w.cnx, w.cny,
-                  w.fx, w.fy, w.od, w.onx, w.ony, w.pax, w.pay};
+                  w.fx, w.fy, w.od, w.onx, w.ony, w.pax, w.pay, w.bank, w.bank_k};
     w.pax = w.pay = nullptr; w.ghz = -1.0f; w.oworld = false;
+    w.bank = nullptr; w.bank_k = nullptr; w.nbank = 0;
     for (void* p : ps) if (p) free(p);
     w.edge = nullptr; w.dsafe = nullptr; w.sp_off = nullptr; w.sp = nullptr;
     w.h0 = w.h1 = w.gx = w.gy = w.gxp = w.gyp = w.sgx = w.sgy = nullptr; w.cin = nullptr; w.cnx = w.cny = nullptr;
@@ -494,6 +498,15 @@ inline bool water_prepare(Water& w, WAlloc al = water_default_alloc) {
             }
     }
     water_perspective(w, al);
+    // The edge cells, listed once with their push (water_step leans the water every tick it tilts: it would
+    // otherwise look through every cell for them, and take a square root at each). Without the memory: it does.
+    int nb = 0;
+    for (int k = 0; k < gn; ++k) if (w.cnx[k] | w.cny[k]) ++nb;
+    w.bank = (int32_t*)al((size_t)(nb > 0 ? nb : 1) * 4); w.bank_k = (float*)al((size_t)(nb > 0 ? nb : 1) * 4);
+    if (!w.bank || !w.bank_k) { if (w.bank) free(w.bank); if (w.bank_k) free(w.bank_k); w.bank = nullptr; w.bank_k = nullptr; }
+    else
+        for (int k = 0; k < gn; ++k)
+            if (w.cnx[k] | w.cny[k]) { w.bank[w.nbank] = k; w.bank_k[w.nbank] = w.pax ? sqrtf(2.0f * w.pax[k]) : 1.0f; ++w.nbank; }
     return true;
 }
 
@@ -543,16 +556,25 @@ inline void water_step(Water& w, float dt, const float dn[3], const float jolt[3
     // off the banks.
     // (An ocean is too big to slosh in a frame: it only just feels them.)
     const float sl = wprm(w, WP_SLOSH) * (w.mode == W_OCEAN ? W_OCEAN_FEEL : 1.0f);
-    const float tx = sl * W_SLOSH_PX * dn[0], ty = sl * W_SLOSH_PX * (dn[1] - 1.0f) * 0.6f;
+    // (toward the side that went down: tipped right, right; top edge tipped away (dn[2] < 0), toward the top -
+    // the far side of the water - and toward you, the bottom)
+    const float tx = sl * W_SLOSH_PX * dn[0], ty = sl * W_SLOSH_PX * dn[2] * 0.6f;
     const float ax = (tx - w.sx) * 10.0f - w.svx * 1.6f, ay = (ty - w.sy) * 10.0f - w.svy * 1.6f;
     const float kx = ax * dt, ky = ay * dt;
     w.svx += kx; w.svy += ky; w.sx += w.svx * dt; w.sy += w.svy * dt;
     const int gn = w.gw * w.gh;
     const float kick = 9.0f * sl;
-    if (fabsf(kx) + fabsf(ky) > 1e-4f)
-        for (int k = 0; k < gn; ++k)
-            if (w.cnx[k] | w.cny[k])                  // (far banks throw smaller waves)
-                w.h1[k] += kick * (w.pax ? sqrtf(2.0f * w.pax[k]) : 1.0f) * (kx * w.cnx[k] + ky * w.cny[k]);
+    if (fabsf(kx) + fabsf(ky) > 1e-4f) {
+        if (w.bank)                                   // (far banks throw smaller waves)
+            for (int b = 0; b < w.nbank; ++b) {
+                const int k = w.bank[b];
+                w.h1[k] += kick * w.bank_k[b] * (kx * w.cnx[k] + ky * w.cny[k]);
+            }
+        else
+            for (int k = 0; k < gn; ++k)
+                if (w.cnx[k] | w.cny[k])
+                    w.h1[k] += kick * (w.pax ? sqrtf(2.0f * w.pax[k]) : 1.0f) * (kx * w.cnx[k] + ky * w.cny[k]);
+    }
     // Shakes: chop where you'd least expect it.
     const float rip = wprm(w, WP_RIPPLE);
     const float jm = sqrtf(jolt[0] * jolt[0] + jolt[1] * jolt[1] + jolt[2] * jolt[2]);
@@ -682,7 +704,7 @@ inline void water_frame_setup(const Water& w, WFrame& F) {
     F.id = ++s_id;
     F.t = w.t; F.al = w.alpha;
     F.rk = W_RIP_K * wprm(w, WP_RIPPLE);
-    F.slx = w.sx * 0.5f; F.sly = w.sy * 0.5f;
+    F.slx = -w.sx * 0.5f; F.sly = -w.sy * 0.5f;     // (a pixel shows the photo from x + d: the lean moves it by −d)
     float hz = wprm(w, WP_HORIZON);
     if (hz < 0) hz = (w.ghz > -200.0f && w.ghz < (float)(w.by + w.bh)) ? w.ghz : (float)w.by;   // the grid's, if any
     F.hz = hz;

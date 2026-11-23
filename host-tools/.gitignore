@@ -1,0 +1,4 @@
+build/
+out/
+*.raw.tmp
+fill_compare.png
