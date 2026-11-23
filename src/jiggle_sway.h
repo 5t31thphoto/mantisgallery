@@ -678,6 +678,91 @@ inline void sw_prep_pendant(Sway& s, std::vector<int>& px_, std::vector<int>& py
 // The fill behind it, where the Studio didn't send one: each hole pixel takes the colour mirrored across
 // the nearest pixel it may copy from (the texture carries on). On the body: only from the body right
 // around the hole; off it: only from off the body.
+// ---- behind hair: what the fill is made of, pixel by pixel, from the masks (mg_sway.hair_behind) -----------
+enum : int8_t { HB_KEEP = 1, HB_LAYER = 2, HB_BODY = 3, HB_SCENE = 4 };
+constexpr float HB_ROOT = 6.0f;          // within this far along a lock from its root: the hair itself (it barely moves)
+constexpr int   HB_DEEP2 = 9;            // this far (3 px, squared) inside the hair: more of her hair - the hair itself
+                                         //  (so a pixel its mesh leaves uncovered for a frame shows nothing)
+constexpr int   HB_SPAN = 40;            // her on both sides of it in its row, this near: it lies on her
+constexpr int   HB_CLOSE = 6;            // … or it covers a notch of her this narrow (her arm under a fall of hair)
+constexpr int   HB_SCENE_NEAR2 = 144;    // anything else (sky, ground, another figure, water) within 12 px: behind it
+constexpr int   HB_RING = 3;             // the rings round the hair (its matte, its ink): neither her nor the scene
+// cls (its region): HB_* for each pixel of its hole, 0 elsewhere. body: her figure; forbid: the other sways.
+inline bool sw_hair_behind(const Sway& s, const uint8_t* body, const uint8_t* forbid, int8_t* cls, void* (*alloc)(size_t)) {
+    const int N = s.rw * s.rh;
+    memset(cls, 0, N);
+    uint8_t* mov = (uint8_t*)alloc(IMG_W * IMG_H);       // the hair and the other sways, and HB_RING rings round them
+    uint8_t* tq = (uint8_t*)alloc(IMG_W * IMG_H);
+    const int mg = HB_CLOSE * 2 + 1;                     // (her, dilated, over the region and a margin: the closing)
+    const int dx0 = std::max(0, s.rx0 - mg), dy0 = std::max(0, s.ry0 - mg);
+    const int dw = std::min(IMG_W, s.rx0 + s.rw + mg) - dx0, dh = std::min(IMG_H, s.ry0 + s.rh + mg) - dy0;
+    uint8_t* dil = (uint8_t*)alloc((size_t)dw * dh);
+    if (!mov || !tq || !dil) { if (mov) free(mov); if (tq) free(tq); if (dil) free(dil); return false; }
+    for (int i = 0; i < IMG_W * IMG_H; ++i) mov[i] = bget_(s.mask, i) || (forbid && bget_(forbid, i));
+    for (int r = 0; r < HB_RING; ++r) sw_grow(mov, IMG_W, IMG_H, tq);
+    auto her = [&](int x, int y) { const int i = y * IMG_W + x; return !mov[i] && bget_(body, i); };
+    auto scene = [&](int x, int y) { const int i = y * IMG_W + x; return !mov[i] && !bget_(body, i); };
+    for (int y = 0; y < dh; ++y)                         // dilation (outside the picture: nothing)
+        for (int x = 0; x < dw; ++x) {
+            const int X = dx0 + x, Y = dy0 + y;
+            bool on = false;
+            for (int v = -HB_CLOSE; v <= HB_CLOSE && !on; ++v)
+                for (int u = -HB_CLOSE; u <= HB_CLOSE && !on; ++u) {
+                    if (u * u + v * v > HB_CLOSE * HB_CLOSE) continue;
+                    const int qx = X + u, qy = Y + v;
+                    on = qx >= 0 && qy >= 0 && qx < IMG_W && qy < IMG_H && her(qx, qy);
+                }
+            dil[y * dw + x] = on;
+        }
+    for (int i = 0; i < N; ++i) {
+        if (!s.hole[i]) continue;
+        const int X = s.rx0 + i % s.rw, Y = s.ry0 + i / s.rw;
+        float best = 1e18f, Sb = 0;                      // along its nearest lock: near the root, the hair itself
+        for (int k = 0; k < s.nr; ++k) {
+            float d, Sk, Dk;
+            sw_bind((float)X, (float)Y, s.rx[k], s.ry[k], s.nn[k], d, Sk, Dk);
+            if (d < best) { best = d; Sb = Sk; }
+        }
+        if (s.nr > 0 && Sb < HB_ROOT) { cls[i] = HB_KEEP; continue; }
+        if (mask_get(s.mask, X, Y)) {                   // well inside the hair: more of her hair
+            bool edge = false;
+            for (int v = -2; v <= 2 && !edge; ++v)
+                for (int u = -2; u <= 2 && !edge; ++u) {
+                    const int qx = X + u, qy = Y + v;
+                    if (u * u + v * v >= HB_DEEP2 || qx < 0 || qy < 0 || qx >= IMG_W || qy >= IMG_H) continue;
+                    edge = !mask_get(s.mask, qx, qy);
+                }
+            if (!edge) { cls[i] = HB_LAYER; continue; }
+        }
+        // lies on her: her on both sides in its row (the nearest still pixel each way) …
+        bool L = false, Rr = false;
+        for (int x = X - 1; x >= 0; --x) if (!mov[Y * IMG_W + x]) { L = X - x <= HB_SPAN && her(x, Y); break; }
+        for (int x = X + 1; x < IMG_W; ++x) if (!mov[Y * IMG_W + x]) { Rr = x - X <= HB_SPAN && her(x, Y); break; }
+        bool onher = L && Rr;
+        if (!onher) {                                   // … or a notch of her it covers (the closing)
+            bool all = true;
+            for (int v = -HB_CLOSE; v <= HB_CLOSE && all; ++v)
+                for (int u = -HB_CLOSE; u <= HB_CLOSE && all; ++u) {
+                    if (u * u + v * v > HB_CLOSE * HB_CLOSE) continue;
+                    const int qx = X + u, qy = Y + v;
+                    all = qx >= 0 && qy >= 0 && qx < IMG_W && qy < IMG_H && dil[(qy - dy0) * dw + (qx - dx0)];
+                }
+            onher = all;
+        }
+        if (onher) { cls[i] = HB_BODY; continue; }
+        bool near = false;                              // anything else near: that's behind it
+        for (int v = -12; v <= 12 && !near; ++v)
+            for (int u = -12; u <= 12 && !near; ++u) {
+                const int qx = X + u, qy = Y + v;
+                if (u * u + v * v > HB_SCENE_NEAR2 || qx < 0 || qy < 0 || qx >= IMG_W || qy >= IMG_H) continue;
+                near = scene(qx, qy);
+            }
+        cls[i] = near ? HB_SCENE : HB_BODY;
+    }
+    free(mov); free(tq); free(dil);
+    return true;
+}
+
 inline void sw_fill(Sway& s, const uint8_t* body, const uint8_t* fb, int16_t* nx, int16_t* ny, uint8_t* tmp) {
     const int w = s.rw, h = s.rh, N = w * h;
     std::vector<uint8_t> src(N), want(N);
@@ -721,11 +806,11 @@ inline void sw_fill(Sway& s, const uint8_t* body, const uint8_t* fb, int16_t* nx
 // hip R, waist R. Its waistband's ends if set, its legs under the hem (body) if known, else body proportions.
 inline bool sway_fit_hips(Sway& s, const uint8_t* body) {
     if (!s.mask) return false;
-    auto bit = [](const uint8_t* m, int x, int y) { const int i = y * IMG_W + x; return ((m[i >> 3] >> (i & 7)) & 1) != 0; };
+    auto mbit = [](const uint8_t* m, int x, int y) { const int i = y * IMG_W + x; return ((m[i >> 3] >> (i & 7)) & 1) != 0; };   // (not "bit": an Arduino macro)
     int top = -1, bot = -1, xa = IMG_W, xb = -1;
     for (int y = 0; y < IMG_H; ++y)
         for (int x = 0; x < IMG_W; ++x)
-            if (bit(s.mask, x, y)) { if (top < 0) top = y; bot = y; if (x < xa) xa = x; if (x > xb) xb = x; }
+            if (mbit(s.mask, x, y)) { if (top < 0) top = y; bot = y; if (x < xa) xa = x; if (x > xb) xb = x; }
     if (top < 0) return false;
     float wa, wb;
     if (s.gn[0] >= 2) {                                 // (the waistband you set: its two ends)
@@ -735,7 +820,7 @@ inline bool sway_fit_hips(Sway& s, const uint8_t* body) {
     } else {
         int lo = IMG_W, hi = -1;
         for (int y = top; y < std::min(IMG_H, top + std::max(2, (bot - top) / 10)); ++y)
-            for (int x = 0; x < IMG_W; ++x) if (bit(s.mask, x, y)) { lo = std::min(lo, x); hi = std::max(hi, x); }
+            for (int x = 0; x < IMG_W; ++x) if (mbit(s.mask, x, y)) { lo = std::min(lo, x); hi = std::max(hi, x); }
         wa = (float)lo; wb = (float)hi;
     }
     // her legs right under the hem (body, not skirt): the two widest runs of columns
@@ -743,7 +828,7 @@ inline bool sway_fit_hips(Sway& s, const uint8_t* body) {
     if (body)
         for (int y = bot + 1; y < std::min(IMG_H, bot + 8); ++y)
             for (int x = std::max(0, xa - 2); x < std::min(IMG_W, xb + 3); ++x)
-                if (bit(body, x, y) && !bit(s.mask, x, y)) cols[x] = true;
+                if (mbit(body, x, y) && !mbit(s.mask, x, y)) cols[x] = true;
     int ra[2] = {0, 0}, rb[2] = {-1, -1}, nr = 0;      // (the two longest runs ≥ 2, later ones winning ties)
     for (int x = 0; x < IMG_W;) {
         if (!cols[x]) { ++x; continue; }
@@ -836,14 +921,14 @@ inline bool sw_bikini_poly(const Sway& s, float* qx, float* qy) {   // (mg_sway.
     if (s.narm != 9) return false;
     const float h0x = s.armx[1], h0y = s.army[1], l0x = s.armx[2], l0y = s.army[2], lix = s.armx[3];
     const float cx = s.armx[4], cy = s.army[4], rix = s.armx[5], r0x = s.armx[6], r0y = s.army[6], h1x = s.armx[7], h1y = s.army[7];
-    const bool bk = s.arm_back;                         // (seen from behind: her seat - higher, steeper, wider panel)
+    const bool bk = s.arm_back;                         // (seen from behind: her seat - higher, a cheeky cut, a narrow panel)
     const float hy = (h0y + h1y) / 2, ty = hy + (bk ? -0.05f : 0.1f) * std::max(2.0f, cy - hy);
     auto side = [&](float ax, float ay, float bx, float by) { return ax + (bx - ax) * (by != ay ? (ty - ay) / (by - ay) : 0.0f); };
     const float xl = side(h0x, h0y, l0x, l0y) + 1.0f, xr = side(h1x, h1y, r0x, r0y) - 1.0f;
     const float gap = std::max(3.0f, rix - lix), by = cy + 0.5f;
-    const float wb = bk ? std::min(gap * 0.6f + 2.0f, 6.0f) : std::min(gap * 0.3f + 1.0f, 3.0f);
+    const float wb = bk ? std::min(gap * 0.25f + 1.0f, 2.5f) : std::min(gap * 0.3f + 1.0f, 3.0f);
     for (int k = 0; k < 6; ++k) {
-        const float t = k / 5.0f, y = ty + (by - ty) * t, f = powf(1 - t, bk ? 0.75f : 1.6f);
+        const float t = k / 5.0f, y = ty + (by - ty) * t, f = powf(1 - t, bk ? 2.6f : 1.6f);
         qx[k] = cx - wb - (cx - wb - xl) * f; qy[k] = y;
         qx[SW_BIKINI_N - 1 - k] = cx + wb + (xr - cx - wb) * f; qy[SW_BIKINI_N - 1 - k] = y;
     }
@@ -1138,7 +1223,27 @@ inline bool sway_prepare(Sway& s, const uint16_t* photo, bool psw, const uint8_t
         const int X = s.rx0 + i % s.rw, Y = s.ry0 + i / s.rw;
         if (s.pdef_ok && s.pdef && s.pdef_has && bget_(s.pdef_has, Y * IMG_W + X)) s.plate[i] = s.pdef[Y * IMG_W + X];
     }
-    sw_fill(s, body, fb, nx, ny, tmp);
+    int8_t* hcls = nullptr; uint8_t* hb = nullptr;     // hair: what's behind it, from the masks (sw_hair_behind)
+    if (s.kind == SK_HAIR && body) {
+        hcls = (int8_t*)alloc(N); hb = (uint8_t*)alloc(MASK_BYTES);
+        if (hcls && hb && sw_hair_behind(s, body, forbid, hcls, alloc)) {
+            memcpy(hb, body, MASK_BYTES);               // (its hole: on her only where it lies on her)
+            for (int i = 0; i < N; ++i) {
+                if (!s.hole[i]) continue;
+                const int j = (s.ry0 + i / s.rw) * IMG_W + s.rx0 + i % s.rw;
+                if (hcls[i] == HB_BODY) hb[j >> 3] |= (uint8_t)(1 << (j & 7)); else hb[j >> 3] &= (uint8_t)~(1 << (j & 7));
+            }
+        } else { if (hcls) free(hcls); if (hb) free(hb); hcls = nullptr; hb = nullptr; }
+    }
+    sw_fill(s, hb ? hb : body, fb, nx, ny, tmp);
+    if (hcls) {                                         // near its roots, and well inside it: the hair itself
+        for (int i = 0; i < N; ++i) {
+            const int X = s.rx0 + i % s.rw, Y = s.ry0 + i / s.rw;
+            if (s.pdef_ok && s.pdef_has && bget_(s.pdef_has, Y * IMG_W + X)) continue;
+            if (hcls[i] == HB_KEEP || hcls[i] == HB_LAYER) s.plate[i] = s.photo[i];
+        }
+        free(hcls); free(hb);
+    }
     if (s.kind == SK_CLOTH) {                           // (its own fill: never skin in the bikini area)
         float qx[SW_BIKINI_N], qy[SW_BIKINI_N];
         if (sw_bikini_poly(s, qx, qy))

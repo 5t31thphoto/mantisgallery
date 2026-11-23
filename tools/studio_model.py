@@ -519,6 +519,52 @@ class Studio:
         m[:] = S.grow_mask(m, n)
         self._commit(m, before)
 
+    def take_outline(self, reach=3):
+        """The layer's mask takes in the ink outline round it: the dark line-art pixels touching it (within
+        `reach` px, joined to it). Drawn pictures have one; left out, it stays behind on the scene - a ghost of
+        her edge - when she slides, and a hair lock or skirt carries half of its own. Returns the px added."""
+        m = self.mask()
+        if m is None or self.image is None or not m.any():
+            return 0
+        img = np.asarray(self.image, np.float32)
+        lum = img.mean(-1)
+        mx, mn = img.max(-1), img.min(-1)
+        sat = (mx - mn) / np.maximum(mx, 1.0)
+        ring = S.grow_mask(m, 1) & ~m
+        ref = float(np.median(lum[m])) if m.any() else 128.0
+        ink = (lum < min(110.0, 0.6 * ref + 20.0)) & (sat < 0.6)       # (dark and not strongly coloured: line art)
+        grown = m.copy()
+        for _ in range(int(reach)):                      # (step by step, so only ink joined to it comes in)
+            grown |= S.grow_mask(grown, 1) & ink
+        add = (grown | ring) & ~m
+        if not add.any():
+            return 0
+        self.push_undo()
+        before = m.copy()
+        m |= add
+        self._commit(m, before)
+        return int(add.sum())
+
+    def hair_behind(self):
+        """The active hair lock's fill, as the Studio and the Core2 will make it (mg_sway.hair_behind): per pixel
+        it can uncover, the hair itself (near its roots / well inside it), her, or the scene. None if not hair."""
+        L = self.layer()
+        if L.kind != "sway" or L.obj.kind != "hair" or not L.obj.ok() or self.image is None:
+            return None
+        body = self.body_mask()
+        others = np.zeros((H, W), bool)
+        for s in self.sways:
+            if s is not L.obj and s.mask is not None:
+                others |= s.mask
+        rb = SW.rest_body(body, [s.mask for s in self.sways]) if body.any() else None
+        key = (L.obj.mask.tobytes(), repr(L.obj.guides), others.tobytes(), None if rb is None else rb.tobytes())
+        if getattr(self, "_hb_key", None) == key:
+            return self._hb
+        sim = SW.SwaySim(L.obj, self.image, rb, forbid=others if others.any() else None)
+        self._hb = SW.hair_behind(sim.hole, L.obj.mask, rb, others, sim.rods) if (sim.ok and rb is not None) else None
+        self._hb_key = key
+        return self._hb
+
     def clear_mask(self):
         m = self.mask()
         if m is None or not m.any():

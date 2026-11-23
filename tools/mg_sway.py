@@ -269,7 +269,8 @@ def bikini_poly(pts, back=False):
     """A bikini bottom on the hips' outline: its top edge low across the hips (at the hip line, the
     full width of the outline there), the sides curving in like leg openings, down to a narrow panel
     just past the point between the legs (node 4). Seen from behind (back): the seat - its top a little
-    higher, the sides falling more steeply (a cheeky cut), a wider panel at the bottom."""
+    higher, a cheeky cut: the leg openings sweep up and in across each cheek (their round lower halves
+    showing), down to a narrow panel at the bottom."""
     (w0x, w0y), (h0x, h0y), (l0x, l0y), (lix, liy), (cx, cy), (rix, riy), (r0x, r0y), (h1x, h1y), (w1x, w1y) = pts
     hy = (h0y + h1y) / 2
     ty = hy + (-0.05 if back else 0.1) * max(2.0, cy - hy)   # its top: just under the hip line
@@ -279,12 +280,12 @@ def bikini_poly(pts, back=False):
     xr = side(h1x, h1y, r0x, r0y) - 1.0
     gap = max(3.0, rix - lix)
     by = cy + 0.5                                      # down to the point between the legs
-    wb = min(gap * 0.6 + 2.0, 6.0) if back else min(gap * 0.3 + 1.0, 3.0)   # the panel there
+    wb = min(gap * 0.25 + 1.0, 2.5) if back else min(gap * 0.3 + 1.0, 3.0)  # the panel there
     left, right = [], []
     for k in range(6):                                 # leg openings: steep at first, then in
         t = k / 5
         y = ty + (by - ty) * t
-        f = (1 - t) ** (1.1 if back else 1.6)
+        f = (1 - t) ** (2.6 if back else 1.6)
         left.append((cx - wb - (cx - wb - xl) * f, y))
         right.append((cx + wb + (xr - cx - wb) * f, y))
     return left + right[::-1]
@@ -664,8 +665,14 @@ class SwaySim:
         elif sw.kind == "cloth":
             self.plate = cloth_fill(self.photo, self.hole, fb, self.moving, self.body, self.arm, sw.back)
         elif self.body is not None:                       # behind what lies on her is her; behind what hangs free is the scene
-            onb = self.hole & self.body
-            plate = inpaint_em(self.photo, self.hole & ~self.body, forbid=fb | self.body)
+            if sw.kind == "hair":                         # (hair: from the masks - see hair_behind)
+                cls = hair_behind(self.hole, sw.mask, self.body, forbid, self.rods)
+                her = self.body & ~sw.mask & ~(forbid if forbid is not None else False)
+                onb = cls == HB_BODY
+                plate = inpaint_em(self.photo, cls == HB_SCENE, forbid=fb | her)
+            else:
+                onb = self.hole & self.body
+                plate = inpaint_em(self.photo, self.hole & ~self.body, forbid=fb | self.body)
             if onb.any():
                 # Behind hair lying on her is the skin / cloth right next to it - never her dress from a
                 # hand's width away: sources only from her own pixels close around the hole (widened only
@@ -676,6 +683,9 @@ class SwaySim:
                     if src.sum() >= 60 + 2 * onb.sum() ** 0.5:
                         break
                 plate = inpaint_em(plate, onb, forbid=~src | fb, win=max(10, int(min(reach, 40))))
+            if sw.kind == "hair":
+                keep = (cls == HB_KEEP) | (cls == HB_LAYER)
+                plate[keep] = self.photo[keep]
             self.plate = plate
         else:
             self.plate = inpaint_em(self.photo, self.hole, forbid=fb)
@@ -1200,6 +1210,65 @@ class SwaySim:
         col = col * shade
         sl = out[by0:by1 + 1, bx0:bx1 + 1]
         sl[:] = sl * (1 - a[..., None]) + col * a[..., None]
+
+
+# ---- behind hair: what the fill is made of, pixel by pixel (from the masks the editor already has) ----------
+HB_KEEP, HB_LAYER, HB_BODY, HB_SCENE = 1, 2, 3, 4
+HB_ROOT = 6.0          # within this far along a lock from its root: the hair itself (it barely moves there)
+HB_DEEP = 3.0          # this far inside the hair: more of her hair - the hair itself (so a pixel its mesh
+                       #  leaves uncovered for a frame shows nothing)
+HB_SPAN = 40           # her on both sides of it in its row, this near: it lies on her
+HB_CLOSE = 6           # … or it covers a notch of her this narrow (her arm under a fall of hair)
+HB_SCENE_NEAR = 12.0   # anything else - sky, ground, another figure, water - this near: that's behind it
+HB_RING = 3            # the rings round the hair (its matte, its ink): neither her nor the scene
+
+
+def _disk(r):
+    y, x = np.mgrid[-r:r + 1, -r:r + 1]
+    return x * x + y * y <= r * r
+
+
+def hair_behind(hole, mask, body, forbid, rods):
+    """What's behind each pixel a hair lock can uncover, from the masks: HB_KEEP near its roots (the hair
+    itself), HB_LAYER well inside it (more of her hair: the hair itself), HB_BODY where it lies on her (her on both
+    sides of it in its row, or a notch of her it covers), HB_SCENE where anything that isn't her is near
+    (the sky, ground, another figure, water - preferred over her), else HB_BODY. body: her figure (it may
+    include the moving pixels); forbid: the other sways. Returns (H, W) int8, 0 outside the hole."""
+    from scipy.ndimage import binary_closing
+    hole = np.asarray(hole, bool); mask = np.asarray(mask, bool)
+    mov = mask | (np.asarray(forbid, bool) if forbid is not None else False)
+    for _ in range(HB_RING):                       # (its outline's rings go with it: the ink round a lock isn't her)
+        mov = grow1(mov)
+    her = np.asarray(body, bool) & ~mov if body is not None else np.zeros_like(mask)
+    scene = ~mov & ~her
+    ys, xs = np.nonzero(hole)
+    best = np.full(len(xs), 1e18); S = np.zeros(len(xs))
+    for r in rods:
+        d, Sk, _ = bind(xs, ys, r)
+        t = d < best; best[t] = d[t]; S[t] = Sk[t]
+    out = np.zeros(hole.shape, np.int8)
+    keep = np.zeros(hole.shape, bool); keep[ys, xs] = S < HB_ROOT
+    deep = mask & (edt(~mask) >= HB_DEEP)
+    # her on both sides in the row (the nearest still pixel each way, within HB_SPAN)
+    left = np.zeros(hole.shape, bool); right = np.zeros(hole.shape, bool)
+    for y in range(H):
+        still, isher = ~mov[y], her[y]
+        last, lx = False, -10 ** 6
+        for x in range(W):
+            if still[x]: last, lx = isher[x], x
+            else: left[y, x] = last and x - lx <= HB_SPAN
+        last, lx = False, 10 ** 6
+        for x in range(W - 1, -1, -1):
+            if still[x]: last, lx = isher[x], x
+            else: right[y, x] = last and lx - x <= HB_SPAN
+    onher = (left & right) | binary_closing(her, structure=_disk(HB_CLOSE))
+    near_scene = edt(scene) <= HB_SCENE_NEAR
+    out[hole] = HB_BODY
+    out[hole & near_scene] = HB_SCENE
+    out[hole & onher] = HB_BODY
+    out[hole & deep] = HB_LAYER
+    out[hole & keep] = HB_KEEP
+    return out
 
 
 def inpaint_em(img, hole, forbid=None, patch=5, levels=3, iters=5, win=40):

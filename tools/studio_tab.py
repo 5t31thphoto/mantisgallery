@@ -153,6 +153,7 @@ class StudioTab(tk.Frame):
         self.show_layers = tk.BooleanVar(value=True)
         self.show_handles = tk.BooleanVar(value=True)
         self.show_depth = tk.BooleanVar(value=False)
+        self.show_hairfill = tk.BooleanVar(value=False)   # (the active hair lock: what's behind it, from the masks)
         self.tilt = tk.DoubleVar(value=0.0)
         self.lean = tk.DoubleVar(value=0.0)
         self.dance = tk.BooleanVar(value=False)
@@ -339,7 +340,7 @@ class StudioTab(tk.Frame):
         self._label(r2, "FIX", YEL, ("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 4))
         self.fix_btns = []
         for text, fn in (("Tighter", lambda: self.smart_step(-1)), ("Looser", lambda: self.smart_step(1)),
-                         ("Refine edges", self.refine), ("Grow 1 px", lambda: self._do(lambda: self.st.grow(1))),
+                         ("Refine edges", self.refine), ("Take outline", self.take_outline), ("Grow 1 px", lambda: self._do(lambda: self.st.grow(1))),
                          ("Shrink 1 px", lambda: self._do(lambda: self.st.grow(-1))), ("Clear", self.clear_mask)):
             b = self._btn(r2, text, fn)
             b.pack(side="left", padx=1)
@@ -463,7 +464,7 @@ class StudioTab(tk.Frame):
                             "2  Alt-paint (or − Subtract) on what she isn't, where it touches her:\n"
                             "    the background by her sides, the ground between her feet.\n"
                             "3  Every stroke re-cuts. Her hair and clothes count as her.\n"
-                            "4  A thin outline left behind when she slides? Grow 1 px.\n"
+                            "4  A drawn picture's ink outline left behind when she slides? Take outline.\n"
                             "5  Feet line: drag where she touches the ground.", FG, bg=PANEL).pack(fill="x")
 
     def _clear_feet(self):
@@ -820,7 +821,8 @@ class StudioTab(tk.Frame):
             self.speed_btns[v] = b
         self._label(r2, "Show:", bg=PANEL).pack(side="left", padx=(10, 2))
         self.show_btns = {}
-        for text, var in (("Layers", self.show_layers), ("Handles", self.show_handles), ("Depth map", self.show_depth)):
+        for text, var in (("Layers", self.show_layers), ("Handles", self.show_handles), ("Depth map", self.show_depth),
+                          ("Hair fill", self.show_hairfill)):
             b = self._btn(r2, text, lambda var=var: (var.set(not var.get()), self._paint_preview_bar(), self._render()), padx=6)
             b.pack(side="left", padx=1)
             self.show_btns[text] = (b, var)
@@ -1269,6 +1271,14 @@ class StudioTab(tk.Frame):
         self._hint(f"Refined: {n} px changed to follow the real edges." if n else "Already on the edges.")
         self._changed()
 
+    def take_outline(self):
+        if self.st.mask() is None or not self.st.mask().any():
+            self._hint("Take outline adds the ink line round the layer - select something first.")
+            return
+        n = self.st.take_outline()
+        self._hint(f"Took in {n} px of its outline (it moves with it now)." if n else "No ink outline touching it.")
+        self._changed()
+
     def clear_mask(self):
         if self.st.mask() is not None and self.st.mask().any() and messagebox.askyesno(
                 "Clear", f"Clear everything selected in “{self.st.layer().name}”?", parent=self):
@@ -1672,6 +1682,14 @@ class StudioTab(tk.Frame):
                     continue
                 a = 0.45 if L.key == self.st.active else 0.18
                 img[m] = (img[m] * (1 - a) + np.array(_hex(self.st.color(L))) * a).astype(np.uint8)
+        if not self.preview.get() and self.show_hairfill.get():
+            hb = self.st.hair_behind()                   # yellow: the hair itself; pink: her; blue: the scene
+            if hb is not None:
+                for v, col in ((SW.HB_KEEP, (255, 230, 0)), (SW.HB_LAYER, (255, 230, 0)), (SW.HB_BODY, (255, 70, 190)),
+                               (SW.HB_SCENE, (40, 200, 255))):
+                    m = hb == v
+                    a = 0.35 if v == SW.HB_LAYER else 0.6
+                    img[m] = (img[m] * (1 - a) + np.array(col) * a).astype(np.uint8)
         c = self._cut
         if c is not None and c["key"] == self.st.active and not self.preview.get() and self.tool == "cut":
             img[c["keep"]] = _hex(LIME)

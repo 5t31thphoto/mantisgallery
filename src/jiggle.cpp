@@ -412,6 +412,9 @@ void prepare_sways() {
     uint8_t* skb = nullptr;                             // (a skirt's fill: her hips under it - mg_sway.skirt_plate)
     for (int i = 0; i < g_ns && !skb && body; ++i)
         if (g_sway[i].kind == SK_CLOTH && g_sway[i].narm == 9) skb = (uint8_t*)water_alloc(MASK_BYTES);
+    uint8_t* hrb = nullptr;                             // (hair, no body lines: her figure alone - the others are scene)
+    for (int i = 0; i < g_ns && !hrb && body && anyb && !g_body && g_par.n > 0; ++i)
+        if (g_sway[i].kind == SK_HAIR) hrb = (uint8_t*)water_alloc(MASK_BYTES);
     const uint16_t* photo = (const uint16_t*)g_img.getBuffer();
     for (int i = 0; i < g_ns; ++i) {
         if (forbid) {                                   // (never filled from one another)
@@ -424,11 +427,28 @@ void prepare_sways() {
             sway_hips_body(g_sway[i], skb);
             fb = skb;
         }
+        if (hrb && g_sway[i].kind == SK_HAIR) {         // the figure it's on (named, else the one it overlaps most)
+            const Sway& sw = g_sway[i];
+            int best = -1, bo = 0;
+            for (int k = 0; k < g_par.n; ++k) {
+                const Plane& pl = g_par.pl[k];
+                if (!pl.mask) continue;
+                if (sw.on[0] && strncmp(sw.on, pl.name, sizeof(pl.name)) == 0) { best = k; break; }
+                int o = 0;
+                for (int b = 0; b < MASK_BYTES; ++b) o += __builtin_popcount(pl.mask[b] & sw.mask[b]);
+                if (o > bo) { bo = o; best = k; }
+            }
+            if (best >= 0) {
+                for (int b = 0; b < MASK_BYTES; ++b) hrb[b] = body[b] & (g_par.pl[best].mask[b] | sw.mask[b]);
+                fb = hrb;
+            }
+        }
         const bool ok = sway_prepare(g_sway[i], photo, g_swapped, fb, g_sdf, forbid, water_alloc);
         Serial.printf("jig: %s %d %s\n", sway_kind_info(g_sway[i].kind).label, i + 1, ok ? "ready" : "not ready (no memory, or nothing selected)");
     }
     if (forbid) free(forbid);
     if (skb) free(skb);
+    if (hrb) free(hrb);
     if (body) free(body);
 }
 bool any_sway_def() {
